@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -264,9 +265,26 @@ class RunOrchestrator:
                 await self._transaction_repo.create_batch(run_id, mapped_txns)
 
         elif step_name == "risk" and state.get("scored_candidates"):
-            mapped_candidates = _map_candidates(state["scored_candidates"])
-            if mapped_candidates:
-                await self._candidate_repo.create_batch(run_id, mapped_candidates)
+            # Candidates already exist in DB (ingested at run creation).
+            # Update each row with risk scores from the RiskAgent.
+            skipped = 0
+            for c in state["scored_candidates"]:
+                candidate_id = c.get("candidate_id")
+                if not candidate_id:
+                    skipped += 1
+                    continue
+                try:
+                    await self._candidate_repo.update_risk_scoring(
+                        candidate_id=uuid.UUID(candidate_id),
+                        risk_score=Decimal(str(c.get("risk_score", 0.5))),
+                        risk_reasons=c.get("risk_reasons", []),
+                        risk_decision=c.get("risk_decision", "review"),
+                        run_id=run_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Run {run_id}: failed to update risk for candidate {candidate_id}: {e}")
+            if skipped:
+                logger.warning(f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)")
 
     # ------------------------------------------------------------------
     # Internal: approval gate

@@ -82,10 +82,14 @@ class CandidateRepository:
         risk_score: Decimal,
         risk_reasons: list,
         risk_decision: str,
+        run_id: UUID | None = None,
     ) -> None:
+        conditions = [PayoutCandidateModel.id == candidate_id]
+        if run_id is not None:
+            conditions.append(PayoutCandidateModel.run_id == run_id)
         stmt = (
             update(PayoutCandidateModel)
-            .where(PayoutCandidateModel.id == candidate_id)
+            .where(*conditions)
             .values(
                 risk_score=risk_score,
                 risk_reasons=risk_reasons,

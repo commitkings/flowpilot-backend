@@ -82,7 +82,18 @@ Risk tolerance threshold: {risk_tolerance}"""
             )
 
             result = json.loads(response)
-            scored = result.get("scored_candidates", candidates)
+            llm_scored = result.get("scored_candidates", [])
+
+            # Merge LLM risk scores onto original candidates (preserves candidate_id
+            # and other fields the LLM may have dropped from its response)
+            for i, orig in enumerate(candidates):
+                if i < len(llm_scored):
+                    orig["risk_score"] = llm_scored[i].get("risk_score", 0.5)
+                    orig["risk_reasons"] = llm_scored[i].get("risk_reasons", [])
+                else:
+                    orig.setdefault("risk_score", 0.5)
+                    orig.setdefault("risk_reasons", [])
+            scored = candidates
 
             for c in scored:
                 score = c.get("risk_score", 0.5)
