@@ -7,14 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.graph import build_flowpilot_graph
+from src.agents.orchestrator import RunOrchestrator
 from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
-    PlanStepRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -22,15 +21,11 @@ from src.infrastructure.database.repositories import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# In-memory cache of active run states (for runs awaiting approval).
+# Only populated between create_run halt and approval/rejection.
 _running_states: dict[str, AgentState] = {}
+
 _DEFAULT_OPERATOR_ID = "00000000-0000-0000-0000-000000000001"
-_NODE_TO_AGENT_TYPE = {
-    "plan": "planner",
-    "reconcile": "reconciliation",
-    "risk": "risk",
-    "execute": "execution",
-    "audit": "audit",
-}
 
 
 class CreateRunRequest(BaseModel):
@@ -59,19 +54,6 @@ def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 
 
-def _status_from_node(node_name: str, state: AgentState) -> str:
-    status_map = {
-        "plan": "planning",
-        "reconcile": "reconciling",
-        "risk": "scoring",
-        "approval_gate": "awaiting_approval",
-        "execute": "executing",
-    }
-    if node_name == "audit":
-        return "failed" if state.get("error") else "completed"
-    return status_map.get(node_name, "planning")
-
-
 def _current_step_from_status(status: str) -> str:
     """Derive a human-readable current_step from the persisted run status."""
     return {
@@ -88,74 +70,6 @@ def _current_step_from_status(status: str) -> str:
     }.get(status, status)
 
 
-def _build_audit_entries(run_id: uuid.UUID, entries: list[dict]) -> list[dict]:
-    return [
-        {
-            "run_id": run_id,
-            "step_id": entry.get("step_id"),
-            "agent_type": entry.get("agent_type"),
-            "action": entry.get("action", "unknown"),
-            "detail": entry.get("detail"),
-            "api_endpoint": entry.get("api_endpoint"),
-            "request_hash": entry.get("request_hash"),
-            "response_status": entry.get("response_status"),
-            "response_time_ms": entry.get("response_time_ms"),
-        }
-        for entry in entries
-    ]
-
-
-def _map_plan_steps(steps: list[dict]) -> list[dict]:
-    """Map planner agent output to PlanStepModel column names."""
-    mapped_steps = [
-        {
-            "agent_type": s.get("agent_type", ""),
-            "step_order": s.get("order", idx + 1),
-            "description": s.get("description"),
-            "status": "pending",
-        }
-        for idx, s in enumerate(steps)
-    ]
-    if not any(step["agent_type"] == "planner" for step in mapped_steps):
-        mapped_steps.insert(
-            0,
-            {
-                "agent_type": "planner",
-                "step_order": 0,
-                "description": "Generate execution plan",
-                "status": "pending",
-            },
-        )
-    return mapped_steps
-
-
-def _map_transactions(txns: list[dict]) -> list[dict]:
-    """Map Interswitch transaction dicts to TransactionModel column names."""
-    mapped: list[dict] = []
-    for t in txns:
-        ref = t.get("transactionReference")
-        amount = t.get("amount")
-        status = t.get("status")
-        if not ref or amount is None or status is None:
-            continue
-        mapped.append({
-            "transaction_reference": ref,
-            "amount": amount,
-            "currency": t.get("currency", "NGN"),
-            "status": status,
-            "channel": t.get("channel"),
-            "transaction_timestamp": t.get("timestamp"),
-            "customer_id": t.get("customerId"),
-            "merchant_id": t.get("merchantId"),
-            "processor_response_code": t.get("processorResponseCode"),
-            "processor_response_message": t.get("processorResponseMessage"),
-            "settlement_date": t.get("settlementDate"),
-            "is_anomaly": t.get("isAnomaly", False),
-            "anomaly_reason": t.get("anomalyReason"),
-        })
-    return mapped
-
-
 @router.post("/runs", response_model=RunResponse)
 async def create_run(
     request: CreateRunRequest,
@@ -163,9 +77,6 @@ async def create_run(
 ):
     operator_id = _parse_uuid(request.operator_id, "operator_id")
     run_repo = RunRepository(session)
-    audit_repo = AuditRepository(session)
-    plan_step_repo = PlanStepRepository(session)
-    transaction_repo = TransactionRepository(session)
 
     run = await run_repo.create(
         operator_id=operator_id,
@@ -183,7 +94,7 @@ async def create_run(
     await session.refresh(run)
 
     run_id = str(run.id)
-    initial_state: AgentState = {
+    state: AgentState = {
         "run_id": run_id,
         "objective": request.objective,
         "constraints": request.constraints,
@@ -206,116 +117,35 @@ async def create_run(
         "error": None,
         "audit_entries": [],
     }
-    _running_states[run_id] = initial_state
 
     logger.info(f"Created run {run_id}: {request.objective[:80]}")
 
     try:
-        await run_repo.mark_started(run.id)
-        await run_repo.update_status(run.id, "planning")
+        orchestrator = RunOrchestrator(session)
+        state = await orchestrator.execute_run(run.id, state)
 
-        graph = build_flowpilot_graph()
-        plan_step_ids_by_agent_type: dict[str, uuid.UUID] = {}
-        started_plan_step_ids: set[uuid.UUID] = set()
-
-        async for step_output in graph.astream(initial_state):
-            node_name = next(iter(step_output.keys()), "unknown") if step_output else "unknown"
-            logger.info(f"Run {run_id}: completed step '{node_name}'")
-
-            node_audit_entries: list[dict] = []
-            if isinstance(step_output, dict):
-                for node_state in step_output.values():
-                    if isinstance(node_state, dict):
-                        node_audit_entries = node_state.pop("audit_entries", [])
-                        initial_state.update(node_state)
-                        initial_state.setdefault("audit_entries", [])
-                        initial_state["audit_entries"].extend(node_audit_entries)
-
-            # Persist plan_steps after the plan node completes
-            if node_name == "plan" and initial_state.get("plan_steps"):
-                mapped_steps = _map_plan_steps(initial_state["plan_steps"])
-                persisted_steps = await plan_step_repo.create_batch(run.id, mapped_steps)
-                plan_step_ids_by_agent_type = {
-                    step.agent_type: step.id for step in persisted_steps
-                }
-                await run_repo.update_plan_graph(
-                    run.id, {"steps": initial_state["plan_steps"]}
-                )
-
-            # Persist transactions after the reconcile node completes
-            if node_name == "reconcile" and initial_state.get("transactions"):
-                mapped_txns = _map_transactions(initial_state["transactions"])
-                await transaction_repo.create_batch(run.id, mapped_txns)
-
-            agent_type = _NODE_TO_AGENT_TYPE.get(node_name)
-            step_id = (
-                plan_step_ids_by_agent_type.get(agent_type) if agent_type else None
-            )
-            if step_id is not None:
-                if step_id not in started_plan_step_ids:
-                    await plan_step_repo.mark_started(step_id)
-                    started_plan_step_ids.add(step_id)
-
-                if initial_state.get("error"):
-                    await plan_step_repo.update_status(
-                        step_id,
-                        "failed",
-                        error_message=initial_state.get("error"),
-                    )
-                else:
-                    node_output = (
-                        step_output.get(node_name)
-                        if isinstance(step_output, dict)
-                        else None
-                    )
-                    await plan_step_repo.mark_completed(
-                        step_id,
-                        node_output if isinstance(node_output, dict) else None,
-                    )
-
-            # Flush new audit entries from this node
-            if node_audit_entries:
-                await audit_repo.append_batch(
-                    _build_audit_entries(run.id, node_audit_entries)
-                )
-
-            await run_repo.update_status(
-                run.id,
-                _status_from_node(node_name, initial_state),
-                initial_state.get("error"),
-            )
-            await session.commit()
-
-            if initial_state.get("current_step") == "awaiting_approval":
-                break
-
-        final_status = (
-            "awaiting_approval"
-            if initial_state.get("current_step") == "awaiting_approval"
-            else ("failed" if initial_state.get("error") else "completed")
-        )
-        await run_repo.update_status(run.id, final_status, initial_state.get("error"))
-
-        if final_status == "completed":
-            await run_repo.mark_completed(run.id)
+        # Derive final status from DB semantics, not agent current_step
+        if state.get("current_step") == "awaiting_approval":
+            final_status = "awaiting_approval"
+            _running_states[run_id] = state
+        elif state.get("error"):
+            final_status = "failed"
             _running_states.pop(run_id, None)
-        elif final_status == "failed":
+        else:
+            final_status = "completed"
             _running_states.pop(run_id, None)
-
-        await session.commit()
 
         return RunResponse(
             run_id=run_id,
             objective=run.objective,
             status=final_status,
             created_at=run.created_at.isoformat(),
-            plan_steps=initial_state.get("plan_steps"),
-            current_step=initial_state.get("current_step"),
-            error=initial_state.get("error"),
+            plan_steps=state.get("plan_steps"),
+            current_step=state.get("current_step"),
+            error=state.get("error"),
         )
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
-        initial_state["error"] = str(e)
         try:
             await session.rollback()
             await run_repo.update_status(run.id, "failed", str(e))

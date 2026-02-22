@@ -115,3 +115,23 @@ class RunRepository:
         )
         await self._session.execute(stmt)
         await self._session.flush()
+
+    async def transition_status(
+        self, run_id: UUID, from_status: str, to_status: str
+    ) -> bool:
+        """Atomically transition status only if current status matches from_status.
+
+        Returns True if the transition succeeded (exactly one row updated).
+        Use this to prevent race conditions on approval/execution gates.
+        """
+        stmt = (
+            update(AgentRunModel)
+            .where(
+                AgentRunModel.id == run_id,
+                AgentRunModel.status == from_status,
+            )
+            .values(status=to_status)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.rowcount > 0

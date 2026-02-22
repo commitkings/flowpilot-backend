@@ -1,5 +1,4 @@
-from typing import TypedDict, Optional, Annotated
-from operator import add
+from typing import TypedDict, Optional
 
 
 class AgentState(TypedDict, total=False):
@@ -40,5 +39,5 @@ class AgentState(TypedDict, total=False):
     current_step: str
     error: Optional[str]
 
-    # Accumulator for audit log entries
-    audit_entries: Annotated[list[dict], add]
+    # Accumulated audit log entries (managed by orchestrator, not LangGraph reducer)
+    audit_entries: list[dict]
