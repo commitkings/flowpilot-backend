@@ -3,6 +3,7 @@
 .env.local
 .env.*.local
 .env.production
+.infisical.json
 
 # Python
 __pycache__/

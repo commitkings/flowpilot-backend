@@ -125,12 +125,18 @@ class CandidateRepository:
         execution_status: str,
         client_reference: str | None = None,
         provider_reference: str | None = None,
+        batch_id: UUID | None = None,
+        executed_at=None,
     ) -> None:
         values: dict = {"execution_status": execution_status}
         if client_reference is not None:
             values["client_reference"] = client_reference
         if provider_reference is not None:
             values["provider_reference"] = provider_reference
+        if batch_id is not None:
+            values["batch_id"] = batch_id
+        if executed_at is not None:
+            values["executed_at"] = executed_at
         stmt = (
             update(PayoutCandidateModel)
             .where(PayoutCandidateModel.id == candidate_id)

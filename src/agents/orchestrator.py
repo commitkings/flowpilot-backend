@@ -29,6 +29,7 @@ from src.agents.execution_agent import ExecutionAgent
 from src.agents.audit_agent import AuditAgent
 from src.infrastructure.database.repositories import (
     AuditRepository,
+    BatchRepository,
     CandidateRepository,
     PlanStepRepository,
     RunRepository,
@@ -72,6 +73,7 @@ class RunOrchestrator:
         self._plan_step_repo = PlanStepRepository(session)
         self._transaction_repo = TransactionRepository(session)
         self._candidate_repo = CandidateRepository(session)
+        self._batch_repo = BatchRepository(session)
         self._audit_repo = AuditRepository(session)
         self._step_ids: dict[str, uuid.UUID] = {}  # agent_type → plan_step.id
 
@@ -285,6 +287,71 @@ class RunOrchestrator:
                     logger.warning(f"Run {run_id}: failed to update risk for candidate {candidate_id}: {e}")
             if skipped:
                 logger.warning(f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)")
+
+        elif step_name == "execute":
+            await self._persist_execution_artifacts(run_id, state)
+
+    async def _persist_execution_artifacts(
+        self, run_id: uuid.UUID, state: AgentState
+    ) -> None:
+        """Persist lookup results, payout_batch, and execution references."""
+        from datetime import datetime, timezone
+
+        # 1. Persist lookup results on payout_candidate rows
+        for lr in state.get("candidate_lookup_results", []):
+            candidate_id = lr.get("candidate_id")
+            if not candidate_id:
+                continue
+            try:
+                match_score = lr.get("lookup_match_score")
+                await self._candidate_repo.update_lookup(
+                    candidate_id=uuid.UUID(candidate_id),
+                    lookup_status=lr.get("lookup_status", "failed"),
+                    lookup_account_name=lr.get("lookup_account_name"),
+                    lookup_match_score=(
+                        Decimal(str(match_score)) if match_score is not None else None
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"Run {run_id}: failed to persist lookup for {candidate_id}: {e}")
+
+        # 2. Create payout_batch record
+        batch_details = state.get("batch_details")
+        batch_id = None
+        if batch_details:
+            try:
+                batch = await self._batch_repo.create(
+                    run_id=run_id,
+                    batch_reference=batch_details["batch_reference"],
+                    currency=batch_details.get("currency", "NGN"),
+                    source_account_id=batch_details.get("source_account_id", ""),
+                    total_amount=Decimal(str(batch_details.get("total_amount", 0))),
+                    item_count=batch_details.get("item_count", 0),
+                    submission_status=batch_details.get("submission_status", "pending"),
+                    accepted_count=batch_details.get("accepted_count", 0),
+                    rejected_count=batch_details.get("rejected_count", 0),
+                )
+                batch_id = batch.id
+            except Exception as e:
+                logger.error(f"Run {run_id}: failed to persist payout_batch: {e}")
+
+        # 3. Persist execution results on payout_candidate rows
+        now = datetime.now(timezone.utc)
+        for er in state.get("candidate_execution_results", []):
+            candidate_id = er.get("candidate_id")
+            if not candidate_id:
+                continue
+            try:
+                await self._candidate_repo.update_execution(
+                    candidate_id=uuid.UUID(candidate_id),
+                    execution_status=er.get("execution_status", "pending"),
+                    client_reference=er.get("client_reference"),
+                    provider_reference=er.get("provider_reference"),
+                    batch_id=batch_id,
+                    executed_at=now,
+                )
+            except Exception as e:
+                logger.warning(f"Run {run_id}: failed to persist execution for {candidate_id}: {e}")
 
     # ------------------------------------------------------------------
     # Internal: approval gate
