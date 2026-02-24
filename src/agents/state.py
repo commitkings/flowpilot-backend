@@ -24,9 +24,9 @@ class AgentState(TypedDict, total=False):
     forecast: Optional[dict]
 
     # ExecutionAgent output
-    lookup_results: list[dict]
-    payout_results: list[dict]
-    payout_status_results: list[dict]
+    candidate_lookup_results: list[dict]
+    candidate_execution_results: list[dict]
+    batch_details: dict
 
     # ApprovalGate
     approved_candidate_ids: list[str]

@@ -296,6 +296,7 @@ class RunOrchestrator:
     ) -> None:
         """Persist lookup results, payout_batch, and execution references."""
         from datetime import datetime, timezone
+        persist_errors: list[str] = []
 
         # 1. Persist lookup results on payout_candidate rows
         for lr in state.get("candidate_lookup_results", []):
@@ -313,27 +314,37 @@ class RunOrchestrator:
                     ),
                 )
             except Exception as e:
-                logger.warning(f"Run {run_id}: failed to persist lookup for {candidate_id}: {e}")
+                msg = f"lookup persist for {candidate_id}: {e}"
+                logger.warning(f"Run {run_id}: {msg}")
+                persist_errors.append(msg)
 
         # 2. Create payout_batch record
         batch_details = state.get("batch_details")
         batch_id = None
         if batch_details:
-            try:
-                batch = await self._batch_repo.create(
-                    run_id=run_id,
-                    batch_reference=batch_details["batch_reference"],
-                    currency=batch_details.get("currency", "NGN"),
-                    source_account_id=batch_details.get("source_account_id", ""),
-                    total_amount=Decimal(str(batch_details.get("total_amount", 0))),
-                    item_count=batch_details.get("item_count", 0),
-                    submission_status=batch_details.get("submission_status", "pending"),
-                    accepted_count=batch_details.get("accepted_count", 0),
-                    rejected_count=batch_details.get("rejected_count", 0),
-                )
-                batch_id = batch.id
-            except Exception as e:
-                logger.error(f"Run {run_id}: failed to persist payout_batch: {e}")
+            item_count = batch_details.get("item_count", 0)
+            if item_count < 1:
+                msg = f"batch skipped: item_count={item_count}"
+                logger.error(f"Run {run_id}: {msg}")
+                persist_errors.append(msg)
+            else:
+                try:
+                    batch = await self._batch_repo.create(
+                        run_id=run_id,
+                        batch_reference=batch_details["batch_reference"],
+                        currency=batch_details.get("currency", "NGN"),
+                        source_account_id=batch_details.get("source_account_id", ""),
+                        total_amount=Decimal(str(batch_details.get("total_amount", 0))),
+                        item_count=item_count,
+                        submission_status=batch_details.get("submission_status", "pending"),
+                        accepted_count=batch_details.get("accepted_count", 0),
+                        rejected_count=batch_details.get("rejected_count", 0),
+                    )
+                    batch_id = batch.id
+                except Exception as e:
+                    msg = f"batch persist: {e}"
+                    logger.error(f"Run {run_id}: {msg}")
+                    persist_errors.append(msg)
 
         # 3. Persist execution results on payout_candidate rows
         now = datetime.now(timezone.utc)
@@ -341,17 +352,32 @@ class RunOrchestrator:
             candidate_id = er.get("candidate_id")
             if not candidate_id:
                 continue
+            exec_status = er.get("execution_status", "pending")
+            # Only link to batch and set executed_at for candidates that were actually submitted
+            was_submitted = exec_status != "requires_followup"
             try:
                 await self._candidate_repo.update_execution(
                     candidate_id=uuid.UUID(candidate_id),
-                    execution_status=er.get("execution_status", "pending"),
+                    execution_status=exec_status,
                     client_reference=er.get("client_reference"),
                     provider_reference=er.get("provider_reference"),
-                    batch_id=batch_id,
-                    executed_at=now,
+                    batch_id=batch_id if was_submitted else None,
+                    executed_at=now if was_submitted else None,
                 )
             except Exception as e:
-                logger.warning(f"Run {run_id}: failed to persist execution for {candidate_id}: {e}")
+                msg = f"execution persist for {candidate_id}: {e}"
+                logger.warning(f"Run {run_id}: {msg}")
+                persist_errors.append(msg)
+
+        # Propagate critical persistence failures to state so run doesn't silently complete
+        if persist_errors:
+            err_summary = f"Execution artifact persistence errors: {'; '.join(persist_errors[:5])}"
+            logger.error(f"Run {run_id}: {err_summary}")
+            existing_error = state.get("error")
+            if existing_error:
+                state["error"] = f"{existing_error} | {err_summary}"
+            else:
+                state["error"] = err_summary
 
     # ------------------------------------------------------------------
     # Internal: approval gate

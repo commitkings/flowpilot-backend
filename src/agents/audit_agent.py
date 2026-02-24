@@ -31,18 +31,7 @@ class AuditAgent(BaseAgent):
                     "unresolved_count": len(state.get("unresolved_references", [])),
                 },
                 "risk_summary": self._summarize_risk(state.get("scored_candidates", [])),
-                "execution_summary": {
-                    "lookup_results_count": len(state.get("lookup_results", [])),
-                    "payout_batches": len(state.get("payout_results", [])),
-                    "final_statuses": [
-                        {
-                            "reference": s.get("providerReference"),
-                            "status": s.get("status"),
-                            "amount": s.get("amount"),
-                        }
-                        for s in state.get("payout_status_results", [])
-                    ],
-                },
+                "execution_summary": self._summarize_execution(state),
                 "approval_summary": {
                     "approved": len(state.get("approved_candidate_ids", [])),
                     "rejected": len(state.get("rejected_candidate_ids", [])),
@@ -61,7 +50,7 @@ Run ID: {state.get('run_id')}
 Objective: {state.get('objective')}
 Transactions processed: {len(state.get('transactions', []))}
 Candidates scored: {len(state.get('scored_candidates', []))}
-Payouts executed: {len(state.get('payout_results', []))}
+Payouts executed: {len(state.get('candidate_execution_results', []))}
 Risk summary: {json.dumps(report['risk_summary'])}
 
 Write in professional, factual tone suitable for an audit report."""
@@ -118,4 +107,33 @@ Write in professional, factual tone suitable for an audit report."""
             "decisions": decisions,
             "average_risk_score": round(avg_score, 3),
             "total_amount": total_amount,
+        }
+
+    def _summarize_execution(self, state: AgentState) -> dict:
+        lookup_results = state.get("candidate_lookup_results", [])
+        exec_results = state.get("candidate_execution_results", [])
+        batch = state.get("batch_details")
+
+        lookup_counts = {}
+        for lr in lookup_results:
+            s = lr.get("lookup_status", "unknown")
+            lookup_counts[s] = lookup_counts.get(s, 0) + 1
+
+        exec_counts = {}
+        for er in exec_results:
+            s = er.get("execution_status", "unknown")
+            exec_counts[s] = exec_counts.get(s, 0) + 1
+
+        return {
+            "lookups_performed": len(lookup_results),
+            "lookup_statuses": lookup_counts,
+            "candidates_submitted": len(exec_results),
+            "execution_statuses": exec_counts,
+            "batch": {
+                "batch_reference": batch.get("batch_reference"),
+                "submission_status": batch.get("submission_status"),
+                "item_count": batch.get("item_count"),
+                "accepted_count": batch.get("accepted_count"),
+                "rejected_count": batch.get("rejected_count"),
+            } if batch else None,
         }

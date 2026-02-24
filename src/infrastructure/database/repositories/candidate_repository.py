@@ -64,11 +64,13 @@ class CandidateRepository:
         return result.rowcount
 
     async def reject(self, candidate_ids: list[UUID], run_id: UUID) -> int:
+        # Only reject candidates still pending — prevents race with concurrent approve
         stmt = (
             update(PayoutCandidateModel)
             .where(
                 PayoutCandidateModel.id.in_(candidate_ids),
                 PayoutCandidateModel.run_id == run_id,
+                PayoutCandidateModel.approval_status == "pending",
             )
             .values(approval_status="rejected")
         )
