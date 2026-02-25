@@ -79,22 +79,22 @@ def _serialize_transaction(transaction) -> dict:
         "transactionReference": transaction.interswitch_ref,
         "amount": float(transaction.amount),
         "currency": transaction.currency,
+        "direction": transaction.direction,
         "status": transaction.status,
         "channel": transaction.channel,
+        "narration": transaction.narration,
         "timestamp": (
             transaction.transaction_timestamp.isoformat()
             if transaction.transaction_timestamp
             else None
         ),
-        "customerId": transaction.customer_id,
-        "merchantId": transaction.merchant_id,
-        "processorResponseCode": transaction.processor_response_code,
-        "processorResponseMessage": transaction.processor_response_message,
         "settlementDate": (
             transaction.settlement_date.isoformat()
             if transaction.settlement_date
             else None
         ),
+        "counterpartyName": transaction.counterparty_name,
+        "counterpartyBank": transaction.counterparty_bank,
         "hasAnomaly": transaction.has_anomaly,
         "anomalyCount": transaction.anomaly_count,
     }
@@ -175,6 +175,7 @@ async def _reconstruct_state_from_db(
 
     return {
         "run_id": str(run.id),
+        "business_id": str(run.business_id),
         "objective": run.objective,
         "constraints": run.constraints,
         "risk_tolerance": float(run.risk_tolerance),

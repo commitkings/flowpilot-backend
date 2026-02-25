@@ -169,7 +169,7 @@ async def create_run(
             }
             for c in request.candidates
         ]
-        persisted = await candidate_repo.create_batch(run.id, raw_rows)
+        persisted = await candidate_repo.create_batch(run.id, raw_rows, business_id=business_uuid)
         await session.commit()
         # Build dicts for RiskAgent (matches its expected input format)
         candidate_dicts = [
@@ -429,7 +429,7 @@ async def upload_candidates_csv(
             detail=f"No valid candidates in CSV. Errors: {'; '.join(errors[:10])}",
         )
 
-    persisted = await candidate_repo.create_batch(run_uuid, rows)
+    persisted = await candidate_repo.create_batch(run_uuid, rows, business_id=run.business_id)
     await session.commit()
 
     return {

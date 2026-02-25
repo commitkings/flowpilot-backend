@@ -8,9 +8,11 @@ from pydantic import BaseModel, Field
 class RunStatus(str, Enum):
     PENDING = "pending"
     PLANNING = "planning"
-    EXECUTING = "executing"
+    RECONCILING = "reconciling"
+    SCORING = "scoring"
+    FORECASTING = "forecasting"
     AWAITING_APPROVAL = "awaiting_approval"
-    APPROVED = "approved"
+    EXECUTING = "executing"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -24,7 +26,6 @@ class AgentRun(BaseModel):
     budget_cap: Optional[float] = Field(None, description="Maximum payout budget in NGN")
     status: RunStatus = Field(default=RunStatus.PENDING)
     plan_graph: Optional[dict] = Field(None, description="Executable plan from PlannerAgent")
-    operator_id: Optional[str] = None  # backward compat alias for created_by
     created_by: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

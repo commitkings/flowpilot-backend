@@ -425,14 +425,14 @@ def upgrade() -> None:
     op.create_index('agent_run_business_id_created_at_idx', 'agent_run', ['business_id', sa.literal_column('created_at DESC')], unique=False)
     op.create_index('agent_run_business_id_idx', 'agent_run', ['business_id'], unique=False)
     op.create_index('agent_run_created_by_idx', 'agent_run', ['created_by'], unique=False)
-    op.create_foreign_key(None, 'agent_run', 'user', ['cancelled_by'], ['id'], ondelete='SET NULL')
-    op.create_foreign_key(None, 'agent_run', 'business', ['business_id'], ['id'], ondelete='CASCADE')
-    op.create_foreign_key(None, 'agent_run', 'user', ['created_by'], ['id'], ondelete='RESTRICT')
-    op.create_foreign_key(None, 'agent_run', 'user', ['approved_by'], ['id'], ondelete='SET NULL')
+    op.create_foreign_key('agent_run_cancelled_by_fkey', 'agent_run', 'user', ['cancelled_by'], ['id'], ondelete='SET NULL')
+    op.create_foreign_key('agent_run_business_id_fkey', 'agent_run', 'business', ['business_id'], ['id'], ondelete='CASCADE')
+    op.create_foreign_key('agent_run_created_by_fkey', 'agent_run', 'user', ['created_by'], ['id'], ondelete='RESTRICT')
+    op.create_foreign_key('agent_run_approved_by_fkey', 'agent_run', 'user', ['approved_by'], ['id'], ondelete='SET NULL')
     op.drop_column('agent_run', 'operator_id')
 
     # audit_log FK already dropped above; just re-create pointing to run_step
-    op.create_foreign_key(None, 'audit_log', 'run_step', ['step_id'], ['id'], ondelete='SET NULL')
+    op.create_foreign_key('audit_log_step_id_fkey', 'audit_log', 'run_step', ['step_id'], ['id'], ondelete='SET NULL')
     op.drop_column('audit_log', 'response_time_ms')
     op.drop_column('audit_log', 'request_hash')
     op.drop_column('audit_log', 'response_status')
@@ -454,7 +454,7 @@ def upgrade() -> None:
     """)
     op.alter_column('payout_batch', 'business_id', nullable=False)
     op.create_index('payout_batch_business_id_idx', 'payout_batch', ['business_id'], unique=False)
-    op.create_foreign_key(None, 'payout_batch', 'business', ['business_id'], ['id'], ondelete='CASCADE')
+    op.create_foreign_key('payout_batch_business_id_fkey', 'payout_batch', 'business', ['business_id'], ['id'], ondelete='CASCADE')
     op.add_column('payout_candidate', sa.Column('business_id', sa.UUID(), nullable=True))
     op.alter_column('payout_candidate', 'amount',
                existing_type=sa.NUMERIC(precision=15, scale=2),
@@ -478,8 +478,8 @@ def upgrade() -> None:
     op.alter_column('payout_candidate', 'business_id', nullable=False)
     op.create_index('payout_candidate_business_id_idx', 'payout_candidate', ['business_id'], unique=False)
     # payout_candidate FK already dropped above; just re-create pointing to user + business
-    op.create_foreign_key(None, 'payout_candidate', 'business', ['business_id'], ['id'], ondelete='CASCADE')
-    op.create_foreign_key(None, 'payout_candidate', 'user', ['approved_by'], ['id'], ondelete='SET NULL')
+    op.create_foreign_key('payout_candidate_business_id_fkey', 'payout_candidate', 'business', ['business_id'], ['id'], ondelete='CASCADE')
+    op.create_foreign_key('payout_candidate_approved_by_fkey', 'payout_candidate', 'user', ['approved_by'], ['id'], ondelete='SET NULL')
 
     # 7. Create set_updated_at trigger for new mutable tables
     op.execute("""
@@ -492,7 +492,7 @@ def upgrade() -> None:
         $$ LANGUAGE plpgsql;
     """)
     for tbl in [
-        'business', 'business_config', 'business_member', 'invitation',
+        'user', 'business', 'business_config', 'business_member', 'invitation',
         'reconciled_transaction', 'run_step', 'forecast_result',
         'notification_outbox',
     ]:
@@ -501,14 +501,45 @@ def upgrade() -> None:
             BEFORE UPDATE ON {tbl}
             FOR EACH ROW EXECUTE FUNCTION set_updated_at();
         """)
+
+    # 8. Add institution_type_check constraint
+    op.create_check_constraint(
+        'institution_type_check', 'institution',
+        "institution_type IN ('bank', 'mobile_money', 'microfinance', 'other')"
+    )
+
+    # 9. Add missing FK-supporting indexes
+    op.create_index('agent_run_approved_by_idx', 'agent_run', ['approved_by'], unique=False)
+    op.create_index('agent_run_cancelled_by_idx', 'agent_run', ['cancelled_by'], unique=False)
+    op.create_index('invitation_invited_by_idx', 'invitation', ['invited_by'], unique=False)
+    op.create_index('run_event_step_id_idx', 'run_event', ['step_id'], unique=False)
+    op.create_index('notification_outbox_run_id_idx', 'notification_outbox', ['run_id'], unique=False)
+
+    # 10. Add missing audit_log indexes (not in baseline)
+    op.create_index('audit_log_run_id_idx', 'audit_log', ['run_id'], unique=False)
+    op.create_index('audit_log_step_id_idx', 'audit_log', ['step_id'], unique=False)
+    op.create_index('audit_log_run_id_created_at_idx', 'audit_log', ['run_id', sa.literal_column('created_at DESC')], unique=False)
+    op.create_index('audit_log_created_at_brin_idx', 'audit_log', ['created_at'], unique=False, postgresql_using='brin')
+    op.create_index('audit_log_detail_gin_idx', 'audit_log', ['detail'], unique=False, postgresql_using='gin')
+
+    # 11. Add missing payout_candidate GIN index
+    op.create_index('payout_candidate_risk_reasons_idx', 'payout_candidate', ['risk_reasons'], unique=False, postgresql_using='gin')
+
+    # 12. Drop redundant run_step index (unique constraint already creates one)
+    op.drop_index('run_step_run_id_step_order_idx', table_name='run_step')
+
+    # 13. Fix invitation.invited_by and approval_override.overridden_by to be nullable
+    #     (required for SET NULL ondelete to work)
+    op.alter_column('invitation', 'invited_by', nullable=True)
+    op.alter_column('approval_override', 'overridden_by', nullable=True)
     # ### end Alembic commands ###
 
 
 def downgrade() -> None:
     """Downgrade schema."""
     # ### commands auto generated by Alembic - please adjust! ###
-    op.drop_constraint(None, 'payout_candidate', type_='foreignkey')
-    op.drop_constraint(None, 'payout_candidate', type_='foreignkey')
+    op.drop_constraint('payout_candidate_business_id_fkey', 'payout_candidate', type_='foreignkey')
+    op.drop_constraint('payout_candidate_approved_by_fkey', 'payout_candidate', type_='foreignkey')
     op.create_foreign_key(op.f('payout_candidate_approved_by_fkey'), 'payout_candidate', 'operator', ['approved_by'], ['id'], ondelete='SET NULL')
     op.drop_index('payout_candidate_business_id_idx', table_name='payout_candidate')
     op.alter_column('payout_candidate', 'lookup_match_score',
@@ -524,7 +555,7 @@ def downgrade() -> None:
                type_=sa.NUMERIC(precision=15, scale=2),
                existing_nullable=False)
     op.drop_column('payout_candidate', 'business_id')
-    op.drop_constraint(None, 'payout_batch', type_='foreignkey')
+    op.drop_constraint('payout_batch_business_id_fkey', 'payout_batch', type_='foreignkey')
     op.drop_index('payout_batch_business_id_idx', table_name='payout_batch')
     op.alter_column('payout_batch', 'total_amount',
                existing_type=sa.Numeric(precision=18, scale=2),
@@ -538,13 +569,13 @@ def downgrade() -> None:
     op.add_column('audit_log', sa.Column('response_status', sa.SMALLINT(), autoincrement=False, nullable=True))
     op.add_column('audit_log', sa.Column('request_hash', sa.CHAR(length=64), autoincrement=False, nullable=True))
     op.add_column('audit_log', sa.Column('response_time_ms', sa.INTEGER(), autoincrement=False, nullable=True))
-    op.drop_constraint(None, 'audit_log', type_='foreignkey')
+    op.drop_constraint('audit_log_step_id_fkey', 'audit_log', type_='foreignkey')
     op.create_foreign_key(op.f('audit_log_step_id_fkey'), 'audit_log', 'plan_step', ['step_id'], ['id'], ondelete='SET NULL')
     op.add_column('agent_run', sa.Column('operator_id', sa.UUID(), autoincrement=False, nullable=False))
-    op.drop_constraint(None, 'agent_run', type_='foreignkey')
-    op.drop_constraint(None, 'agent_run', type_='foreignkey')
-    op.drop_constraint(None, 'agent_run', type_='foreignkey')
-    op.drop_constraint(None, 'agent_run', type_='foreignkey')
+    op.drop_constraint('agent_run_cancelled_by_fkey', 'agent_run', type_='foreignkey')
+    op.drop_constraint('agent_run_business_id_fkey', 'agent_run', type_='foreignkey')
+    op.drop_constraint('agent_run_created_by_fkey', 'agent_run', type_='foreignkey')
+    op.drop_constraint('agent_run_approved_by_fkey', 'agent_run', type_='foreignkey')
     op.create_foreign_key(op.f('agent_run_operator_id_fkey'), 'agent_run', 'operator', ['operator_id'], ['id'], ondelete='RESTRICT')
     op.drop_index('agent_run_created_by_idx', table_name='agent_run')
     op.drop_index('agent_run_business_id_idx', table_name='agent_run')

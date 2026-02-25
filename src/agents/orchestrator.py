@@ -356,8 +356,10 @@ class RunOrchestrator:
                 persist_errors.append(msg)
             else:
                 try:
+                    business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else run_id
                     batch = await self._batch_repo.create(
                         run_id=run_id,
+                        business_id=business_id,
                         batch_reference=batch_details["batch_reference"],
                         currency=batch_details.get("currency", "NGN"),
                         source_account_id=batch_details.get("source_account_id", ""),
@@ -465,10 +467,6 @@ class RunOrchestrator:
                 "agent_type": entry.get("agent_type"),
                 "action": entry.get("action", "unknown"),
                 "detail": entry.get("detail"),
-                "api_endpoint": entry.get("api_endpoint"),
-                "request_hash": entry.get("request_hash"),
-                "response_status": entry.get("response_status"),
-                "response_time_ms": entry.get("response_time_ms"),
             }
             for entry in entries
         ]
@@ -524,14 +522,14 @@ def _map_transactions(txns: list[dict]) -> list[dict]:
             "interswitch_ref": ref,
             "amount": amount,
             "currency": t.get("currency", "NGN"),
+            "direction": t.get("direction", "inflow"),
             "status": status,
             "channel": t.get("channel"),
+            "narration": t.get("narration"),
             "transaction_timestamp": t.get("timestamp"),
-            "customer_id": t.get("customerId"),
-            "merchant_id": t.get("merchantId"),
-            "processor_response_code": t.get("processorResponseCode"),
-            "processor_response_message": t.get("processorResponseMessage"),
             "settlement_date": t.get("settlementDate"),
+            "counterparty_name": t.get("counterpartyName"),
+            "counterparty_bank": t.get("counterpartyBank"),
             "has_anomaly": t.get("isAnomaly", False),
             "anomaly_count": len(t.get("anomalies", [])) if t.get("isAnomaly") else 0,
         })

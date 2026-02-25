@@ -239,7 +239,7 @@ class InvitationModel(Base):
         UUID(as_uuid=True),
         ForeignKey("business.id", ondelete="CASCADE"),
     )
-    invited_by: Mapped[uuid.UUID] = mapped_column(
+    invited_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
     )
@@ -1089,7 +1089,7 @@ class ApprovalOverrideModel(Base):
         UUID(as_uuid=True),
         ForeignKey("agent_run.id", ondelete="CASCADE"),
     )
-    overridden_by: Mapped[uuid.UUID] = mapped_column(
+    overridden_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
     )
