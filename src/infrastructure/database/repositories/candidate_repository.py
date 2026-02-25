@@ -16,10 +16,10 @@ class CandidateRepository:
         self._session = session
 
     async def create_batch(
-        self, run_id: UUID, candidates: list[dict]
+        self, run_id: UUID, candidates: list[dict], business_id: UUID | None = None,
     ) -> list[PayoutCandidateModel]:
         models = [
-            PayoutCandidateModel(run_id=run_id, **candidate)
+            PayoutCandidateModel(run_id=run_id, business_id=business_id, **candidate)
             for candidate in candidates
         ]
         self._session.add_all(models)

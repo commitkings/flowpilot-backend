@@ -21,10 +21,6 @@ class AuditRepository:
         agent_type: str | None = None,
         step_id: UUID | None = None,
         detail: dict | None = None,
-        api_endpoint: str | None = None,
-        request_hash: str | None = None,
-        response_status: int | None = None,
-        response_time_ms: int | None = None,
     ) -> AuditLogModel:
         entry = AuditLogModel(
             run_id=run_id,
@@ -32,10 +28,6 @@ class AuditRepository:
             agent_type=agent_type,
             step_id=step_id,
             detail=detail,
-            api_endpoint=api_endpoint,
-            request_hash=request_hash,
-            response_status=response_status,
-            response_time_ms=response_time_ms,
         )
         self._session.add(entry)
         await self._session.flush()

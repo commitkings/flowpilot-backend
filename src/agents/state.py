@@ -3,6 +3,7 @@ from typing import TypedDict, Optional
 
 class AgentState(TypedDict, total=False):
     run_id: str
+    business_id: str
     objective: str
     constraints: Optional[str]
     risk_tolerance: float

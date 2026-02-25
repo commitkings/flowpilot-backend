@@ -57,7 +57,8 @@ class CandidateResponse(BaseModel):
 
 
 class CreateRunRequest(BaseModel):
-    operator_id: str = Field(_DEFAULT_OPERATOR_ID, description="Operator UUID")
+    business_id: str = Field(..., description="Business UUID (multi-tenancy scope)")
+    created_by: str = Field(_DEFAULT_OPERATOR_ID, description="User UUID")
     objective: str = Field(..., description="Operator objective text")
     constraints: Optional[str] = None
     risk_tolerance: float = Field(0.35, ge=0.0, le=1.0)
@@ -129,12 +130,14 @@ async def create_run(
     request: CreateRunRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    operator_id = _parse_uuid(request.operator_id, "operator_id")
+    operator_id = _parse_uuid(request.created_by, "created_by")
+    business_uuid = _parse_uuid(request.business_id, "business_id")
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
 
     run = await run_repo.create(
-        operator_id=operator_id,
+        business_id=business_uuid,
+        created_by=operator_id,
         objective=request.objective,
         merchant_id=request.merchant_id or Settings.INTERSWITCH_MERCHANT_ID,
         constraints=request.constraints,
@@ -185,6 +188,7 @@ async def create_run(
 
     state: AgentState = {
         "run_id": run_id,
+        "business_id": str(business_uuid),
         "objective": request.objective,
         "constraints": request.constraints,
         "risk_tolerance": request.risk_tolerance,
@@ -294,7 +298,7 @@ async def get_run(
                 "description": s.description,
                 "status": s.status,
             }
-            for s in (run.plan_steps or [])
+            for s in (run.run_steps or [])
         ]
         current_step = _current_step_from_status(run.status)
 

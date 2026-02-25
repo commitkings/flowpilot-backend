@@ -76,7 +76,7 @@ def _serialize_plan_step(plan_step) -> dict:
 
 def _serialize_transaction(transaction) -> dict:
     return {
-        "transactionReference": transaction.transaction_reference,
+        "transactionReference": transaction.interswitch_ref,
         "amount": float(transaction.amount),
         "currency": transaction.currency,
         "status": transaction.status,
@@ -95,8 +95,8 @@ def _serialize_transaction(transaction) -> dict:
             if transaction.settlement_date
             else None
         ),
-        "isAnomaly": transaction.is_anomaly,
-        "anomalyReason": transaction.anomaly_reason,
+        "hasAnomaly": transaction.has_anomaly,
+        "anomalyCount": transaction.anomaly_count,
     }
 
 
@@ -156,8 +156,8 @@ async def _reconstruct_state_from_db(
     if run is None:
         return None
 
-    plan_steps = [_serialize_plan_step(step) for step in run.plan_steps]
-    transactions = [_serialize_transaction(txn) for txn in run.transactions]
+    plan_steps = [_serialize_plan_step(step) for step in run.run_steps]
+    transactions = [_serialize_transaction(txn) for txn in run.reconciled_transactions]
     scored_candidates = [
         _serialize_scored_candidate(c) for c in run.payout_candidates
     ]
@@ -267,7 +267,7 @@ async def approve_candidates(
             raise HTTPException(status_code=404, detail="Run not found")
 
     # Approve candidates in DB (candidate_ids already validated above)
-    approved_count = await candidate_repo.approve(candidate_ids, run.operator_id, run_uuid)
+    approved_count = await candidate_repo.approve(candidate_ids, run.created_by, run_uuid)
 
     # Audit log: approval action
     audit_repo = AuditRepository(session)
@@ -277,7 +277,7 @@ async def approve_candidates(
         detail={
             "candidate_ids": [str(cid) for cid in candidate_ids],
             "approved_count": approved_count,
-            "operator_id": str(run.operator_id),
+            "created_by": str(run.created_by),
         },
     )
     await session.commit()

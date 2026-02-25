@@ -21,8 +21,11 @@ class InstitutionRepository:
             index_elements=["institution_code"],
             set_={
                 "institution_name": stmt.excluded.institution_name,
+                "short_name": stmt.excluded.short_name,
+                "institution_type": stmt.excluded.institution_type,
                 "is_active": stmt.excluded.is_active,
                 "last_synced_at": stmt.excluded.last_synced_at,
+                "raw_response": stmt.excluded.raw_response,
             },
         )
         result = await self._session.execute(stmt)

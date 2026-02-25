@@ -19,6 +19,7 @@ class BatchRepository:
     async def create(
         self,
         run_id: UUID,
+        business_id: UUID,
         batch_reference: str,
         currency: str,
         source_account_id: str,
@@ -30,6 +31,7 @@ class BatchRepository:
     ) -> PayoutBatchModel:
         batch = PayoutBatchModel(
             run_id=run_id,
+            business_id=business_id,
             batch_reference=batch_reference,
             currency=currency,
             source_account_id=source_account_id,

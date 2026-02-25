@@ -270,14 +270,11 @@ class RunOrchestrator:
         elif step_name == "reconcile" and state.get("transactions"):
             mapped_txns = _map_transactions(state["transactions"])
             if mapped_txns:
-                await self._transaction_repo.create_batch(run_id, mapped_txns)
-
-            # Update transactions resolved by reference_search
-            resolved = state.get("resolved_references", [])
-            if resolved:
-                await self._transaction_repo.update_resolved(run_id, resolved)
+                business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else None
+                await self._transaction_repo.create_batch(run_id, business_id, mapped_txns)
 
             # Persist reconciliation summary on plan_step output_data
+            resolved = state.get("resolved_references", [])
             recon_step_id = self._step_ids.get("reconciliation")
             if recon_step_id is not None:
                 await self._plan_step_repo.mark_completed(
@@ -524,7 +521,7 @@ def _map_transactions(txns: list[dict]) -> list[dict]:
         if not ref or amount is None or status is None:
             continue
         mapped.append({
-            "transaction_reference": ref,
+            "interswitch_ref": ref,
             "amount": amount,
             "currency": t.get("currency", "NGN"),
             "status": status,
@@ -535,8 +532,8 @@ def _map_transactions(txns: list[dict]) -> list[dict]:
             "processor_response_code": t.get("processorResponseCode"),
             "processor_response_message": t.get("processorResponseMessage"),
             "settlement_date": t.get("settlementDate"),
-            "is_anomaly": t.get("isAnomaly", False),
-            "anomaly_reason": t.get("anomalyReason"),
+            "has_anomaly": t.get("isAnomaly", False),
+            "anomaly_count": len(t.get("anomalies", [])) if t.get("isAnomaly") else 0,
         })
     return mapped
 

@@ -18,15 +18,17 @@ class RunRepository:
 
     async def create(
         self,
-        operator_id: UUID,
+        business_id: UUID,
+        created_by: UUID,
         objective: str,
         merchant_id: str,
         constraints: str | None = None,
-        risk_tolerance: Decimal = Decimal("0.35"),
+        risk_tolerance: Decimal = Decimal("0.3500"),
         budget_cap: Decimal | None = None,
     ) -> AgentRunModel:
         run = AgentRunModel(
-            operator_id=operator_id,
+            business_id=business_id,
+            created_by=created_by,
             objective=objective,
             merchant_id=merchant_id,
             constraints=constraints,
@@ -41,8 +43,8 @@ class RunRepository:
         stmt = (
             select(AgentRunModel)
             .options(
-                selectinload(AgentRunModel.plan_steps),
-                selectinload(AgentRunModel.transactions),
+                selectinload(AgentRunModel.run_steps),
+                selectinload(AgentRunModel.reconciled_transactions),
                 selectinload(AgentRunModel.payout_candidates),
                 selectinload(AgentRunModel.payout_batches),
             )
@@ -51,12 +53,12 @@ class RunRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def list_by_operator(
-        self, operator_id: UUID, limit: int = 50, offset: int = 0
+    async def list_by_business(
+        self, business_id: UUID, limit: int = 50, offset: int = 0
     ) -> list[AgentRunModel]:
         stmt = (
             select(AgentRunModel)
-            .where(AgentRunModel.operator_id == operator_id)
+            .where(AgentRunModel.business_id == business_id)
             .order_by(AgentRunModel.created_at.desc())
             .limit(limit)
             .offset(offset)

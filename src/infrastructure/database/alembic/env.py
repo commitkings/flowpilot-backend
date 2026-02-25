@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
-from src.infrastructure.database.flowpilot_models import Base
+from src.infrastructure.database.base import Base
+import src.infrastructure.database.flowpilot_models  # noqa: F401 — register models
 
 config = context.config
 
