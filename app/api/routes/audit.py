@@ -28,10 +28,6 @@ def _serialize_audit_log(entry) -> dict:
         "agent_type": entry.agent_type,
         "action": entry.action,
         "detail": entry.detail,
-        "api_endpoint": entry.api_endpoint,
-        "request_hash": entry.request_hash,
-        "response_status": entry.response_status,
-        "response_time_ms": entry.response_time_ms,
         "created_at": entry.created_at.isoformat(),
     }
 
