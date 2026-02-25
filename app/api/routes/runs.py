@@ -194,6 +194,7 @@ async def create_run(
         "transactions": [],
         "reconciled_ledger": {},
         "unresolved_references": [],
+        "resolved_references": [],
         "scored_candidates": candidate_dicts,
         "forecast": None,
         "candidate_lookup_results": [],

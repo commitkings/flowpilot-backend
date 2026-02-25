@@ -277,6 +277,7 @@ class ExecutionAgent(BaseAgent):
                     "provider_reference": provider_ref,
                     "item_status": item_status,
                 },
+                "api_endpoint": "/api/v1/payouts",
             })
 
         return batch_details, candidate_results

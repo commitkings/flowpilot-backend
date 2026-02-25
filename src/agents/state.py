@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     transactions: list[dict]
     reconciled_ledger: dict
     unresolved_references: list[str]
+    resolved_references: list[dict]
 
     # RiskAgent output
     scored_candidates: list[dict]

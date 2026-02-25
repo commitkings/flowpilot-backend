@@ -62,6 +62,12 @@ Write in professional, factual tone suitable for an audit report."""
 
             report["executive_summary"] = narrative
 
+            # Prepare report for persistence (exclude audit_trail to avoid
+            # redundancy — individual entries are already in audit_log)
+            persistable_report = {
+                k: v for k, v in report.items() if k != "audit_trail"
+            }
+
             logger.info("[AuditAgent] Audit report generated")
 
             return {
@@ -70,9 +76,8 @@ Write in professional, factual tone suitable for an audit report."""
                 "current_step": "audit_complete",
                 "audit_entries": [{
                     "agent_type": "audit",
-                    "action": "report_generated",
-                    "detail": {"report_sections": list(report.keys())},
-                    "created_at": datetime.utcnow().isoformat(),
+                    "action": "final_report",
+                    "detail": persistable_report,
                 }],
             }
         except Exception as e:
@@ -85,7 +90,6 @@ Write in professional, factual tone suitable for an audit report."""
                     "agent_type": "audit",
                     "action": "audit_failed",
                     "detail": {"error": str(e)},
-                    "created_at": datetime.utcnow().isoformat(),
                 }],
             }
 

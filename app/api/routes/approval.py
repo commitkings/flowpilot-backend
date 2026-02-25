@@ -11,6 +11,7 @@ from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.state import AgentState
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
+    AuditRepository,
     CandidateRepository,
     RunRepository,
     TransactionRepository,
@@ -183,6 +184,7 @@ async def _reconstruct_state_from_db(
         "transactions": transactions,
         "reconciled_ledger": _build_reconciled_ledger(transactions),
         "unresolved_references": unresolved,
+        "resolved_references": [],
         "scored_candidates": scored_candidates,
         "forecast": None,
         "candidate_lookup_results": [],
@@ -266,6 +268,18 @@ async def approve_candidates(
 
     # Approve candidates in DB (candidate_ids already validated above)
     approved_count = await candidate_repo.approve(candidate_ids, run.operator_id, run_uuid)
+
+    # Audit log: approval action
+    audit_repo = AuditRepository(session)
+    await audit_repo.append(
+        run_id=run_uuid,
+        action="candidates_approved",
+        detail={
+            "candidate_ids": [str(cid) for cid in candidate_ids],
+            "approved_count": approved_count,
+            "operator_id": str(run.operator_id),
+        },
+    )
     await session.commit()
 
     # Update in-memory state
@@ -337,6 +351,19 @@ async def reject_candidates(
 
     # Reject candidates in DB (candidate_ids already validated above)
     rejected_count = await candidate_repo.reject(candidate_ids, run_uuid)
+
+    # Audit log: rejection action
+    audit_repo = AuditRepository(session)
+    await audit_repo.append(
+        run_id=run_uuid,
+        action="candidates_rejected",
+        detail={
+            "candidate_ids": [str(cid) for cid in candidate_ids],
+            "rejected_count": rejected_count,
+            "reason": request.reason,
+        },
+    )
+    await session.commit()
 
     state = _running_states.get(run_id)
     remaining_approved = 0

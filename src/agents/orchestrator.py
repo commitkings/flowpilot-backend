@@ -211,7 +211,8 @@ class RunOrchestrator:
         state["audit_entries"].extend(new_audit_entries)
 
         # 9. Persist step-specific artifacts (may populate self._step_ids for plan step)
-        await self._persist_step_artifacts(run_id, step_name, state)
+        #    Returns True if step status/output_data was already finalized.
+        step_finalized = await self._persist_step_artifacts(run_id, step_name, state)
 
         # 10. Re-read step_id after artifact persistence (plan step creates step_ids)
         step_id = self._step_ids.get(agent_type)
@@ -220,8 +221,8 @@ class RunOrchestrator:
         error_after = state.get("error")
         step_failed = error_after is not None and error_after != error_before
 
-        # 12. Mark plan_step complete/failed (only blame THIS step for failures it caused)
-        if step_id is not None:
+        # 12. Mark plan_step complete/failed (skip if _persist_step_artifacts already finalized)
+        if step_id is not None and not step_finalized:
             node_output = result_state if isinstance(result_state, dict) else None
             if step_failed:
                 await self._plan_step_repo.update_status(
@@ -249,8 +250,12 @@ class RunOrchestrator:
 
     async def _persist_step_artifacts(
         self, run_id: uuid.UUID, step_name: str, state: AgentState
-    ) -> None:
-        """Persist step-specific data to the appropriate tables."""
+    ) -> bool:
+        """Persist step-specific data to the appropriate tables.
+
+        Returns True if the step's status/output_data was already finalized here
+        (caller should skip redundant mark_completed).
+        """
         if step_name == "plan" and state.get("plan_steps"):
             mapped_steps = _map_plan_steps(state["plan_steps"])
             persisted = await self._plan_step_repo.create_batch(run_id, mapped_steps)
@@ -260,11 +265,32 @@ class RunOrchestrator:
             await self._run_repo.update_plan_graph(
                 run_id, {"steps": state["plan_steps"]}
             )
+            return False
 
         elif step_name == "reconcile" and state.get("transactions"):
             mapped_txns = _map_transactions(state["transactions"])
             if mapped_txns:
                 await self._transaction_repo.create_batch(run_id, mapped_txns)
+
+            # Update transactions resolved by reference_search
+            resolved = state.get("resolved_references", [])
+            if resolved:
+                await self._transaction_repo.update_resolved(run_id, resolved)
+
+            # Persist reconciliation summary on plan_step output_data
+            recon_step_id = self._step_ids.get("reconciliation")
+            if recon_step_id is not None:
+                await self._plan_step_repo.mark_completed(
+                    recon_step_id,
+                    output_data={
+                        "reconciled_ledger": state.get("reconciled_ledger", {}),
+                        "unresolved_references": state.get("unresolved_references", []),
+                        "resolved_count": len(resolved),
+                        "total_transactions": len(state.get("transactions", [])),
+                    },
+                )
+                return True
+            return False
 
         elif step_name == "risk" and state.get("scored_candidates"):
             # Candidates already exist in DB (ingested at run creation).
@@ -287,9 +313,13 @@ class RunOrchestrator:
                     logger.warning(f"Run {run_id}: failed to update risk for candidate {candidate_id}: {e}")
             if skipped:
                 logger.warning(f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)")
+            return False
 
         elif step_name == "execute":
             await self._persist_execution_artifacts(run_id, state)
+            return False
+
+        return False
 
     async def _persist_execution_artifacts(
         self, run_id: uuid.UUID, state: AgentState
