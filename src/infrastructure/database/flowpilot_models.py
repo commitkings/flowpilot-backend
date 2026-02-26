@@ -382,7 +382,7 @@ class AgentRunModel(Base):
         CheckConstraint(
             "status IN ('pending', 'planning', 'reconciling', 'scoring', "
             "'forecasting', 'awaiting_approval', 'executing', "
-            "'completed', 'failed', 'cancelled')",
+            "'completed', 'completed_with_errors', 'failed', 'cancelled')",
             name="agent_run_status_check",
         ),
         Index("agent_run_status_idx", "status"),

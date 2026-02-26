@@ -14,6 +14,7 @@ class RunStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     EXECUTING = "executing"
     COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
     FAILED = "failed"
     CANCELLED = "cancelled"
 

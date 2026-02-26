@@ -37,3 +37,11 @@ class InterswitchAuth:
             headers=self.get_headers(),
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
+
+    def get_resilient_client(self):
+        """Return a ResilientClient with retry/backoff for transient errors."""
+        from src.infrastructure.external_services.interswitch.http_client import (
+            ResilientClient,
+        )
+
+        return ResilientClient(self.get_client())

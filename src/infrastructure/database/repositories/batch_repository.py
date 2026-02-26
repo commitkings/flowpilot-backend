@@ -4,6 +4,8 @@ from decimal import Decimal
 from datetime import datetime
 from uuid import UUID
 
+from typing import Optional
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +31,11 @@ class BatchRepository:
         accepted_count: int = 0,
         rejected_count: int = 0,
     ) -> PayoutBatchModel:
+        # Idempotency: return existing batch if batch_reference already used
+        existing = await self.get_by_reference(batch_reference)
+        if existing is not None:
+            return existing
+
         batch = PayoutBatchModel(
             run_id=run_id,
             business_id=business_id,
@@ -45,6 +52,15 @@ class BatchRepository:
         self._session.add(batch)
         await self._session.flush()
         return batch
+
+    async def get_by_reference(
+        self, batch_reference: str
+    ) -> Optional[PayoutBatchModel]:
+        stmt = select(PayoutBatchModel).where(
+            PayoutBatchModel.batch_reference == batch_reference
+        )
+        result = await self._session.execute(stmt)
+        return result.scalars().first()
 
     async def update_status(
         self,

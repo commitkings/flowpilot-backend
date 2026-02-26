@@ -22,10 +22,9 @@ class CustomerLookupClient:
             "currency": currency,
         }
 
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info(f"Customer lookup: {institution_code}/{account_number}")
             response = await client.post("/api/v1/payouts/customer-lookup", json=payload)
-            response.raise_for_status()
             data = response.json()
             logger.info(f"Lookup result: {data.get('lookupStatus')}")
             return data

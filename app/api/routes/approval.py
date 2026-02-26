@@ -12,6 +12,7 @@ from src.agents.state import AgentState
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
+    BatchRepository,
     CandidateRepository,
     RunRepository,
     TransactionRepository,
@@ -257,6 +258,15 @@ async def approve_candidates(
             detail=f"Run is not awaiting approval (status: {run.status})",
         )
     await session.commit()
+
+    # Idempotency guard: reject if this run already has a payout batch
+    batch_repo = BatchRepository(session)
+    existing_batches = await batch_repo.get_by_run(run_uuid)
+    if existing_batches:
+        raise HTTPException(
+            status_code=409,
+            detail="Run already has a payout batch — cannot re-execute",
+        )
 
     run = await run_repo.get_by_id(run_uuid)
 

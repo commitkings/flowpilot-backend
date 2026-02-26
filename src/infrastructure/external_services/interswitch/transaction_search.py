@@ -32,10 +32,9 @@ class TransactionSearchClient:
             "currency": currency,
         }
 
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info(f"Interswitch quick_search: {merchant_id} from {start_date} to {end_date}")
             response = await client.post("/transaction-search/quick-search", json=payload)
-            response.raise_for_status()
             data = response.json()
             logger.info(f"Retrieved {data.get('totalCount', 0)} transactions")
             return data
@@ -50,8 +49,7 @@ class TransactionSearchClient:
             "merchantId": merchant_id,
         }
 
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info(f"Interswitch reference_search: {transaction_reference}")
             response = await client.post("/transaction-search/reference-search", json=payload)
-            response.raise_for_status()
             return response.json()

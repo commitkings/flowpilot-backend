@@ -13,10 +13,9 @@ class PayoutClient:
         self._auth = InterswitchAuth()
 
     async def get_receiving_institutions(self) -> dict:
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info("Fetching receiving institutions")
             response = await client.get("/api/v1/payouts/receiving-institutions")
-            response.raise_for_status()
             return response.json()
 
     async def execute_payout(
@@ -43,17 +42,15 @@ class PayoutClient:
             ],
         }
 
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info(f"Executing payout batch: {batch_reference} ({len(items)} items)")
             response = await client.post("/api/v1/payouts", json=payload)
-            response.raise_for_status()
             data = response.json()
             logger.info(f"Payout submission: {data.get('submissionStatus')}, accepted: {data.get('acceptedCount')}")
             return data
 
     async def get_payout_status(self, provider_reference: str) -> dict:
-        async with self._auth.get_client() as client:
+        async with self._auth.get_resilient_client() as client:
             logger.info(f"Checking payout status: {provider_reference}")
             response = await client.get(f"/api/v1/payouts/{provider_reference}")
-            response.raise_for_status()
             return response.json()
