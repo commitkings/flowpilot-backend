@@ -293,6 +293,8 @@ class InstitutionModel(Base):
     institution_code: Mapped[str] = mapped_column(String(10), unique=True)
     institution_name: Mapped[str] = mapped_column(String(255))
     short_name: Mapped[Optional[str]] = mapped_column(String(50))
+    nip_code: Mapped[Optional[str]] = mapped_column(String(10))
+    cbn_code: Mapped[Optional[str]] = mapped_column(String(10))
     institution_type: Mapped[Optional[str]] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(
@@ -725,6 +727,7 @@ class PayoutCandidateModel(Base):
     )
     client_reference: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
     provider_reference: Mapped[Optional[str]] = mapped_column(String(100))
+    transaction_reference: Mapped[Optional[str]] = mapped_column(String(255))
     executed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(
@@ -984,8 +987,10 @@ class CustomerLookupResultModel(Base):
     )
     account_number: Mapped[str] = mapped_column(String(20))
     institution_code: Mapped[str] = mapped_column(String(10))
+    can_credit: Mapped[Optional[bool]] = mapped_column(Boolean)
     name_returned: Mapped[Optional[str]] = mapped_column(String(255))
     similarity_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
+    transaction_reference: Mapped[Optional[str]] = mapped_column(String(255))
     http_status_code: Mapped[int] = mapped_column(SmallInteger)
     response_message: Mapped[Optional[str]] = mapped_column(Text)
     raw_response: Mapped[dict] = mapped_column(JSONB)

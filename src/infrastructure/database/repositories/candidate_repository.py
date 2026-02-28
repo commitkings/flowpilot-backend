@@ -107,12 +107,15 @@ class CandidateRepository:
         lookup_status: str,
         lookup_account_name: str | None = None,
         lookup_match_score: Decimal | None = None,
+        transaction_reference: str | None = None,
     ) -> None:
         values: dict = {"lookup_status": lookup_status}
         if lookup_account_name is not None:
             values["lookup_account_name"] = lookup_account_name
         if lookup_match_score is not None:
             values["lookup_match_score"] = lookup_match_score
+        if transaction_reference is not None:
+            values["transaction_reference"] = transaction_reference
         stmt = (
             update(PayoutCandidateModel)
             .where(PayoutCandidateModel.id == candidate_id)
@@ -127,6 +130,7 @@ class CandidateRepository:
         execution_status: str,
         client_reference: str | None = None,
         provider_reference: str | None = None,
+        transaction_reference: str | None = None,
         batch_id: UUID | None = None,
         executed_at=None,
     ) -> None:
@@ -135,6 +139,8 @@ class CandidateRepository:
             values["client_reference"] = client_reference
         if provider_reference is not None:
             values["provider_reference"] = provider_reference
+        if transaction_reference is not None:
+            values["transaction_reference"] = transaction_reference
         if batch_id is not None:
             values["batch_id"] = batch_id
         if executed_at is not None:

@@ -31,6 +31,7 @@ from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
     CandidateRepository,
+    ExecutionDetailRepository,
     PlanStepRepository,
     RunRepository,
     TransactionRepository,
@@ -75,6 +76,7 @@ class RunOrchestrator:
         self._candidate_repo = CandidateRepository(session)
         self._batch_repo = BatchRepository(session)
         self._audit_repo = AuditRepository(session)
+        self._exec_detail_repo = ExecutionDetailRepository(session)
         self._step_ids: dict[str, uuid.UUID] = {}  # agent_type → plan_step.id
 
     async def execute_run(
@@ -325,13 +327,14 @@ class RunOrchestrator:
         from datetime import datetime, timezone
         persist_errors: list[str] = []
 
-        # 1. Persist lookup results on payout_candidate rows
+        # 1. Persist lookup results on payout_candidate rows + detail table
         for lr in state.get("candidate_lookup_results", []):
             candidate_id = lr.get("candidate_id")
             if not candidate_id:
                 continue
             try:
                 match_score = lr.get("lookup_match_score")
+                txn_ref = lr.get("transaction_reference")
                 await self._candidate_repo.update_lookup(
                     candidate_id=uuid.UUID(candidate_id),
                     lookup_status=lr.get("lookup_status", "failed"),
@@ -339,6 +342,23 @@ class RunOrchestrator:
                     lookup_match_score=(
                         Decimal(str(match_score)) if match_score is not None else None
                     ),
+                    transaction_reference=txn_ref,
+                )
+                # Write detail record to customer_lookup_result
+                await self._exec_detail_repo.create_lookup_result(
+                    candidate_id=uuid.UUID(candidate_id),
+                    run_id=run_id,
+                    account_number=lr.get("lookup_account_name", ""),  # from raw data
+                    institution_code=lr.get("institution_code", ""),
+                    can_credit=lr.get("lookup_status") == "success" or lr.get("lookup_status") == "mismatch",
+                    name_returned=lr.get("lookup_account_name"),
+                    similarity_score=(
+                        Decimal(str(match_score)) if match_score is not None else None
+                    ),
+                    transaction_reference=txn_ref,
+                    http_status_code=200,
+                    response_message=lr.get("lookup_status"),
+                    raw_response=lr.get("raw_response", {}),
                 )
             except Exception as e:
                 msg = f"lookup persist for {candidate_id}: {e}"
@@ -375,7 +395,7 @@ class RunOrchestrator:
                     logger.error(f"Run {run_id}: {msg}")
                     persist_errors.append(msg)
 
-        # 3. Persist execution results on payout_candidate rows
+        # 3. Persist execution results on payout_candidate rows + detail table
         now = datetime.now(timezone.utc)
         for er in state.get("candidate_execution_results", []):
             candidate_id = er.get("candidate_id")
@@ -393,6 +413,19 @@ class RunOrchestrator:
                     batch_id=batch_id if was_submitted else None,
                     executed_at=now if was_submitted else None,
                 )
+                # Write detail record to payout_execution
+                if was_submitted:
+                    await self._exec_detail_repo.create_payout_execution(
+                        candidate_id=uuid.UUID(candidate_id),
+                        run_id=run_id,
+                        submission_type="submission",
+                        interswitch_reference=er.get("provider_reference"),
+                        execution_status=exec_status,
+                        http_status_code=200,
+                        response_message=er.get("response_message", ""),
+                        raw_response={},
+                        called_at=now,
+                    )
             except Exception as e:
                 msg = f"execution persist for {candidate_id}: {e}"
                 logger.warning(f"Run {run_id}: {msg}")
