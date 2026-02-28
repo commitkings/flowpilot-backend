@@ -1,5 +1,15 @@
-import uuid
+"""
+Interswitch authentication — OAuth 2.0 Client Credentials flow.
+
+Acquires a bearer token via POST /passport/oauth/token, caches it in-memory
+with TTL, and auto-refreshes when expired.  Falls back to a static
+INTERSWITCH_ACCESS_TOKEN env var when OAuth2 credentials are absent.
+"""
+
+import base64
 import logging
+import time
+import uuid
 from typing import Optional
 
 import httpx
@@ -8,18 +18,72 @@ from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+_TOKEN_REFRESH_MARGIN_SECONDS = 60
+
 
 class InterswitchAuth:
+
+    _cached_token: Optional[str] = None
+    _token_expires_at: float = 0.0
 
     def __init__(self) -> None:
         self._base_url = Settings.INTERSWITCH_BASE_URL.rstrip("/")
         self._client_id = Settings.INTERSWITCH_CLIENT_ID
         self._client_secret = Settings.INTERSWITCH_CLIENT_SECRET
 
-    def get_headers(self, access_token: Optional[str] = None) -> dict[str, str]:
-        token = access_token or Settings.get_interswitch_access_token()
-        if not token:
-            raise ValueError("Interswitch access token not configured")
+    async def get_access_token(self) -> str:
+        """Return a valid bearer token, refreshing via OAuth2 if needed."""
+        if self._cached_token and time.time() < self._token_expires_at:
+            return self._cached_token
+
+        if self._client_id and self._client_secret:
+            return await self._acquire_oauth2_token()
+
+        static_token = Settings.get_interswitch_access_token()
+        if static_token:
+            logger.info("Using static INTERSWITCH_ACCESS_TOKEN (no OAuth2 credentials)")
+            return static_token
+
+        raise ValueError(
+            "Interswitch credentials not configured. "
+            "Set INTERSWITCH_CLIENT_ID + INTERSWITCH_CLIENT_SECRET for OAuth2, "
+            "or set INTERSWITCH_ACCESS_TOKEN as a static fallback."
+        )
+
+    async def _acquire_oauth2_token(self) -> str:
+        """Acquire token via OAuth2 Client Credentials grant."""
+        token_url = f"{self._base_url}/passport/oauth/token"
+        credentials = f"{self._client_id}:{self._client_secret}"
+        basic_auth = base64.b64encode(credentials.encode()).decode()
+
+        logger.info("Acquiring Interswitch OAuth2 token via client_credentials grant")
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            response = await client.post(
+                token_url,
+                params={"grant_type": "client_credentials"},
+                headers={
+                    "Authorization": f"Basic {basic_auth}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        access_token = data.get("access_token")
+        if not access_token:
+            raise ValueError(f"OAuth2 response missing access_token: {data}")
+
+        expires_in = int(data.get("expires_in", 3600))
+        InterswitchAuth._cached_token = access_token
+        InterswitchAuth._token_expires_at = time.time() + expires_in - _TOKEN_REFRESH_MARGIN_SECONDS
+
+        logger.info(f"OAuth2 token acquired, expires in {expires_in}s")
+        return access_token
+
+    async def get_headers(self, access_token: Optional[str] = None) -> dict[str, str]:
+        """Build request headers with a valid bearer token."""
+        token = access_token or await self.get_access_token()
         return {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -31,17 +95,25 @@ class InterswitchAuth:
     def base_url(self) -> str:
         return self._base_url
 
-    def get_client(self) -> httpx.AsyncClient:
+    async def get_client(self) -> httpx.AsyncClient:
+        """Create an httpx.AsyncClient with current auth headers."""
+        headers = await self.get_headers()
         return httpx.AsyncClient(
             base_url=self._base_url,
-            headers=self.get_headers(),
+            headers=headers,
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
 
-    def get_resilient_client(self):
+    async def get_resilient_client(self):
         """Return a ResilientClient with retry/backoff for transient errors."""
         from src.infrastructure.external_services.interswitch.http_client import (
             ResilientClient,
         )
+        client = await self.get_client()
+        return ResilientClient(client)
 
-        return ResilientClient(self.get_client())
+    @classmethod
+    def clear_token_cache(cls) -> None:
+        """Clear cached token (useful for tests or forced re-auth)."""
+        cls._cached_token = None
+        cls._token_expires_at = 0.0

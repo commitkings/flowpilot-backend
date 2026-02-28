@@ -1,3 +1,11 @@
+"""
+Interswitch Transaction Search — Quick Search and Reference Search.
+
+NOTE: These endpoints may be partner-specific / custom.  The paths below
+follow the contract defined in the HACKATHON.md architecture doc.  If the
+sandbox returns 404, the ReconciliationAgent falls back gracefully.
+"""
+
 import logging
 from datetime import datetime
 from typing import Optional
@@ -22,6 +30,7 @@ class TransactionSearchClient:
         page_size: int = 100,
         currency: str = "NGN",
     ) -> dict:
+        """Search transactions by date range and optional status filter."""
         payload = {
             "merchantId": merchant_id,
             "startDate": start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -32,7 +41,7 @@ class TransactionSearchClient:
             "currency": currency,
         }
 
-        async with self._auth.get_resilient_client() as client:
+        async with await self._auth.get_resilient_client() as client:
             logger.info(f"Interswitch quick_search: {merchant_id} from {start_date} to {end_date}")
             response = await client.post("/transaction-search/quick-search", json=payload)
             data = response.json()
@@ -44,12 +53,13 @@ class TransactionSearchClient:
         transaction_reference: str,
         merchant_id: str,
     ) -> dict:
+        """Lookup a single transaction by its reference."""
         payload = {
             "transactionReference": transaction_reference,
             "merchantId": merchant_id,
         }
 
-        async with self._auth.get_resilient_client() as client:
+        async with await self._auth.get_resilient_client() as client:
             logger.info(f"Interswitch reference_search: {transaction_reference}")
             response = await client.post("/transaction-search/reference-search", json=payload)
             return response.json()

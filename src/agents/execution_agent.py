@@ -1,3 +1,13 @@
+"""
+ExecutionAgent — verifies beneficiaries and executes payouts.
+
+Flow after real Interswitch API wiring:
+  1. CreditInquiry per candidate → validates account, returns transactionReference
+  2. Name matching (lookup_name vs beneficiary_name)
+  3. AccountCredit per verified candidate (uses transactionReference from step 1)
+  4. Requery to poll for final settlement status
+"""
+
 import logging
 import uuid
 from datetime import datetime
@@ -29,15 +39,31 @@ class ExecutionAgent(BaseAgent):
             if c.get("candidate_id") in approved_ids
         ]
 
+        # Idempotency: skip candidates already submitted (guards against re-runs).
+        # Only terminal/submitted states are skipped; requires_followup is retriable.
+        prior_execution_results = state.get("candidate_execution_results", [])
+        _SUBMITTED_STATUSES = {"pending", "success", "failed"}
+        already_executed = {
+            er["candidate_id"]
+            for er in prior_execution_results
+            if er.get("execution_status") in _SUBMITTED_STATUSES
+        }
+        if already_executed:
+            logger.info(f"[ExecutionAgent] Skipping {len(already_executed)} already-executed candidates")
+            approved_candidates = [
+                c for c in approved_candidates
+                if c.get("candidate_id") not in already_executed
+            ]
+
         logger.info(f"[ExecutionAgent] Processing {len(approved_candidates)} approved candidates")
 
         if not approved_candidates:
             logger.warning("[ExecutionAgent] No approved candidates to process")
             return {
                 **state,
-                "candidate_lookup_results": [],
-                "candidate_execution_results": [],
-                "batch_details": None,
+                "candidate_lookup_results": state.get("candidate_lookup_results", []),
+                "candidate_execution_results": prior_execution_results,
+                "batch_details": state.get("batch_details"),
                 "current_step": "execution_complete",
                 "audit_entries": [{
                     "agent_type": "execution",
@@ -49,7 +75,8 @@ class ExecutionAgent(BaseAgent):
         audit_entries: list[dict] = []
 
         try:
-            # 1. Verify all approved candidates via customer lookup + name matching
+            # 1. Verify all approved candidates via CreditInquiry + name matching
+            #    This also captures transactionReference for each candidate.
             lookup_results = await self._verify_recipients(approved_candidates, audit_entries)
 
             # 2. Split into verified vs failed/mismatched
@@ -57,7 +84,9 @@ class ExecutionAgent(BaseAgent):
             failed_candidates = []
             for c, lr in zip(approved_candidates, lookup_results):
                 if lr["lookup_status"] == "success":
-                    verified_candidates.append(c)
+                    # Carry the transactionReference from inquiry → credit
+                    c_with_ref = {**c, "_transaction_reference": lr["transaction_reference"]}
+                    verified_candidates.append(c_with_ref)
                 else:
                     failed_candidates.append(c)
 
@@ -83,13 +112,20 @@ class ExecutionAgent(BaseAgent):
                 batch_details, exec_results = await self._execute_payouts(
                     state["run_id"], verified_candidates, audit_entries
                 )
+                # 5. Poll for final status on pending items
+                exec_results = await self._poll_payout_statuses(exec_results, audit_entries)
                 candidate_execution_results.extend(exec_results)
+
+            # Merge with prior execution results from previous runs (idempotency)
+            new_ids = {er["candidate_id"] for er in candidate_execution_results}
+            preserved_prior = [er for er in prior_execution_results if er["candidate_id"] not in new_ids]
+            all_execution_results = preserved_prior + candidate_execution_results
 
             return {
                 **state,
                 "candidate_lookup_results": lookup_results,
-                "candidate_execution_results": candidate_execution_results,
-                "batch_details": batch_details,
+                "candidate_execution_results": all_execution_results,
+                "batch_details": batch_details or state.get("batch_details"),
                 "current_step": "execution_complete",
                 "audit_entries": audit_entries,
             }
@@ -112,10 +148,11 @@ class ExecutionAgent(BaseAgent):
     async def _verify_recipients(
         self, candidates: list[dict], audit_entries: list[dict]
     ) -> list[dict]:
-        """Verify each candidate via customer lookup and name matching.
+        """Verify each candidate via Interswitch CreditInquiry + name matching.
 
-        Returns per-candidate lookup results:
-        [{candidate_id, lookup_status, lookup_account_name, lookup_match_score}]
+        Returns per-candidate lookup results with:
+            candidate_id, lookup_status, lookup_account_name,
+            lookup_match_score, transaction_reference
         """
         results = []
         for c in candidates:
@@ -132,6 +169,7 @@ class ExecutionAgent(BaseAgent):
                         "lookup_status": "failed",
                         "lookup_account_name": None,
                         "lookup_match_score": None,
+                        "transaction_reference": None,
                     })
                     audit_entries.append({
                         "agent_type": "execution",
@@ -139,8 +177,9 @@ class ExecutionAgent(BaseAgent):
                         "detail": {
                             "candidate_id": candidate_id,
                             "raw_status": raw.get("lookupStatus"),
+                            "can_credit": raw.get("canCredit", False),
                         },
-                        "api_endpoint": "/api/v1/payouts/customer-lookup",
+                        "api_endpoint": "/quicktellerservice/api/v5/transactions/CreditInquiry",
                     })
                     continue
 
@@ -148,6 +187,7 @@ class ExecutionAgent(BaseAgent):
                 lookup_name = raw.get("accountName", "")
                 beneficiary_name = c.get("beneficiary_name", "")
                 match_score = name_match_score(lookup_name, beneficiary_name)
+                txn_ref = raw.get("transactionReference", "")
 
                 if match_score >= NAME_MATCH_THRESHOLD:
                     lookup_status = "success"
@@ -163,6 +203,7 @@ class ExecutionAgent(BaseAgent):
                     "lookup_status": lookup_status,
                     "lookup_account_name": lookup_name,
                     "lookup_match_score": round(match_score, 3),
+                    "transaction_reference": txn_ref,
                 })
                 audit_entries.append({
                     "agent_type": "execution",
@@ -171,8 +212,9 @@ class ExecutionAgent(BaseAgent):
                         "candidate_id": candidate_id,
                         "lookup_account_name": lookup_name,
                         "match_score": round(match_score, 3),
+                        "transaction_reference": txn_ref[:30] + "..." if len(txn_ref) > 30 else txn_ref,
                     },
-                    "api_endpoint": "/api/v1/payouts/customer-lookup",
+                    "api_endpoint": "/quicktellerservice/api/v5/transactions/CreditInquiry",
                 })
 
             except Exception as e:
@@ -182,25 +224,29 @@ class ExecutionAgent(BaseAgent):
                     "lookup_status": "failed",
                     "lookup_account_name": None,
                     "lookup_match_score": None,
+                    "transaction_reference": None,
                 })
                 audit_entries.append({
                     "agent_type": "execution",
                     "action": "lookup_failed",
                     "detail": {"candidate_id": candidate_id, "error": str(e)},
-                    "api_endpoint": "/api/v1/payouts/customer-lookup",
+                    "api_endpoint": "/quicktellerservice/api/v5/transactions/CreditInquiry",
                 })
         return results
 
     async def _execute_payouts(
         self, run_id: str, candidates: list[dict], audit_entries: list[dict]
     ) -> tuple[dict, list[dict]]:
-        """Submit verified candidates as a payout batch.
+        """Execute payouts for verified candidates using per-item AccountCredit.
+
+        Each candidate dict must have _transaction_reference from the
+        CreditInquiry step.
 
         Returns (batch_details, per_candidate_execution_results).
         """
         batch_reference = f"FP_{run_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-        source_account_id = Settings.INTERSWITCH_SOURCE_ACCOUNT_ID
 
+        # Build items for the payout client — now includes transaction_reference
         items = [
             {
                 "client_reference": c.get("candidate_id", str(uuid.uuid4())),
@@ -209,6 +255,7 @@ class ExecutionAgent(BaseAgent):
                 "account_number": c["account_number"],
                 "account_name": c["beneficiary_name"],
                 "narration": c.get("purpose", "FlowPilot payout"),
+                "transaction_reference": c["_transaction_reference"],
             }
             for c in candidates
         ]
@@ -220,15 +267,23 @@ class ExecutionAgent(BaseAgent):
 
         # Build batch details for orchestrator persistence
         total_amount = sum(c["amount"] for c in candidates)
+        accepted_count = raw.get("acceptedCount", 0)
+        rejected_count = raw.get("rejectedCount", 0)
+        api_status = (raw.get("submissionStatus") or "pending").lower()
+
+        # Derive submission_status: if API says accepted but counts disagree, mark partial
+        if api_status in ("accepted", "pending") and accepted_count < len(candidates) and rejected_count > 0:
+            api_status = "partial"
+
         batch_details = {
             "batch_reference": batch_reference,
             "currency": candidates[0].get("currency", "NGN"),
-            "source_account_id": source_account_id or "",
+            "source_account_id": Settings.INTERSWITCH_SOURCE_ACCOUNT_ID or "",
             "total_amount": total_amount,
             "item_count": len(candidates),
-            "submission_status": (raw.get("submissionStatus") or "pending").lower(),
-            "accepted_count": raw.get("acceptedCount", 0),
-            "rejected_count": raw.get("rejectedCount", 0),
+            "submission_status": api_status,
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
         }
 
         audit_entries.append({
@@ -240,7 +295,7 @@ class ExecutionAgent(BaseAgent):
                 "total_amount": total_amount,
                 "submission_status": batch_details["submission_status"],
             },
-            "api_endpoint": "/api/v1/payouts",
+            "api_endpoint": "/quicktellerservice/api/v5/transactions/AccountCredit",
         })
 
         # Map response items back to candidates for per-candidate execution results
@@ -252,12 +307,14 @@ class ExecutionAgent(BaseAgent):
         for c in candidates:
             cid = c.get("candidate_id")
             resp_item = response_items.get(cid, {})
-            provider_ref = resp_item.get("providerReference")
+            provider_ref = resp_item.get("providerReference", "")
+            resp_code = resp_item.get("responseCode", "")
             item_status = (resp_item.get("status") or "").upper()
 
-            if item_status == "ACCEPTED" or provider_ref:
-                exec_status = "pending"
-            elif item_status == "REJECTED":
+            # Map Interswitch response codes to execution status
+            if resp_code == "00" or resp_code == "09" or item_status == "ACCEPTED":
+                exec_status = "pending"  # accepted by API, awaiting final settlement
+            elif item_status == "FAILED" or (resp_code and resp_code not in ("00", "09")):
                 exec_status = "failed"
             else:
                 exec_status = "pending"
@@ -275,9 +332,76 @@ class ExecutionAgent(BaseAgent):
                 "detail": {
                     "candidate_id": cid,
                     "provider_reference": provider_ref,
+                    "response_code": resp_code,
                     "item_status": item_status,
                 },
-                "api_endpoint": "/api/v1/payouts",
+                "api_endpoint": "/quicktellerservice/api/v5/transactions/AccountCredit",
             })
 
         return batch_details, candidate_results
+
+    async def _poll_payout_statuses(
+        self, candidate_results: list[dict], audit_entries: list[dict],
+        max_polls: int = 2, poll_delay: float = 2.0,
+    ) -> list[dict]:
+        """Poll final status for pending payout items via Requery.
+
+        Makes up to *max_polls* attempts per item, with *poll_delay* seconds
+        between attempts.  Only items with a client_reference and status
+        "pending" are polled.
+        """
+        import asyncio
+
+        pending = [
+            r for r in candidate_results
+            if r["execution_status"] == "pending" and r.get("client_reference")
+        ]
+        if not pending:
+            return candidate_results
+
+        logger.info(f"[ExecutionAgent] Polling status for {len(pending)} pending items")
+
+        # Index results by candidate_id for in-place updates
+        results_map = {r["candidate_id"]: r for r in candidate_results}
+
+        for attempt in range(max_polls):
+            if attempt > 0:
+                await asyncio.sleep(poll_delay)
+
+            still_pending = [
+                r for r in pending
+                if results_map[r["candidate_id"]]["execution_status"] == "pending"
+            ]
+            if not still_pending:
+                break
+
+            for item in still_pending:
+                try:
+                    status_resp = await self._payout_client.requery_payout(
+                        client_ref=item["client_reference"],
+                        transaction_reference=item.get("provider_reference"),
+                    )
+                    raw_status = (status_resp.get("status") or "").upper()
+                    if raw_status == "SUCCESSFUL":
+                        results_map[item["candidate_id"]]["execution_status"] = "success"
+                    elif raw_status in ("FAILED", "REVERSED"):
+                        results_map[item["candidate_id"]]["execution_status"] = "failed"
+                    # else still PENDING — will retry on next poll
+
+                    audit_entries.append({
+                        "agent_type": "execution",
+                        "action": f"payout_poll_{results_map[item['candidate_id']]['execution_status']}",
+                        "detail": {
+                            "candidate_id": item["candidate_id"],
+                            "client_reference": item["client_reference"],
+                            "poll_attempt": attempt + 1,
+                            "raw_status": raw_status,
+                        },
+                        "api_endpoint": "/quicktellerservice/api/v5/transactions/Requery",
+                    })
+                except Exception as e:
+                    logger.warning(
+                        f"[ExecutionAgent] Requery failed for {item['client_reference']}: {e}"
+                    )
+
+        return list(results_map.values())

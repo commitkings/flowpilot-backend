@@ -140,6 +140,7 @@ class Settings:
     INTERSWITCH_CLIENT_SECRET: Optional[str] = os.getenv("INTERSWITCH_CLIENT_SECRET")
     INTERSWITCH_MERCHANT_ID: str = os.getenv("INTERSWITCH_MERCHANT_ID", "")
     INTERSWITCH_SOURCE_ACCOUNT_ID: str = os.getenv("INTERSWITCH_SOURCE_ACCOUNT_ID", "")
+    INTERSWITCH_TERMINAL_ID: str = os.getenv("INTERSWITCH_TERMINAL_ID", "3PBL0001")
 
     @classmethod
     def get_interswitch_access_token(cls) -> Optional[str]:
@@ -147,7 +148,9 @@ class Settings:
 
     @classmethod
     def is_interswitch_configured(cls) -> bool:
-        return bool(cls.get_interswitch_access_token() and cls.INTERSWITCH_CLIENT_ID)
+        has_oauth2 = bool(cls.INTERSWITCH_CLIENT_ID and cls.INTERSWITCH_CLIENT_SECRET)
+        has_static_token = bool(cls.get_interswitch_access_token())
+        return has_oauth2 or has_static_token
 
     # ------------------------------------------------------------------
     # Groq API (LLM)
