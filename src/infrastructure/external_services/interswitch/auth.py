@@ -61,7 +61,7 @@ class InterswitchAuth:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             response = await client.post(
                 token_url,
-                params={"grant_type": "client_credentials"},
+                data={"grant_type": "client_credentials"},
                 headers={
                     "Authorization": f"Basic {basic_auth}",
                     "Content-Type": "application/x-www-form-urlencoded",

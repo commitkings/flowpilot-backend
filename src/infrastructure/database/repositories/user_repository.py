@@ -79,3 +79,29 @@ class UserRepository:
             )
         )
         return list(result.scalars().all())
+
+    async def update_profile(
+        self,
+        user_id: uuid.UUID,
+        *,
+        display_name: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+    ) -> Optional[UserModel]:
+        """Update mutable profile fields. Only non-None values are applied."""
+        user = await self.get_by_id(user_id)
+        if user is None:
+            return None
+        if display_name is not None:
+            user.display_name = display_name
+        if avatar_url is not None:
+            user.avatar_url = avatar_url
+        user.updated_at = datetime.now(timezone.utc)
+        await self._s.flush()
+        return user
+
+    async def clear_last_login(self, user_id: uuid.UUID) -> None:
+        """Set last_login_at to None (used on explicit logout)."""
+        user = await self.get_by_id(user_id)
+        if user is not None:
+            user.last_login_at = None
+            await self._s.flush()

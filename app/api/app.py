@@ -12,6 +12,7 @@ from app.api.routes.runs import router as runs_router
 from app.api.routes.approval import router as approval_router
 from app.api.routes.audit import router as audit_router
 from app.api.routes.institutions import router as institutions_router
+from app.api.routes.onboarding import router as onboarding_router
 from app.api.auth import auth_router
 from src.infrastructure.database.connection import close_db, get_session_factory, init_db
 
@@ -51,6 +52,7 @@ app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
 app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
 app.include_router(audit_router, prefix="/api/v1", tags=["audit"])
 app.include_router(institutions_router, prefix="/api/v1", tags=["institutions"])
+app.include_router(onboarding_router, prefix="/api/v1", tags=["onboarding"])
 
 
 @app.get("/health")

@@ -1,19 +1,26 @@
 """
-Google OAuth routes — login redirect, callback, /me, /logout.
+Google OAuth routes — login redirect, callback, /me, /logout, profile update.
 """
 
 import logging
+from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.jwt_utils import create_access_token
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.user_repository import UserRepository
+
+
+class UpdateProfileRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +113,14 @@ async def google_callback(
 
 
 @router.get("/me")
-async def get_me(current_user=Depends(get_current_user)):
-    """Return the authenticated user's profile and memberships."""
-    repo_session = None  # user already loaded by dependency
+async def get_me(
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Return the authenticated user's profile, memberships, and onboarding status."""
+    repo = UserRepository(session)
+    memberships = await repo.get_memberships(current_user.id)
+
     return {
         "id": str(current_user.id),
         "email": current_user.email,
@@ -120,4 +132,67 @@ async def get_me(current_user=Depends(get_current_user)):
             if current_user.last_login_at
             else None
         ),
+        "memberships": [
+            {
+                "business_id": str(m.business_id),
+                "role": m.role,
+            }
+            for m in memberships
+        ],
+        "has_completed_onboarding": len(memberships) > 0,
+    }
+
+
+@router.post("/logout", status_code=status.HTTP_200_OK)
+async def logout(
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Stateless logout — clears last_login_at. Frontend discards the JWT."""
+    repo = UserRepository(session)
+    await repo.clear_last_login(current_user.id)
+    return {"message": "Logged out"}
+
+
+@router.patch("/me")
+async def update_me(
+    body: UpdateProfileRequest,
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Update the authenticated user's mutable profile fields."""
+    if body.display_name is None and body.avatar_url is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one field (display_name, avatar_url) must be provided",
+        )
+
+    repo = UserRepository(session)
+    updated = await repo.update_profile(
+        current_user.id,
+        display_name=body.display_name,
+        avatar_url=body.avatar_url,
+    )
+
+    memberships = await repo.get_memberships(current_user.id)
+
+    return {
+        "id": str(updated.id),
+        "email": updated.email,
+        "display_name": updated.display_name,
+        "avatar_url": updated.avatar_url,
+        "is_active": updated.is_active,
+        "last_login_at": (
+            updated.last_login_at.isoformat()
+            if updated.last_login_at
+            else None
+        ),
+        "memberships": [
+            {
+                "business_id": str(m.business_id),
+                "role": m.role,
+            }
+            for m in memberships
+        ],
+        "has_completed_onboarding": len(memberships) > 0,
     }
