@@ -12,6 +12,7 @@ from app.api.routes.runs import router as runs_router
 from app.api.routes.approval import router as approval_router
 from app.api.routes.audit import router as audit_router
 from app.api.routes.institutions import router as institutions_router
+from app.api.auth import auth_router
 from src.infrastructure.database.connection import close_db, get_session_factory, init_db
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
 app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
 app.include_router(audit_router, prefix="/api/v1", tags=["audit"])

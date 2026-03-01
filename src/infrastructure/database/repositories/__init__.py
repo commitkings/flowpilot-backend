@@ -6,6 +6,7 @@ from src.infrastructure.database.repositories.institution_repository import Inst
 from src.infrastructure.database.repositories.plan_step_repository import PlanStepRepository
 from src.infrastructure.database.repositories.run_repository import RunRepository
 from src.infrastructure.database.repositories.transaction_repository import TransactionRepository
+from src.infrastructure.database.repositories.user_repository import UserRepository
 
 __all__ = [
     "AuditRepository",
@@ -16,4 +17,5 @@ __all__ = [
     "PlanStepRepository",
     "RunRepository",
     "TransactionRepository",
+    "UserRepository",
 ]

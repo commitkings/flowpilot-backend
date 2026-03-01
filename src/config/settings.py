@@ -167,6 +167,23 @@ class Settings:
         return bool(cls._get_secret("GROQ_API_KEY", "GROQ_API_KEY"))
 
     # ------------------------------------------------------------------
+    # Google OAuth
+    # ------------------------------------------------------------------
+    GOOGLE_CLIENT_ID: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
+    GOOGLE_REDIRECT_URI: str = os.getenv(
+        "GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/auth/google/callback"
+    )
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "flowpilot-dev-secret-change-me")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+    @classmethod
+    def is_google_oauth_configured(cls) -> bool:
+        return bool(cls.GOOGLE_CLIENT_ID and cls.GOOGLE_CLIENT_SECRET)
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

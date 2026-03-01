@@ -42,7 +42,7 @@ class UserModel(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    external_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
+    external_id: Mapped[str] = mapped_column(String(255), unique=True)
     email: Mapped[str] = mapped_column(String(255), unique=True)
     display_name: Mapped[str] = mapped_column(String(100))
     avatar_url: Mapped[Optional[str]] = mapped_column(String(512))
