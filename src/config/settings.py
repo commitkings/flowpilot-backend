@@ -180,8 +180,16 @@ class Settings:
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
     @classmethod
+    def get_google_client_id(cls) -> Optional[str]:
+        return cls._get_secret("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID")
+
+    @classmethod
+    def get_google_client_secret(cls) -> Optional[str]:
+        return cls._get_secret("GOOGLE_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET")
+
+    @classmethod
     def is_google_oauth_configured(cls) -> bool:
-        return bool(cls.GOOGLE_CLIENT_ID and cls.GOOGLE_CLIENT_SECRET)
+        return bool(cls.get_google_client_id() and cls.get_google_client_secret())
 
     # ------------------------------------------------------------------
     # Application

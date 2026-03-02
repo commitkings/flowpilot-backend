@@ -32,21 +32,23 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 @router.get("/google/login")
-async def google_login():
+async def google_login(raw_tokens: bool = False):
     """Redirect user to Google consent screen."""
     if not Settings.is_google_oauth_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Google OAuth not configured",
         )
+    google_client_id = Settings.get_google_client_id()
 
     params = {
-        "client_id": Settings.GOOGLE_CLIENT_ID,
+        "client_id": google_client_id,
         "redirect_uri": Settings.GOOGLE_REDIRECT_URI,
         "response_type": "code",
         "scope": "openid email profile",
         "access_type": "offline",
         "prompt": "consent",
+        "state": "raw_tokens" if raw_tokens else "default",
     }
     return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
 
@@ -54,17 +56,27 @@ async def google_login():
 @router.get("/google/callback")
 async def google_callback(
     code: str,
+    state: Optional[str] = None,
+    raw_tokens: bool = False,
     session=Depends(get_db_session),
 ):
     """Exchange authorization code for tokens, upsert user, return JWT."""
+    google_client_id = Settings.get_google_client_id()
+    google_client_secret = Settings.get_google_client_secret()
+    if not google_client_id or not google_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth not configured",
+        )
+
     # Exchange code for Google access token
     async with httpx.AsyncClient() as client:
         token_resp = await client.post(
             GOOGLE_TOKEN_URL,
             data={
                 "code": code,
-                "client_id": Settings.GOOGLE_CLIENT_ID,
-                "client_secret": Settings.GOOGLE_CLIENT_SECRET,
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
                 "redirect_uri": Settings.GOOGLE_REDIRECT_URI,
                 "grant_type": "authorization_code",
             },
@@ -78,6 +90,9 @@ async def google_callback(
         )
 
     google_tokens = token_resp.json()
+    should_return_raw_tokens = raw_tokens or state == "raw_tokens"
+    if should_return_raw_tokens and not Settings.is_production():
+        return google_tokens
     access_token = google_tokens["access_token"]
 
     # Fetch user profile from Google
