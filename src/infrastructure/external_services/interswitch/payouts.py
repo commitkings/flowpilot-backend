@@ -1,10 +1,11 @@
 """
 Interswitch Payouts — Create Payout, Status Check, and Wallet Balance.
 
-Uses the Payouts Service for:
-  - Create Payout:   POST /api/v1/payouts (wallet-funded bank transfer)
-  - Status Check:    GET  /api/v1/payouts/{transactionReference}
-  - Wallet Balance:  GET  /api/v1/wallet/balance/{merchantCode}
+Uses the Payouts Service hosted at api.interswitchng.com:
+  - Create Payout:   POST /payouts/api/v1/payouts (wallet-funded bank transfer)
+  - Status Check:    GET  /payouts/api/v1/payouts/{transactionReference}
+  - Customer Lookup: POST /payouts/api/v1/payouts/customer-lookup
+  - Wallet Balance:  GET  /merchant-wallet/api/v1/wallet/balance/{merchantCode}
 """
 
 import logging
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 class PayoutClient:
 
     def __init__(self) -> None:
-        self._auth = InterswitchAuth()
+        self._auth = InterswitchAuth(base_url=Settings.INTERSWITCH_PAYOUTS_BASE_URL)
 
     async def get_wallet_balance(self) -> dict:
         """Check wallet balance before payout execution.
@@ -33,7 +34,7 @@ class PayoutClient:
         async with await self._auth.get_resilient_client() as client:
             logger.info(f"Checking wallet balance: merchant={merchant_code}, wallet={wallet_id}")
             response = await client.get(
-                f"/api/v1/wallet/balance/{merchant_code}",
+                f"/merchant-wallet/api/v1/wallet/balance/{merchant_code}",
                 params={"walletId": wallet_id},
             )
             data = response.json()
@@ -92,7 +93,7 @@ class PayoutClient:
                 f"amount={amount_ngn} NGN, account={account_number}"
             )
             response = await client.post(
-                "/api/v1/payouts",
+                "/payouts/api/v1/payouts",
                 json=payload,
             )
             data = response.json()
@@ -112,12 +113,12 @@ class PayoutClient:
             transaction_reference: The transactionReference from the payout call.
 
         Returns:
-            dict with status (SUCCESS | FAILED | PROCESSING), amount, etc.
+            dict with status (SUCCESSFUL | FAILED | PROCESSING), amount, etc.
         """
         async with await self._auth.get_resilient_client() as client:
             logger.info(f"PayoutStatus: ref={transaction_reference[:30]}")
             response = await client.get(
-                f"/api/v1/payouts/{transaction_reference}",
+                f"/payouts/api/v1/payouts/{transaction_reference}",
             )
             data = response.json()
             logger.info(f"PayoutStatus result: status={data.get('status', '?')}")

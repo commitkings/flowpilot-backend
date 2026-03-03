@@ -183,7 +183,7 @@ class ExecutionAgent(BaseAgent):
                             "raw_status": raw.get("lookupStatus"),
                             "can_credit": raw.get("canCredit", False),
                         },
-                        "api_endpoint": "/api/v1/payouts/customer-lookup",
+                        "api_endpoint": "/payouts/api/v1/payouts/customer-lookup",
                     })
                     continue
 
@@ -217,7 +217,7 @@ class ExecutionAgent(BaseAgent):
                         "match_score": round(match_score, 3),
                         "transaction_reference": txn_ref[:30] + "..." if len(txn_ref) > 30 else txn_ref,
                     },
-                    "api_endpoint": "/api/v1/payouts/customer-lookup",
+                    "api_endpoint": "/payouts/api/v1/payouts/customer-lookup",
                 })
 
             except Exception as e:
@@ -233,14 +233,14 @@ class ExecutionAgent(BaseAgent):
                     "agent_type": "execution",
                     "action": "lookup_failed",
                     "detail": {"candidate_id": candidate_id, "error": str(e)},
-                    "api_endpoint": "/api/v1/payouts/customer-lookup",
+                    "api_endpoint": "/payouts/api/v1/payouts/customer-lookup",
                 })
         return results
 
     async def _execute_payouts(
         self, run_id: str, candidates: list[dict], audit_entries: list[dict]
     ) -> tuple[dict, list[dict]]:
-        """Execute payouts for verified candidates using per-item POST /api/v1/payouts.
+        """Execute payouts for verified candidates using per-item POST /payouts/api/v1/payouts.
 
         Each candidate dict must have _transaction_reference from the
         customer-lookup step.
@@ -297,7 +297,7 @@ class ExecutionAgent(BaseAgent):
                 "total_amount": total_amount,
                 "submission_status": batch_details["submission_status"],
             },
-            "api_endpoint": "/api/v1/payouts",
+            "api_endpoint": "/payouts/api/v1/payouts",
         })
 
         # Map response items back to candidates for per-candidate execution results
@@ -334,7 +334,7 @@ class ExecutionAgent(BaseAgent):
                     "provider_reference": provider_ref,
                     "item_status": item_status,
                 },
-                "api_endpoint": "/api/v1/payouts",
+                "api_endpoint": "/payouts/api/v1/payouts",
             })
 
         return batch_details, candidate_results
@@ -343,7 +343,7 @@ class ExecutionAgent(BaseAgent):
         self, candidate_results: list[dict], audit_entries: list[dict],
         max_polls: int = 2, poll_delay: float = 2.0,
     ) -> list[dict]:
-        """Poll final status for pending payout items via GET /api/v1/payouts/{ref}.
+        """Poll final status for pending payout items via GET /payouts/api/v1/payouts/{ref}.
 
         Makes up to *max_polls* attempts per item, with *poll_delay* seconds
         between attempts.  Only items with a provider_reference and status
@@ -395,7 +395,7 @@ class ExecutionAgent(BaseAgent):
                             "poll_attempt": attempt + 1,
                             "raw_status": raw_status,
                         },
-                        "api_endpoint": f"/api/v1/payouts/{item['provider_reference'][:30]}",
+                        "api_endpoint": f"/payouts/api/v1/payouts/{item['provider_reference'][:30]}",
                     })
                 except Exception as e:
                     logger.warning(

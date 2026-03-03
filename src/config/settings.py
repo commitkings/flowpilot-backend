@@ -136,6 +136,9 @@ class Settings:
     # Interswitch API
     # ------------------------------------------------------------------
     INTERSWITCH_BASE_URL: str = os.getenv("INTERSWITCH_BASE_URL", "https://qa.interswitchng.com")
+    INTERSWITCH_PAYOUTS_BASE_URL: str = os.getenv(
+        "INTERSWITCH_PAYOUTS_BASE_URL", "https://api.interswitchng.com"
+    )
     INTERSWITCH_CLIENT_ID: Optional[str] = os.getenv("INTERSWITCH_CLIENT_ID")
     INTERSWITCH_CLIENT_SECRET: Optional[str] = os.getenv("INTERSWITCH_CLIENT_SECRET")
     INTERSWITCH_MERCHANT_ID: str = os.getenv("INTERSWITCH_MERCHANT_ID", "")

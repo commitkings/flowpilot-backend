@@ -23,18 +23,19 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 60
 
 class InterswitchAuth:
 
-    _cached_token: Optional[str] = None
-    _token_expires_at: float = 0.0
+    # Per-base-URL token cache: {base_url: (token, expires_at)}
+    _token_cache: dict[str, tuple[str, float]] = {}
 
-    def __init__(self) -> None:
-        self._base_url = Settings.INTERSWITCH_BASE_URL.rstrip("/")
+    def __init__(self, base_url: Optional[str] = None) -> None:
+        self._base_url = (base_url or Settings.INTERSWITCH_BASE_URL).rstrip("/")
         self._client_id = Settings.INTERSWITCH_CLIENT_ID
         self._client_secret = Settings.INTERSWITCH_CLIENT_SECRET
 
     async def get_access_token(self) -> str:
         """Return a valid bearer token, refreshing via OAuth2 if needed."""
-        if self._cached_token and time.time() < self._token_expires_at:
-            return self._cached_token
+        cached = self._token_cache.get(self._base_url)
+        if cached and time.time() < cached[1]:
+            return cached[0]
 
         if self._client_id and self._client_secret:
             return await self._acquire_oauth2_token()
@@ -75,8 +76,8 @@ class InterswitchAuth:
             raise ValueError(f"OAuth2 response missing access_token: {data}")
 
         expires_in = int(data.get("expires_in", 3600))
-        InterswitchAuth._cached_token = access_token
-        InterswitchAuth._token_expires_at = time.time() + expires_in - _TOKEN_REFRESH_MARGIN_SECONDS
+        expires_at = time.time() + expires_in - _TOKEN_REFRESH_MARGIN_SECONDS
+        InterswitchAuth._token_cache[self._base_url] = (access_token, expires_at)
 
         logger.info(f"OAuth2 token acquired, expires in {expires_in}s")
         return access_token
@@ -113,7 +114,9 @@ class InterswitchAuth:
         return ResilientClient(client)
 
     @classmethod
-    def clear_token_cache(cls) -> None:
-        """Clear cached token (useful for tests or forced re-auth)."""
-        cls._cached_token = None
-        cls._token_expires_at = 0.0
+    def clear_token_cache(cls, base_url: Optional[str] = None) -> None:
+        """Clear cached token(s). Pass base_url to clear a specific cache entry."""
+        if base_url:
+            cls._token_cache.pop(base_url.rstrip("/"), None)
+        else:
+            cls._token_cache.clear()

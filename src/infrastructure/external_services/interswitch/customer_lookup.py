@@ -2,11 +2,12 @@
 Interswitch Customer Lookup — Payouts Service Account Verification.
 
 Validates a beneficiary account before payout using the Payouts Service
-customer-lookup endpoint (POST /api/v1/payouts/customer-lookup).
+customer-lookup endpoint (POST /payouts/api/v1/payouts/customer-lookup).
 """
 
 import logging
 
+from src.config.settings import Settings
 from src.infrastructure.external_services.interswitch.auth import InterswitchAuth
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class CustomerLookupClient:
 
     def __init__(self) -> None:
-        self._auth = InterswitchAuth()
+        self._auth = InterswitchAuth(base_url=Settings.INTERSWITCH_PAYOUTS_BASE_URL)
 
     async def lookup_customer(
         self,
@@ -59,7 +60,7 @@ class CustomerLookupClient:
                 f"ref={transaction_reference[:30]}"
             )
             response = await client.post(
-                "/api/v1/payouts/customer-lookup",
+                "/payouts/api/v1/payouts/customer-lookup",
                 json=payload,
             )
             data = response.json()
