@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth.dependencies import get_current_user
 from app.api.routes.runs import _parse_uuid, _running_states
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.state import AgentState
@@ -211,6 +212,7 @@ async def get_candidates(
     run_id: str,
     approval_status: Optional[str] = None,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)
@@ -235,6 +237,7 @@ async def approve_candidates(
     run_id: str,
     request: ApprovalRequest,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     # Validate input BEFORE acquiring CAS lock to avoid wedging the run
@@ -278,7 +281,7 @@ async def approve_candidates(
             raise HTTPException(status_code=404, detail="Run not found")
 
     # Approve candidates in DB (candidate_ids already validated above)
-    approved_count = await candidate_repo.approve(candidate_ids, run.created_by, run_uuid)
+    approved_count = await candidate_repo.approve(candidate_ids, current_user.id, run_uuid)
 
     # Audit log: approval action
     audit_repo = AuditRepository(session)
@@ -288,7 +291,7 @@ async def approve_candidates(
         detail={
             "candidate_ids": [str(cid) for cid in candidate_ids],
             "approved_count": approved_count,
-            "created_by": str(run.created_by),
+            "approved_by": str(current_user.id),
         },
     )
     await session.commit()
@@ -340,6 +343,7 @@ async def reject_candidates(
     run_id: str,
     request: RejectionRequest,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     candidate_ids = _parse_uuid_list(request.candidate_ids, "candidate_ids")

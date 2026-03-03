@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import AuditRepository
 
@@ -44,6 +45,7 @@ def _extract_structured_report(entries: list) -> Optional[dict]:
 async def get_audit_report(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     audit_repo = AuditRepository(session)
@@ -75,6 +77,7 @@ async def get_audit_report(
 async def download_audit_report(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     audit_repo = AuditRepository(session)

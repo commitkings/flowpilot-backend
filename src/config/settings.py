@@ -139,6 +139,9 @@ class Settings:
     INTERSWITCH_CLIENT_ID: Optional[str] = os.getenv("INTERSWITCH_CLIENT_ID")
     INTERSWITCH_CLIENT_SECRET: Optional[str] = os.getenv("INTERSWITCH_CLIENT_SECRET")
     INTERSWITCH_MERCHANT_ID: str = os.getenv("INTERSWITCH_MERCHANT_ID", "")
+    INTERSWITCH_WALLET_ID: str = os.getenv("INTERSWITCH_WALLET_ID", "")
+    INTERSWITCH_WALLET_PIN: str = os.getenv("INTERSWITCH_WALLET_PIN", "")
+    # DEPRECATED: used only by legacy Quickteller endpoints
     INTERSWITCH_SOURCE_ACCOUNT_ID: str = os.getenv("INTERSWITCH_SOURCE_ACCOUNT_ID", "")
     INTERSWITCH_TERMINAL_ID: str = os.getenv("INTERSWITCH_TERMINAL_ID", "3PBL0001")
 
@@ -151,6 +154,11 @@ class Settings:
         has_oauth2 = bool(cls.INTERSWITCH_CLIENT_ID and cls.INTERSWITCH_CLIENT_SECRET)
         has_static_token = bool(cls.get_interswitch_access_token())
         return has_oauth2 or has_static_token
+
+    @classmethod
+    def is_payout_configured(cls) -> bool:
+        """Check if wallet-based payout credentials are set."""
+        return cls.is_interswitch_configured() and bool(cls.INTERSWITCH_WALLET_ID and cls.INTERSWITCH_WALLET_PIN)
 
     # ------------------------------------------------------------------
     # Groq API (LLM)

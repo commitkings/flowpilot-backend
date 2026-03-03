@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth.dependencies import get_current_user
 from src.agents.orchestrator import RunOrchestrator
 from src.agents.state import AgentState
 from src.config.settings import Settings
@@ -26,8 +27,6 @@ router = APIRouter()
 # In-memory cache of active run states (for runs awaiting approval).
 # Only populated between create_run halt and approval/rejection.
 _running_states: dict[str, AgentState] = {}
-
-_DEFAULT_OPERATOR_ID = "00000000-0000-0000-0000-000000000001"
 
 
 class CandidateInput(BaseModel):
@@ -58,7 +57,6 @@ class CandidateResponse(BaseModel):
 
 class CreateRunRequest(BaseModel):
     business_id: str = Field(..., description="Business UUID (multi-tenancy scope)")
-    created_by: str = Field(_DEFAULT_OPERATOR_ID, description="User UUID")
     objective: str = Field(..., description="Operator objective text")
     constraints: Optional[str] = None
     risk_tolerance: float = Field(0.35, ge=0.0, le=1.0)
@@ -129,8 +127,9 @@ def _candidates_to_response(candidates) -> list[CandidateResponse]:
 async def create_run(
     request: CreateRunRequest,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
-    operator_id = _parse_uuid(request.created_by, "created_by")
+    operator_id = current_user.id
     business_uuid = _parse_uuid(request.business_id, "business_id")
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
@@ -257,7 +256,10 @@ async def create_run(
 
 
 @router.get("/runs")
-async def list_runs(session: AsyncSession = Depends(get_db_session)):
+async def list_runs(
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
     run_repo = RunRepository(session)
     runs = await run_repo.list_all()
     return [
@@ -276,6 +278,7 @@ async def list_runs(session: AsyncSession = Depends(get_db_session)):
 async def get_run(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)
@@ -322,6 +325,7 @@ async def get_run(
 async def get_run_status(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)
@@ -358,6 +362,7 @@ async def upload_candidates_csv(
     run_id: str,
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
 ):
     """Upload payout candidates from a CSV file to an existing run.
 

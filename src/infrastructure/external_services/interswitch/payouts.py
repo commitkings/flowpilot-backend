@@ -1,10 +1,10 @@
 """
-Interswitch Payouts — Account Credit, Requery, and Institutions.
+Interswitch Payouts — Create Payout, Status Check, and Wallet Balance.
 
-Uses the Quickteller Transfer Service for:
-  - AccountCredit:  Execute a payout (requires transactionReference from CreditInquiry)
-  - Requery:        Check payout status
-  - Institutions:   Fetch list of receiving banks/institutions
+Uses the Payouts Service for:
+  - Create Payout:   POST /api/v1/payouts (wallet-funded bank transfer)
+  - Status Check:    GET  /api/v1/payouts/{transactionReference}
+  - Wallet Balance:  GET  /api/v1/wallet/balance/{merchantCode}
 """
 
 import logging
@@ -16,100 +16,115 @@ from src.infrastructure.external_services.interswitch.auth import InterswitchAut
 logger = logging.getLogger(__name__)
 
 
-def _ngn_to_kobo(amount_ngn: float) -> int:
-    """Convert NGN amount to minor denomination (kobo)."""
-    return int(round(amount_ngn * 100))
-
-
 class PayoutClient:
 
     def __init__(self) -> None:
         self._auth = InterswitchAuth()
 
-    async def get_receiving_institutions(self) -> dict:
-        """Fetch supported banks/institutions from Interswitch."""
+    async def get_wallet_balance(self) -> dict:
+        """Check wallet balance before payout execution.
+
+        Returns:
+            dict with availableBalance, ledgerBalance (in NGN major denomination).
+        """
+        merchant_code = Settings.INTERSWITCH_MERCHANT_ID
+        wallet_id = Settings.INTERSWITCH_WALLET_ID
+
         async with await self._auth.get_resilient_client() as client:
-            logger.info("Fetching receiving institutions from Interswitch")
+            logger.info(f"Checking wallet balance: merchant={merchant_code}, wallet={wallet_id}")
             response = await client.get(
-                "/quicktellerservice/api/v5/institutions",
+                f"/api/v1/wallet/balance/{merchant_code}",
+                params={"walletId": wallet_id},
             )
-            return response.json()
+            data = response.json()
+            logger.info(f"Wallet balance: available={data.get('availableBalance', '?')}")
+            return data
 
     async def execute_single_payout(
         self,
         transaction_reference: str,
         amount_ngn: float,
         narration: str,
-        client_ref: str,
+        account_number: str,
+        institution_code: str,
+        currency_code: str = "NGN",
+        single_call: bool = False,
     ) -> dict:
-        """Execute a single payout via Interswitch AccountCredit.
+        """Execute a single payout via Interswitch Payouts Service.
 
-        This is a per-item operation — each candidate requires a separate
-        call.  The transactionReference MUST come from a prior
-        CreditInquiry call.
+        This is a per-item operation — each candidate requires a separate call.
+        The transactionReference MUST come from a prior customer-lookup call
+        (unless singleCall=True).
 
         Args:
-            transaction_reference: From CreditInquiry response.
-            amount_ngn: Payout amount in NGN (converted to kobo internally).
+            transaction_reference: Same reference used in customer-lookup.
+            amount_ngn: Payout amount in NGN (major denomination — NOT kobo).
             narration: Payment narration/description.
-            client_ref: Unique client reference for idempotency tracking.
+            account_number: Recipient account number.
+            institution_code: Bank code (CBN, NIP, or ISW internal).
+            currency_code: Currency code (default "NGN").
+            single_call: If True, skip separate lookup step.
 
         Returns:
-            dict with Interswitch credit response fields.
+            dict with Interswitch payout response fields.
         """
         payload = {
-            "transactionAmount": _ngn_to_kobo(amount_ngn),
-            "narration": narration,
-            "clientRef": client_ref,
             "transactionReference": transaction_reference,
-            "terminalId": Settings.INTERSWITCH_TERMINAL_ID,
+            "payoutChannel": "BANK_TRANSFER",
+            "currencyCode": currency_code,
+            "amount": amount_ngn,
+            "narration": narration,
+            "walletDetails": {
+                "pin": Settings.INTERSWITCH_WALLET_PIN,
+                "walletId": Settings.INTERSWITCH_WALLET_ID,
+            },
+            "recipient": {
+                "recipientAccount": account_number,
+                "recipientBank": institution_code,
+                "currencyCode": currency_code,
+            },
+            "singleCall": single_call,
         }
 
         async with await self._auth.get_resilient_client() as client:
             logger.info(
-                f"AccountCredit: ref={transaction_reference[:20]}..., "
-                f"amount={amount_ngn} NGN ({_ngn_to_kobo(amount_ngn)} kobo), "
-                f"clientRef={client_ref}"
+                f"CreatePayout: ref={transaction_reference[:30]}, "
+                f"amount={amount_ngn} NGN, account={account_number}"
             )
             response = await client.post(
-                "/quicktellerservice/api/v5/transactions/AccountCredit",
+                "/api/v1/payouts",
                 json=payload,
             )
             data = response.json()
-            logger.info(f"AccountCredit result: {data.get('responseCode', '?')} — {data.get('responseMessage', '?')}")
+            logger.info(
+                f"CreatePayout result: status={data.get('status', '?')}, "
+                f"ref={transaction_reference[:30]}"
+            )
             return data
 
     async def requery_payout(
         self,
-        client_ref: str,
-        transaction_reference: Optional[str] = None,
+        transaction_reference: str,
     ) -> dict:
-        """Check payout status via Interswitch Requery.
+        """Check payout status via Interswitch Payouts Service.
 
         Args:
-            client_ref: The clientRef used in the original AccountCredit call.
-            transaction_reference: Optional transaction reference for lookup.
+            transaction_reference: The transactionReference from the payout call.
 
         Returns:
-            dict with status, responseCode, settlementStatus, etc.
+            dict with status (SUCCESS | FAILED | PROCESSING), amount, etc.
         """
-        payload = {"clientRef": client_ref}
-        if transaction_reference:
-            payload["transactionReference"] = transaction_reference
-
         async with await self._auth.get_resilient_client() as client:
-            logger.info(f"Requery: clientRef={client_ref}")
-            response = await client.post(
-                "/quicktellerservice/api/v5/transactions/Requery",
-                json=payload,
+            logger.info(f"PayoutStatus: ref={transaction_reference[:30]}")
+            response = await client.get(
+                f"/api/v1/payouts/{transaction_reference}",
             )
             data = response.json()
-            logger.info(f"Requery result: status={data.get('status', '?')}")
+            logger.info(f"PayoutStatus result: status={data.get('status', '?')}")
             return data
 
     # ------------------------------------------------------------------
-    # Legacy batch method — kept for backward compat but now delegates
-    # to per-item execute_single_payout internally.
+    # Batch wrapper — delegates to per-item execute_single_payout.
     # ------------------------------------------------------------------
 
     async def execute_payout(
@@ -117,14 +132,15 @@ class PayoutClient:
         batch_reference: str,
         items: list[dict],
         currency: str = "NGN",
-        source_account_id: Optional[str] = None,
     ) -> dict:
         """Execute payouts for a batch of items (sequentially per-item).
 
         Each item dict must contain:
-            transaction_reference (str): From prior CreditInquiry
-            amount (float): In NGN
-            client_reference (str): Unique per-item ref
+            transaction_reference (str): From prior customer-lookup
+            amount (float): In NGN (major denomination)
+            account_number (str): Recipient account
+            institution_code (str): Bank code
+            client_reference (str, optional): Internal tracking ref
             narration (str, optional)
         """
         results = []
@@ -137,23 +153,27 @@ class PayoutClient:
                     transaction_reference=item["transaction_reference"],
                     amount_ngn=item["amount"],
                     narration=item.get("narration", "FlowPilot Payout"),
-                    client_ref=item["client_reference"],
+                    account_number=item["account_number"],
+                    institution_code=item["institution_code"],
+                    currency_code=currency,
                 )
-                resp_code = result.get("responseCode", "")
-                status = "PENDING" if resp_code == "00" or resp_code == "09" else "FAILED"
-                results.append({
-                    "clientReference": item["client_reference"],
-                    "providerReference": result.get("transactionReference", ""),
-                    "status": status,
-                    "responseCode": resp_code,
-                    "responseMessage": result.get("responseMessage", ""),
-                })
-                if status != "FAILED":
+                raw_status = (result.get("status") or "").upper()
+                if raw_status in ("SUCCESSFUL", "PROCESSING"):
+                    status = "PENDING"
                     accepted += 1
                 else:
+                    status = "FAILED"
                     rejected += 1
+
+                results.append({
+                    "clientReference": item.get("client_reference", ""),
+                    "providerReference": item["transaction_reference"],
+                    "status": status,
+                    "responseCode": result.get("responseCode", ""),
+                    "responseMessage": result.get("responseMessage", ""),
+                })
             except Exception as e:
-                logger.error(f"Payout failed for {item.get('client_reference')}: {e}")
+                logger.error(f"Payout failed for {item.get('transaction_reference')}: {e}")
                 results.append({
                     "clientReference": item.get("client_reference", ""),
                     "providerReference": "",
@@ -171,6 +191,6 @@ class PayoutClient:
             "items": results,
         }
 
-    async def get_payout_status(self, provider_reference: str) -> dict:
-        """Check status of a single payout (delegates to requery)."""
-        return await self.requery_payout(client_ref=provider_reference)
+    async def get_payout_status(self, transaction_reference: str) -> dict:
+        """Check status of a single payout."""
+        return await self.requery_payout(transaction_reference=transaction_reference)
