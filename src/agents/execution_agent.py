@@ -1,11 +1,15 @@
 """
 ExecutionAgent — verifies beneficiaries and executes payouts.
 
-Flow using the Interswitch Payouts Service:
-  1. Customer-lookup per candidate → validates account, caller provides transactionReference
+Uses a PayoutGateway abstraction so the transport can be either:
+  - LivePayoutGateway  (real Interswitch calls, PAYOUT_MODE=live)
+  - SimulatedPayoutGateway (demo-safe, PAYOUT_MODE=simulated)
+
+Flow:
+  1. Customer-lookup per candidate → validates account
   2. Name matching (lookup_name vs beneficiary_name)
-  3. Create Payout per verified candidate (reuses transactionReference from step 1)
-  4. GET payout status to poll for final settlement
+  3. Create Payout per verified candidate
+  4. Poll payout status for final settlement
 """
 
 import logging
@@ -14,8 +18,8 @@ from datetime import datetime
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
 from src.config.settings import Settings
-from src.infrastructure.external_services.interswitch.customer_lookup import CustomerLookupClient
-from src.infrastructure.external_services.interswitch.payouts import PayoutClient
+from src.infrastructure.external_services.interswitch.gateway_factory import get_payout_gateway
+from src.infrastructure.external_services.interswitch.payout_gateway import PayoutGateway
 from src.utilities.name_match import name_match_score, NAME_MATCH_THRESHOLD
 
 logger = logging.getLogger(__name__)
@@ -23,10 +27,9 @@ logger = logging.getLogger(__name__)
 
 class ExecutionAgent(BaseAgent):
 
-    def __init__(self) -> None:
+    def __init__(self, gateway: PayoutGateway | None = None) -> None:
         super().__init__("ExecutionAgent")
-        self._lookup_client = CustomerLookupClient()
-        self._payout_client = PayoutClient()
+        self._gateway = gateway or get_payout_gateway()
 
     async def run(self, state: AgentState) -> AgentState:
         approved_ids = set(state.get("approved_candidate_ids", []))
@@ -71,7 +74,12 @@ class ExecutionAgent(BaseAgent):
                 }],
             }
 
-        audit_entries: list[dict] = []
+        payout_mode = "simulated" if self._gateway.is_simulated else "live"
+        audit_entries: list[dict] = [{
+            "agent_type": "execution",
+            "action": "payout_mode_selected",
+            "detail": {"payout_mode": payout_mode},
+        }]
         run_id = state["run_id"]
 
         try:
@@ -161,7 +169,7 @@ class ExecutionAgent(BaseAgent):
             candidate_id = c.get("candidate_id")
             txn_ref = f"FP_{run_id}_{candidate_id}"
             try:
-                raw = await self._lookup_client.lookup_customer(
+                raw = await self._gateway.lookup_customer(
                     institution_code=c["institution_code"],
                     account_number=c["account_number"],
                     transaction_reference=txn_ref,
@@ -262,7 +270,7 @@ class ExecutionAgent(BaseAgent):
             for c in candidates
         ]
 
-        raw = await self._payout_client.execute_payout(
+        raw = await self._gateway.execute_payout(
             batch_reference=batch_reference,
             items=items,
         )
@@ -376,7 +384,7 @@ class ExecutionAgent(BaseAgent):
 
             for item in still_pending:
                 try:
-                    status_resp = await self._payout_client.requery_payout(
+                    status_resp = await self._gateway.requery_payout(
                         transaction_reference=item["provider_reference"],
                     )
                     raw_status = (status_resp.get("status") or "").upper()

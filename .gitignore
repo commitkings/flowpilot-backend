@@ -96,6 +96,7 @@ docs/
 guide/
 AGENTS.md
 node_modules/
+frontend/
 dist/
 build/
 coverage/
@@ -120,3 +121,4 @@ skills-lock.json
 scripts/deploy.sh
 scripts/install-skill-to-github.sh
 whatsapp/
+copilot-instructions.md

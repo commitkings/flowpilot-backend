@@ -13,15 +13,34 @@ from app.api.routes.approval import router as approval_router
 from app.api.routes.audit import router as audit_router
 from app.api.routes.institutions import router as institutions_router
 from app.api.routes.onboarding import router as onboarding_router
+from app.api.routes.transactions import router as transactions_router
 from app.api.auth import auth_router
+from src.config.settings import Settings
 from src.infrastructure.database.connection import close_db, get_session_factory, init_db
 
 logger = logging.getLogger(__name__)
 
 
+def _validate_payout_config() -> None:
+    """Log payout mode and surface any configuration warnings at startup."""
+    mode = Settings.PAYOUT_MODE.lower()
+    logger.info(f"PAYOUT_MODE={mode}")
+
+    warnings = Settings.validate_payout_config()
+    for warning in warnings:
+        logger.warning(f"[PayoutConfig] {warning}")
+
+    if mode == "simulated":
+        logger.info(
+            "Payout transport is SIMULATED — no real funds will move. "
+            "Set PAYOUT_MODE=live with valid credentials to enable real payouts."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("FlowPilot API starting up")
+    _validate_payout_config()
     await init_db()
     try:
         yield
@@ -53,6 +72,7 @@ app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
 app.include_router(audit_router, prefix="/api/v1", tags=["audit"])
 app.include_router(institutions_router, prefix="/api/v1", tags=["institutions"])
 app.include_router(onboarding_router, prefix="/api/v1", tags=["onboarding"])
+app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
 
 
 @app.get("/health")
@@ -66,6 +86,7 @@ async def health_check() -> dict[str, str]:
     return {
         "status": "healthy" if db_status == "healthy" else "unhealthy",
         "database": db_status,
+        "payout_mode": Settings.PAYOUT_MODE.lower(),
         "service": "flowpilot",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }

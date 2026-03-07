@@ -148,6 +148,9 @@ class Settings:
     INTERSWITCH_SOURCE_ACCOUNT_ID: str = os.getenv("INTERSWITCH_SOURCE_ACCOUNT_ID", "")
     INTERSWITCH_TERMINAL_ID: str = os.getenv("INTERSWITCH_TERMINAL_ID", "3PBL0001")
 
+    _VALID_PAYOUT_MODES = ("simulated", "live")
+    PAYOUT_MODE: str = os.getenv("PAYOUT_MODE", "simulated")
+
     @classmethod
     def get_interswitch_access_token(cls) -> Optional[str]:
         return cls._get_secret("INTERSWITCH_ACCESS_TOKEN", "INTERSWITCH_ACCESS_TOKEN")
@@ -162,6 +165,41 @@ class Settings:
     def is_payout_configured(cls) -> bool:
         """Check if wallet-based payout credentials are set."""
         return cls.is_interswitch_configured() and bool(cls.INTERSWITCH_WALLET_ID and cls.INTERSWITCH_WALLET_PIN)
+
+    @classmethod
+    def is_payout_simulated(cls) -> bool:
+        return cls.PAYOUT_MODE.lower() == "simulated"
+
+    @classmethod
+    def validate_payout_config(cls) -> list[str]:
+        """Return a list of configuration warnings/errors for payout setup."""
+        warnings: list[str] = []
+        mode = cls.PAYOUT_MODE.lower()
+
+        if mode not in cls._VALID_PAYOUT_MODES:
+            warnings.append(
+                f"PAYOUT_MODE={cls.PAYOUT_MODE!r} is invalid. "
+                f"Must be one of {cls._VALID_PAYOUT_MODES}. Defaulting to 'simulated'."
+            )
+
+        if mode == "live":
+            if not cls.is_payout_configured():
+                warnings.append(
+                    "PAYOUT_MODE=live but wallet credentials are missing "
+                    "(INTERSWITCH_WALLET_ID / INTERSWITCH_WALLET_PIN / auth)."
+                )
+            base = cls.INTERSWITCH_BASE_URL.lower()
+            payouts_base = cls.INTERSWITCH_PAYOUTS_BASE_URL.lower()
+            base_is_qa = "qa.interswitchng" in base
+            payouts_is_prod = "api.interswitchng" in payouts_base and "qa" not in payouts_base
+            if base_is_qa and payouts_is_prod:
+                warnings.append(
+                    "Environment mismatch: INTERSWITCH_BASE_URL points to QA "
+                    "but INTERSWITCH_PAYOUTS_BASE_URL points to production. "
+                    "Auth tokens acquired from QA will be rejected by production."
+                )
+
+        return warnings
 
     # ------------------------------------------------------------------
     # Groq API (LLM)
