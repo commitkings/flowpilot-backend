@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import logging
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,7 @@ def _parse_date(value: Optional[str]) -> Optional[datetime.date]:
 
 @router.get("/transactions")
 async def list_transactions(
+    run_id: Optional[str] = Query(None, description="Filter by run UUID"),
     status: Optional[str] = Query(None, description="Filter: SUCCESS | PENDING | FAILED | REVERSED"),
     channel: Optional[str] = Query(None, description="Filter: CARD | TRANSFER | USSD | QR"),
     search: Optional[str] = Query(None, description="Substring match on interswitch_ref"),
@@ -69,6 +71,7 @@ async def list_transactions(
     repo = TransactionRepository(session)
 
     filter_kwargs = dict(
+        run_id=UUID(run_id) if run_id else None,
         status=status,
         channel=channel,
         search=search,
