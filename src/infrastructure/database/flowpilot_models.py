@@ -157,9 +157,7 @@ class BusinessModel(Base):
         back_populates="business",
         uselist=False,
     )
-    invitations: Mapped[list["InvitationModel"]] = relationship(
-        back_populates="business",
-    )
+
     agent_runs: Mapped[list["AgentRunModel"]] = relationship(
         back_populates="business",
     )
@@ -224,54 +222,6 @@ class BusinessConfigModel(Base):
     business: Mapped["BusinessModel"] = relationship(back_populates="config")
 
 
-# --------------------------------------------------------------------------- #
-# 5. invitation — team invite lifecycle
-# --------------------------------------------------------------------------- #
-class InvitationModel(Base):
-    __tablename__ = "invitation"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    business_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("business.id", ondelete="CASCADE"),
-    )
-    invited_by: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("user.id", ondelete="SET NULL"),
-    )
-    email: Mapped[str] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(Text)
-    token_hash: Mapped[str] = mapped_column(String(255), unique=True)
-    status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
-    accepted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
-    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "role IN ('approver', 'analyst')",
-            name="invitation_role_check",
-        ),
-        CheckConstraint(
-            "status IN ('pending', 'accepted', 'expired', 'revoked')",
-            name="invitation_status_check",
-        ),
-        Index("invitation_business_id_idx", "business_id"),
-        Index("invitation_email_idx", "email"),
-        Index("invitation_expires_at_idx", "expires_at"),
-        Index("invitation_invited_by_idx", "invited_by"),
-    )
-
-    business: Mapped["BusinessModel"] = relationship(back_populates="invitations")
 
 
 # =========================================================================== #
@@ -423,10 +373,7 @@ class AgentRunModel(Base):
     payout_candidates: Mapped[list["PayoutCandidateModel"]] = relationship(
         back_populates="agent_run",
     )
-    forecast_result: Mapped[Optional["ForecastResultModel"]] = relationship(
-        back_populates="agent_run",
-        uselist=False,
-    )
+
     audit_logs: Mapped[list["AuditLogModel"]] = relationship(
         back_populates="agent_run",
     )
@@ -800,9 +747,7 @@ class PayoutCandidateModel(Base):
     payout_executions: Mapped[list["PayoutExecutionModel"]] = relationship(
         back_populates="candidate",
     )
-    approval_overrides: Mapped[list["ApprovalOverrideModel"]] = relationship(
-        back_populates="candidate",
-    )
+
 
 
 # --------------------------------------------------------------------------- #
@@ -851,55 +796,6 @@ class RiskScoreFeatureModel(Base):
     )
 
 
-# --------------------------------------------------------------------------- #
-# 14. forecast_result — per-run forecast with JSONB daily projections
-# --------------------------------------------------------------------------- #
-class ForecastResultModel(Base):
-    __tablename__ = "forecast_result"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("agent_run.id", ondelete="CASCADE"),
-        unique=True,
-    )
-    business_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("business.id", ondelete="CASCADE"),
-    )
-    balance_today: Mapped[Decimal] = mapped_column(Numeric(18, 2))
-    total_payout_batch: Mapped[Decimal] = mapped_column(Numeric(18, 2))
-    projected_balance_after: Mapped[Decimal] = mapped_column(Numeric(18, 2))
-    feasibility: Mapped[str] = mapped_column(Text)
-    stress_flag: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
-    inflow_7d_projected: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
-    outflow_7d_projected: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
-    net_7d_projected: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
-    daily_projections: Mapped[Optional[list]] = mapped_column(JSONB)
-    model_version: Mapped[str] = mapped_column(String(32))
-    computed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "feasibility IN ('safe', 'caution', 'block')",
-            name="forecast_result_feasibility_check",
-        ),
-        Index("forecast_result_business_id_idx", "business_id"),
-    )
-
-    agent_run: Mapped["AgentRunModel"] = relationship(
-        back_populates="forecast_result",
-    )
 
 
 # =========================================================================== #
@@ -985,7 +881,7 @@ class CustomerLookupResultModel(Base):
         UUID(as_uuid=True),
         ForeignKey("agent_run.id", ondelete="CASCADE"),
     )
-    account_number: Mapped[str] = mapped_column(String(20))
+    account_number: Mapped[str] = mapped_column(String(100))
     institution_code: Mapped[str] = mapped_column(String(10))
     can_credit: Mapped[Optional[bool]] = mapped_column(Boolean)
     name_returned: Mapped[Optional[str]] = mapped_column(String(255))
@@ -1074,61 +970,9 @@ class PayoutExecutionModel(Base):
 
 
 # =========================================================================== #
-#  AUDIT & OBSERVABILITY (4 tables)
+#  AUDIT & OBSERVABILITY (3 tables)
 # =========================================================================== #
 
-
-# --------------------------------------------------------------------------- #
-# 18. approval_override — immutable override audit trail
-# --------------------------------------------------------------------------- #
-class ApprovalOverrideModel(Base):
-    __tablename__ = "approval_override"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    candidate_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("payout_candidate.id", ondelete="CASCADE"),
-    )
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("agent_run.id", ondelete="CASCADE"),
-    )
-    overridden_by: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("user.id", ondelete="SET NULL"),
-    )
-    original_decision: Mapped[str] = mapped_column(Text)
-    original_score: Mapped[Decimal] = mapped_column(Numeric(5, 4))
-    new_decision: Mapped[str] = mapped_column(Text)
-    reason: Mapped[str] = mapped_column(Text)
-    overridden_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "original_decision IN ('allow', 'review', 'block')",
-            name="approval_override_original_decision_check",
-        ),
-        CheckConstraint(
-            "new_decision IN ('allow', 'review', 'block')",
-            name="approval_override_new_decision_check",
-        ),
-        Index("approval_override_candidate_id_idx", "candidate_id"),
-        Index("approval_override_run_id_idx", "run_id"),
-        Index("approval_override_overridden_by_idx", "overridden_by"),
-    )
-
-    candidate: Mapped["PayoutCandidateModel"] = relationship(
-        back_populates="approval_overrides",
-    )
 
 
 # --------------------------------------------------------------------------- #
