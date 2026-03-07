@@ -19,15 +19,8 @@ router = APIRouter()
 
 def _serialize_transaction(txn) -> dict:
     """Map a ReconciledTransactionModel to the shape the frontend expects."""
-    # Determine anomaly label
-    if txn.has_anomaly:
-        anomaly = (
-            txn.anomalies[0].anomaly_type
-            if getattr(txn, "anomalies", None)
-            else "Flagged"
-        )
-    else:
-        anomaly = "Clean"
+    # Derive anomaly label from denormalized columns (avoids lazy-load in async)
+    anomaly = "Flagged" if txn.has_anomaly else "Clean"
 
     return {
         "id": str(txn.id),

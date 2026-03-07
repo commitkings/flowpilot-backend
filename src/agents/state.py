@@ -6,6 +6,8 @@ class AgentState(TypedDict, total=False):
     business_id: str
     objective: str
     constraints: Optional[str]
+    date_from: Optional[str]
+    date_to: Optional[str]
     risk_tolerance: float
     budget_cap: Optional[float]
     merchant_id: str

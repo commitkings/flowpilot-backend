@@ -2,6 +2,7 @@ import csv
 import io
 import logging
 import uuid
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -17,6 +18,7 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
+    InstitutionRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -59,6 +61,8 @@ class CreateRunRequest(BaseModel):
     business_id: str = Field(..., description="Business UUID (multi-tenancy scope)")
     objective: str = Field(..., description="Operator objective text")
     constraints: Optional[str] = None
+    date_from: Optional[date] = Field(None, description="Transaction search start date")
+    date_to: Optional[date] = Field(None, description="Transaction search end date")
     risk_tolerance: float = Field(0.35, ge=0.0, le=1.0)
     budget_cap: Optional[float] = None
     merchant_id: Optional[str] = None
@@ -84,6 +88,62 @@ def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
+
+
+def _normalize_institution_key(value: str) -> str:
+    return "".join(char for char in value.strip().lower() if char.isalnum())
+
+
+def _build_institution_alias_map(institutions) -> dict[str, str]:
+    alias_map: dict[str, str] = {}
+
+    for institution in institutions:
+        aliases = [
+            institution.institution_code,
+            institution.institution_name,
+            institution.short_name,
+            institution.nip_code,
+            institution.cbn_code,
+        ]
+
+        for alias in aliases:
+            if not alias:
+                continue
+
+            normalized_alias = _normalize_institution_key(alias)
+            if normalized_alias:
+                alias_map.setdefault(normalized_alias, institution.institution_code)
+
+    return alias_map
+
+
+async def _normalize_candidate_institutions(
+    rows: list[dict],
+    institution_repo: InstitutionRepository,
+) -> list[str]:
+    if not rows:
+        return []
+
+    institutions = await institution_repo.get_all_active()
+    alias_map = _build_institution_alias_map(institutions)
+    errors: list[str] = []
+
+    for row in rows:
+        raw_value = str(row.get("institution_code", "")).strip()
+        normalized_value = _normalize_institution_key(raw_value)
+        resolved_code = alias_map.get(normalized_value)
+
+        if not resolved_code:
+            source_label = row.get("source_label", "Item ?")
+            errors.append(
+                f"{source_label}: unknown institution '{raw_value}'. "
+                "Use a valid institution code or known institution alias."
+            )
+            continue
+
+        row["institution_code"] = resolved_code
+
+    return errors
 
 
 def _current_step_from_status(status: str) -> str:
@@ -133,6 +193,33 @@ async def create_run(
     business_uuid = _parse_uuid(request.business_id, "business_id")
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
+    institution_repo = InstitutionRepository(session)
+
+    candidate_rows: list[dict] = []
+    if request.candidates:
+        candidate_rows = [
+            {
+                "source_label": f"Candidate {index}",
+                "institution_code": c.institution_code,
+                "beneficiary_name": c.beneficiary_name,
+                "account_number": c.account_number,
+                "amount": Decimal(str(c.amount)),
+                "currency": c.currency,
+                "purpose": c.purpose,
+                "approval_status": "pending",
+                "execution_status": "not_started",
+            }
+            for index, c in enumerate(request.candidates, start=1)
+        ]
+        validation_errors = await _normalize_candidate_institutions(
+            candidate_rows,
+            institution_repo,
+        )
+        if validation_errors:
+            raise HTTPException(
+                status_code=400,
+                detail="; ".join(validation_errors[:10]),
+            )
 
     run = await run_repo.create(
         business_id=business_uuid,
@@ -140,6 +227,8 @@ async def create_run(
         objective=request.objective,
         merchant_id=request.merchant_id or Settings.INTERSWITCH_MERCHANT_ID,
         constraints=request.constraints,
+        date_from=request.date_from,
+        date_to=request.date_to,
         risk_tolerance=Decimal(str(request.risk_tolerance)),
         budget_cap=(
             Decimal(str(request.budget_cap))
@@ -154,21 +243,19 @@ async def create_run(
 
     # Persist raw candidates to DB before pipeline starts
     candidate_dicts: list[dict] = []
-    if request.candidates:
-        raw_rows = [
-            {
-                "institution_code": c.institution_code,
-                "beneficiary_name": c.beneficiary_name,
-                "account_number": c.account_number,
-                "amount": Decimal(str(c.amount)),
-                "currency": c.currency,
-                "purpose": c.purpose,
-                "approval_status": "pending",
-                "execution_status": "not_started",
-            }
-            for c in request.candidates
-        ]
-        persisted = await candidate_repo.create_batch(run.id, raw_rows, business_id=business_uuid)
+    if candidate_rows:
+        persisted = await candidate_repo.create_batch(
+            run.id,
+            [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "source_label"
+                }
+                for row in candidate_rows
+            ],
+            business_id=business_uuid,
+        )
         await session.commit()
         # Build dicts for RiskAgent (matches its expected input format)
         candidate_dicts = [
@@ -190,6 +277,8 @@ async def create_run(
         "business_id": str(business_uuid),
         "objective": request.objective,
         "constraints": request.constraints,
+        "date_from": request.date_from.isoformat() if request.date_from else None,
+        "date_to": request.date_to.isoformat() if request.date_to else None,
         "risk_tolerance": request.risk_tolerance,
         "budget_cap": request.budget_cap,
         "merchant_id": request.merchant_id or Settings.INTERSWITCH_MERCHANT_ID,
@@ -243,6 +332,8 @@ async def create_run(
             current_step=state.get("current_step"),
             error=state.get("error"),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
         try:
@@ -288,22 +379,25 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    # Prefer in-memory state for active runs, fall back to DB
+    db_plan_steps = [
+        {
+            "agent_type": s.agent_type,
+            "order": s.step_order,
+            "description": s.description,
+            "status": s.status,
+        }
+        for s in (run.run_steps or [])
+    ]
+
+    # Use DB plan steps when available because they carry persisted step status.
+    # Fall back to in-memory planner output only if the DB rows do not exist yet.
     state = _running_states.get(run_id)
-    if state is not None:
-        plan_steps = state.get("plan_steps")
-        current_step = state.get("current_step")
-    else:
-        plan_steps = [
-            {
-                "agent_type": s.agent_type,
-                "order": s.step_order,
-                "description": s.description,
-                "status": s.status,
-            }
-            for s in (run.run_steps or [])
-        ]
-        current_step = _current_step_from_status(run.status)
+    plan_steps = db_plan_steps or (state.get("plan_steps") if state is not None else None)
+    current_step = (
+        state.get("current_step")
+        if state is not None
+        else _current_step_from_status(run.status)
+    )
 
     db_candidates = await candidate_repo.get_by_run(run_uuid)
     candidate_responses = _candidates_to_response(db_candidates)
@@ -372,6 +466,7 @@ async def upload_candidates_csv(
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
+    institution_repo = InstitutionRepository(session)
 
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
@@ -418,6 +513,7 @@ async def upload_candidates_csv(
             continue
 
         rows.append({
+            "source_label": f"Row {i}",
             "institution_code": row["institution_code"],
             "beneficiary_name": row.get("beneficiary_name", ""),
             "account_number": row["account_number"],
@@ -434,7 +530,21 @@ async def upload_candidates_csv(
             detail=f"No valid candidates in CSV. Errors: {'; '.join(errors[:10])}",
         )
 
-    persisted = await candidate_repo.create_batch(run_uuid, rows, business_id=run.business_id)
+    validation_errors = await _normalize_candidate_institutions(rows, institution_repo)
+    if validation_errors:
+        raise HTTPException(
+            status_code=400,
+            detail="; ".join(validation_errors[:10]),
+        )
+
+    persisted = await candidate_repo.create_batch(
+        run_uuid,
+        [
+            {key: value for key, value in row.items() if key != "source_label"}
+            for row in rows
+        ],
+        business_id=run.business_id,
+    )
     await session.commit()
 
     return {

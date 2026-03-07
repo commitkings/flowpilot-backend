@@ -15,6 +15,7 @@ def _serialize_institution(institution) -> dict:
     return {
         "institutionCode": institution.institution_code,
         "institutionName": institution.institution_name,
+        "shortName": institution.short_name,
         "nipCode": institution.nip_code,
         "cbnCode": institution.cbn_code,
         "isActive": institution.is_active,

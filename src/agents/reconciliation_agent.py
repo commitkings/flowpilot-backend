@@ -1,5 +1,7 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+
+import httpx
 
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
@@ -21,13 +23,78 @@ class ReconciliationAgent(BaseAgent):
         super().__init__("ReconciliationAgent")
         self._search_client = TransactionSearchClient()
 
+    def _resolve_window(self, state: AgentState) -> tuple[datetime, datetime]:
+        raw_from = state.get("date_from")
+        raw_to = state.get("date_to")
+
+        if raw_from:
+            start_date = datetime.combine(date.fromisoformat(raw_from), time.min)
+        else:
+            start_date = datetime.utcnow() - timedelta(days=1)
+
+        if raw_to:
+            end_date = datetime.combine(date.fromisoformat(raw_to), time.max)
+        else:
+            end_date = datetime.utcnow()
+
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        return start_date, end_date
+
+    def _format_exception(self, error: Exception) -> str:
+        if isinstance(error, httpx.HTTPStatusError):
+            status = error.response.status_code
+            body = error.response.text.strip()
+            body = body[:300] if body else ""
+            detail = f"HTTP {status} from {error.request.method} {error.request.url}"
+            return f"{detail}: {body}" if body else detail
+
+        message = str(error).strip()
+        if message:
+            return message
+
+        return type(error).__name__
+
+    def _build_simulated_result(
+        self,
+        state: AgentState,
+        merchant_id: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> AgentState:
+        audit_entries: list[dict] = [{
+            "agent_type": "reconciliation",
+            "action": "reconciliation_simulated",
+            "detail": {
+                "merchant_id": merchant_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "reason": "demo_mode",
+                "total_fetched": 0,
+            },
+        }]
+
+        return {
+            **state,
+            "transactions": [],
+            "reconciled_ledger": self._build_ledger([]),
+            "unresolved_references": [],
+            "resolved_references": [],
+            "current_step": "reconciliation_complete",
+            "audit_entries": audit_entries,
+        }
+
     async def run(self, state: AgentState) -> AgentState:
         merchant_id = state.get("merchant_id", Settings.INTERSWITCH_MERCHANT_ID)
         logger.info(f"[ReconciliationAgent] Starting reconciliation for merchant {merchant_id}")
 
         try:
-            end_date = datetime.utcnow()
-            start_date = end_date - timedelta(days=1)
+            start_date, end_date = self._resolve_window(state)
+
+            if Settings.is_payout_simulated():
+                logger.info("[ReconciliationAgent] Demo mode enabled - skipping Interswitch transaction search")
+                return self._build_simulated_result(state, merchant_id, start_date, end_date)
 
             search_result = await self._search_client.quick_search(
                 merchant_id=merchant_id,
@@ -133,15 +200,16 @@ class ReconciliationAgent(BaseAgent):
                 "audit_entries": audit_entries,
             }
         except Exception as e:
-            logger.error(f"[ReconciliationAgent] Failed: {e}")
+            error_message = self._format_exception(e)
+            logger.error(f"[ReconciliationAgent] Failed: {error_message}", exc_info=True)
             return {
                 **state,
-                "error": f"ReconciliationAgent failed: {str(e)}",
+                "error": f"ReconciliationAgent failed: {error_message}",
                 "current_step": "reconciliation_failed",
                 "audit_entries": [{
                     "agent_type": "reconciliation",
                     "action": "reconciliation_failed",
-                    "detail": {"error": str(e)},
+                    "detail": {"error": error_message},
                 }],
             }
 

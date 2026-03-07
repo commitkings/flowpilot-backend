@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
@@ -23,6 +24,8 @@ class RunRepository:
         objective: str,
         merchant_id: str,
         constraints: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
         risk_tolerance: Decimal = Decimal("0.3500"),
         budget_cap: Decimal | None = None,
     ) -> AgentRunModel:
@@ -32,6 +35,8 @@ class RunRepository:
             objective=objective,
             merchant_id=merchant_id,
             constraints=constraints,
+            date_from=date_from,
+            date_to=date_to,
             risk_tolerance=risk_tolerance,
             budget_cap=budget_cap,
         )

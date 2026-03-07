@@ -126,6 +126,7 @@ class TransactionRepository:
     async def get_summary(
         self,
         *,
+        run_id: Optional[UUID] = None,
         business_id: Optional[UUID] = None,
         status: Optional[str] = None,
         channel: Optional[str] = None,
@@ -142,7 +143,7 @@ class TransactionRepository:
             func.count().filter(T.status == "FAILED").label("failed_count"),
         )
         base = self._apply_filters(
-            base, business_id=business_id, status=status, channel=channel,
+            base, run_id=run_id, business_id=business_id, status=status, channel=channel,
             search=search, from_date=from_date, to_date=to_date,
         )
         row = (await self._session.execute(base)).one()
