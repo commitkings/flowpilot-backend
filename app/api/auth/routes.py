@@ -1,5 +1,5 @@
 """
-Auth routes — Google OAuth plus local password reset flows.
+Auth routes — Google OAuth, local email/password, and password reset flows.
 """
 
 import logging
@@ -20,6 +20,8 @@ from app.api.auth.passwords import (
     hash_password_reset_token,
     normalize_email,
     password_reset_expires_at,
+    validate_password,
+    verify_password,
 )
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
@@ -27,6 +29,17 @@ from src.infrastructure.database.repositories.password_reset_token_repository im
     PasswordResetTokenRepository,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
+
+
+class RegisterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=512)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class UpdateProfileRequest(BaseModel):
@@ -60,6 +73,101 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 FORGOT_PASSWORD_RESPONSE = (
     "If an account exists for that email, a password reset link has been sent."
 )
+
+_INVALID_CREDENTIALS = "Invalid email or password"
+
+
+# ── Local email / password auth ───────────────────────────────
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register_with_password(
+    body: RegisterRequest,
+    session=Depends(get_db_session),
+):
+    """Create a new user with email + password."""
+    repo = UserRepository(session)
+    normalized = normalize_email(body.email)
+
+    existing = await repo.get_by_email(normalized)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        )
+
+    password_hashed = hash_password(body.password)
+
+    from src.infrastructure.database.flowpilot_models import UserModel
+
+    new_user = UserModel(
+        email=normalized,
+        display_name=body.name.strip(),
+        password_hash=password_hashed,
+        is_active=True,
+    )
+    session.add(new_user)
+    await session.flush()
+    await session.refresh(new_user)
+
+    token = create_access_token(new_user.id, new_user.email)
+    await session.commit()
+
+    return {
+        "token": token,
+        "user": {
+            "id": str(new_user.id),
+            "email": new_user.email,
+            "display_name": new_user.display_name,
+        },
+    }
+
+
+@router.post("/login")
+async def login_with_password(
+    body: LoginRequest,
+    session=Depends(get_db_session),
+):
+    """Authenticate an existing user with email + password."""
+    repo = UserRepository(session)
+    normalized = normalize_email(body.email)
+
+    user = await repo.get_by_email(normalized)
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_INVALID_CREDENTIALS,
+        )
+
+    if not user.password_hash:
+        # OAuth-only user — no local password set
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_INVALID_CREDENTIALS,
+        )
+
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_INVALID_CREDENTIALS,
+        )
+
+    from datetime import datetime, timezone as tz
+
+    user.last_login_at = datetime.now(tz.utc)
+    await session.flush()
+
+    token = create_access_token(user.id, user.email)
+    await session.commit()
+
+    return {
+        "token": token,
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+        },
+    }
 
 
 @router.get("/google/login")
