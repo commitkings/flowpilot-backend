@@ -1,5 +1,5 @@
 """
-Google OAuth routes — login redirect, callback, /me, /logout, profile update.
+Auth routes — Google OAuth plus local password reset flows.
 """
 
 import logging
@@ -9,18 +9,46 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.jwt_utils import create_access_token
+from app.api.auth.passwords import (
+    build_password_reset_url,
+    generate_password_reset_token,
+    hash_password,
+    hash_password_reset_token,
+    normalize_email,
+    password_reset_expires_at,
+)
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.repositories.password_reset_token_repository import (
+    PasswordResetTokenRepository,
+)
 from src.infrastructure.database.repositories.user_repository import UserRepository
 
 
 class UpdateProfileRequest(BaseModel):
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=2048)
+    new_password: str = Field(
+        min_length=1,
+        max_length=512,
+        validation_alias=AliasChoices("new_password", "password", "newPassword"),
+    )
+
+
+class MessageResponse(BaseModel):
+    message: str
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +57,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+FORGOT_PASSWORD_RESPONSE = (
+    "If an account exists for that email, a password reset link has been sent."
+)
 
 
 @router.get("/google/login")
@@ -211,3 +242,86 @@ async def update_me(
         ],
         "has_completed_onboarding": len(memberships) > 0,
     }
+
+
+@router.post(
+    "/forgot-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    session=Depends(get_db_session),
+):
+    if Settings.is_production():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Password reset delivery is not configured",
+        )
+
+    normalized_email = normalize_email(body.email)
+    user_repo = UserRepository(session)
+    token_repo = PasswordResetTokenRepository(session)
+
+    user = await user_repo.get_by_email(normalized_email)
+    if user is None or not user.is_active:
+        return MessageResponse(message=FORGOT_PASSWORD_RESPONSE)
+
+    await token_repo.revoke_active_tokens_for_user(user.id)
+
+    raw_token = generate_password_reset_token()
+    token_hash = hash_password_reset_token(raw_token)
+    await token_repo.create(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=password_reset_expires_at(),
+    )
+
+    reset_url = build_password_reset_url(raw_token)
+    logger.info(
+        "Generated password reset link for user_id=%s email=%s reset_url=%s",
+        user.id,
+        normalized_email,
+        reset_url,
+    )
+
+    return MessageResponse(message=FORGOT_PASSWORD_RESPONSE)
+
+
+@router.post(
+    "/reset-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def reset_password(
+    body: ResetPasswordRequest,
+    session=Depends(get_db_session),
+):
+    token_repo = PasswordResetTokenRepository(session)
+    user_repo = UserRepository(session)
+
+    token_hash = hash_password_reset_token(body.token)
+    token_record = await token_repo.get_active_by_token_hash(token_hash)
+    if token_record is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token",
+        )
+
+    updated_user = await user_repo.set_password(
+        token_record.user_id,
+        hash_password(body.new_password),
+    )
+    if updated_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Password reset token references a missing user",
+        )
+
+    await token_repo.mark_used(token_record)
+    await token_repo.revoke_active_tokens_for_user(
+        token_record.user_id,
+        exclude_token_id=token_record.id,
+    )
+
+    return MessageResponse(message="Password has been reset successfully.")

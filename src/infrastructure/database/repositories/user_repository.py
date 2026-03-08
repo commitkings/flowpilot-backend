@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,6 +72,13 @@ class UserRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_email(self, email: str) -> Optional[UserModel]:
+        normalized_email = email.strip().lower()
+        result = await self._s.execute(
+            select(UserModel).where(func.lower(UserModel.email) == normalized_email)
+        )
+        return result.scalar_one_or_none()
+
     async def get_memberships(self, user_id: uuid.UUID) -> list[BusinessMemberModel]:
         result = await self._s.execute(
             select(BusinessMemberModel).where(
@@ -105,3 +112,17 @@ class UserRepository:
         if user is not None:
             user.last_login_at = None
             await self._s.flush()
+
+    async def set_password(
+        self, user_id: uuid.UUID, password_hash: str
+    ) -> Optional[UserModel]:
+        user = await self.get_by_id(user_id)
+        if user is None:
+            return None
+
+        now = datetime.now(timezone.utc)
+        user.password_hash = password_hash
+        user.password_changed_at = now
+        user.updated_at = now
+        await self._s.flush()
+        return user

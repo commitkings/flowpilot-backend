@@ -227,6 +227,14 @@ class Settings:
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3001")
+    PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
+    PASSWORD_HASH_ITERATIONS: int = int(
+        os.getenv("PASSWORD_HASH_ITERATIONS", "600000")
+    )
+    PASSWORD_RESET_TOKEN_EXPIRY_MINUTES: int = int(
+        os.getenv("PASSWORD_RESET_TOKEN_EXPIRY_MINUTES", "30")
+    )
+    PASSWORD_RESET_PATH: str = os.getenv("PASSWORD_RESET_PATH", "/reset-password")
 
     @classmethod
     def get_google_client_id(cls) -> Optional[str]:

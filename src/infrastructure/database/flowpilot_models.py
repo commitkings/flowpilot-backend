@@ -27,12 +27,12 @@ from src.infrastructure.database.base import Base
 
 
 # =========================================================================== #
-#  AUTH & IDENTITY (2 tables)
+#  AUTH & IDENTITY (3 tables)
 # =========================================================================== #
 
 
 # --------------------------------------------------------------------------- #
-# 1. user — local record, auth delegated to external provider
+# 1. user — local identity record for OAuth and local-password auth
 # --------------------------------------------------------------------------- #
 class UserModel(Base):
     __tablename__ = "user"
@@ -42,10 +42,14 @@ class UserModel(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    external_id: Mapped[str] = mapped_column(String(255), unique=True)
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
     email: Mapped[str] = mapped_column(String(255), unique=True)
     display_name: Mapped[str] = mapped_column(String(100))
     avatar_url: Mapped[Optional[str]] = mapped_column(String(512))
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255))
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True)
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True)
@@ -58,6 +62,9 @@ class UserModel(Base):
     )
 
     memberships: Mapped[list["BusinessMemberModel"]] = relationship(
+        back_populates="user",
+    )
+    password_reset_tokens: Mapped[list["PasswordResetTokenModel"]] = relationship(
         back_populates="user",
     )
 
@@ -76,7 +83,37 @@ class UserModel(Base):
 
 
 # --------------------------------------------------------------------------- #
-# 2. business_member — M:N user ↔ business with role
+# 2. password_reset_token — one-time token for local password reset
+# --------------------------------------------------------------------------- #
+class PasswordResetTokenModel(Base):
+    __tablename__ = "password_reset_token"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+    )
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
+    used_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("password_reset_token_user_id_idx", "user_id"),
+        Index("password_reset_token_expires_at_idx", "expires_at"),
+    )
+
+    user: Mapped["UserModel"] = relationship(back_populates="password_reset_tokens")
+
+
+# --------------------------------------------------------------------------- #
+# 3. business_member — M:N user ↔ business with role
 # --------------------------------------------------------------------------- #
 class BusinessMemberModel(Base):
     __tablename__ = "business_member"
