@@ -3,7 +3,7 @@ User repository — upsert-on-first-login for external auth providers.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone as timezone_mod
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -34,7 +34,7 @@ class UserRepository:
         On conflict (external_id already exists) we update profile fields
         and bump last_login_at.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone_mod.utc)
         stmt = (
             pg_insert(UserModel)
             .values(
@@ -93,16 +93,30 @@ class UserRepository:
         *,
         display_name: Optional[str] = None,
         avatar_url: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        job_title: Optional[str] = None,
+        phone: Optional[str] = None,
+        timezone: Optional[str] = None,
+        department: Optional[str] = None,
     ) -> Optional[UserModel]:
         """Update mutable profile fields. Only non-None values are applied."""
         user = await self.get_by_id(user_id)
         if user is None:
             return None
-        if display_name is not None:
-            user.display_name = display_name
-        if avatar_url is not None:
-            user.avatar_url = avatar_url
-        user.updated_at = datetime.now(timezone.utc)
+        for field, value in [
+            ("display_name", display_name),
+            ("avatar_url", avatar_url),
+            ("first_name", first_name),
+            ("last_name", last_name),
+            ("job_title", job_title),
+            ("phone", phone),
+            ("timezone", timezone),
+            ("department", department),
+        ]:
+            if value is not None:
+                setattr(user, field, value)
+        user.updated_at = datetime.now(timezone_mod.utc)
         await self._s.flush()
         return user
 
@@ -120,7 +134,7 @@ class UserRepository:
         if user is None:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone_mod.utc)
         user.password_hash = password_hash
         user.password_changed_at = now
         user.updated_at = now

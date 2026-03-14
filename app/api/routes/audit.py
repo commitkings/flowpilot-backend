@@ -1,8 +1,9 @@
 import logging
 import uuid
+from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -110,3 +111,39 @@ async def download_audit_report(
             "Content-Disposition": f'attachment; filename="flowpilot_report_{run_id}.json"',
         },
     )
+
+
+# ------------------------------------------------------------------
+# Global audit trail (Gap 3)
+# ------------------------------------------------------------------
+
+
+@router.get("/audit")
+async def list_audit_entries(
+    run_id: Optional[str] = Query(None),
+    agent_type: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    from_date: Optional[date] = Query(None),
+    to_date: Optional[date] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    run_uuid = _parse_uuid(run_id, "run_id") if run_id else None
+    audit_repo = AuditRepository(session)
+    entries, total = await audit_repo.list_all(
+        run_id=run_uuid,
+        agent_type=agent_type,
+        action=action,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "entries": [_serialize_audit_log(e) for e in entries],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }

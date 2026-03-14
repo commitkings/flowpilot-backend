@@ -50,6 +50,13 @@ class UserModel(Base):
     password_changed_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True)
     )
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    last_name: Mapped[Optional[str]] = mapped_column(String(100))
+    job_title: Mapped[Optional[str]] = mapped_column(String(150))
+    phone: Mapped[Optional[str]] = mapped_column(String(30))
+    timezone: Mapped[Optional[str]] = mapped_column(String(60))
+    department: Mapped[Optional[str]] = mapped_column(String(100))
+    external_provider: Mapped[Optional[str]] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True)
@@ -175,6 +182,13 @@ class BusinessModel(Base):
     business_name: Mapped[str] = mapped_column(String(255))
     business_type: Mapped[Optional[str]] = mapped_column(Text)
     interswitch_merchant_id: Mapped[Optional[str]] = mapped_column(String(128))
+    rc_number: Mapped[Optional[str]] = mapped_column(String(50))
+    tax_id: Mapped[Optional[str]] = mapped_column(String(50))
+    city: Mapped[Optional[str]] = mapped_column(String(100))
+    state: Mapped[Optional[str]] = mapped_column(String(100))
+    country: Mapped[Optional[str]] = mapped_column(String(100))
+    website: Mapped[Optional[str]] = mapped_column(String(255))
+    phone: Mapped[Optional[str]] = mapped_column(String(30))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
@@ -1174,6 +1188,50 @@ class NotificationOutboxModel(Base):
             postgresql_where=text("is_sent = false"),
         ),
         Index("notification_outbox_scheduled_for_idx", "scheduled_for"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 19. notification — user-facing in-app notification (Gap 4)
+# --------------------------------------------------------------------------- #
+
+
+class NotificationModel(Base):
+    __tablename__ = "notification"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        index=True,
+    )
+    business_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    title: Mapped[str] = mapped_column(String(255))
+    message: Mapped[str] = mapped_column(Text)
+    type: Mapped[str] = mapped_column(
+        String(32), server_default=text("'info'")
+    )
+    resource_type: Mapped[Optional[str]] = mapped_column(String(64))
+    resource_id: Mapped[Optional[str]] = mapped_column(String(64))
+    is_read: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    read_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('info', 'warning', 'success', 'error')",
+            name="notification_type_check",
+        ),
+        Index("notification_user_unread_idx", "user_id", "is_read",
+              postgresql_where=text("is_read = false")),
     )
 
 

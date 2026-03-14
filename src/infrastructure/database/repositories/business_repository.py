@@ -74,3 +74,47 @@ class BusinessRepository:
             select(BusinessModel).where(BusinessModel.id == business_id)
         )
         return result.scalar_one_or_none()
+
+    async def update(
+        self, business_id: uuid.UUID, **kwargs: object
+    ) -> BusinessModel | None:
+        """Update mutable business fields. Only non-None kwargs are applied."""
+        biz = await self.get_by_id(business_id)
+        if biz is None:
+            return None
+        allowed = {
+            "business_name", "business_type", "rc_number", "tax_id",
+            "city", "state", "country", "website", "phone",
+        }
+        for key, value in kwargs.items():
+            if key in allowed and value is not None:
+                setattr(biz, key, value)
+        biz.updated_at = datetime.now(timezone.utc)
+        await self._s.flush()
+        return biz
+
+    async def update_config(
+        self, business_id: uuid.UUID, **kwargs: object
+    ) -> BusinessConfigModel | None:
+        """Update mutable business config fields."""
+        from sqlalchemy import select
+
+        result = await self._s.execute(
+            select(BusinessConfigModel).where(
+                BusinessConfigModel.business_id == business_id
+            )
+        )
+        config = result.scalar_one_or_none()
+        if config is None:
+            return None
+        allowed = {
+            "monthly_txn_volume_range", "avg_monthly_payouts_range",
+            "primary_bank", "primary_use_cases", "risk_appetite",
+            "default_risk_tolerance", "default_budget_cap", "preferences",
+        }
+        for key, value in kwargs.items():
+            if key in allowed and value is not None:
+                setattr(config, key, value)
+        config.updated_at = datetime.now(timezone.utc)
+        await self._s.flush()
+        return config

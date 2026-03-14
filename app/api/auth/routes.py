@@ -7,7 +7,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import RedirectResponse
 from pydantic import AliasChoices, BaseModel, Field
 
@@ -45,6 +45,17 @@ class LoginRequest(BaseModel):
 class UpdateProfileRequest(BaseModel):
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    job_title: Optional[str] = None
+    phone: Optional[str] = None
+    timezone: Optional[str] = None
+    department: Optional[str] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=512)
+    new_password: str = Field(min_length=1, max_length=512)
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -75,6 +86,31 @@ FORGOT_PASSWORD_RESPONSE = (
 )
 
 _INVALID_CREDENTIALS = "Invalid email or password"
+
+
+def _user_response(user, memberships) -> dict:
+    """Build the standard user profile dict."""
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "display_name": user.display_name,
+        "avatar_url": user.avatar_url,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "job_title": user.job_title,
+        "phone": user.phone,
+        "timezone": user.timezone,
+        "department": user.department,
+        "is_active": user.is_active,
+        "last_login_at": (
+            user.last_login_at.isoformat() if user.last_login_at else None
+        ),
+        "memberships": [
+            {"business_id": str(m.business_id), "role": m.role}
+            for m in memberships
+        ],
+        "has_completed_onboarding": len(memberships) > 0,
+    }
 
 
 # ── Local email / password auth ───────────────────────────────
@@ -274,27 +310,7 @@ async def get_me(
     """Return the authenticated user's profile, memberships, and onboarding status."""
     repo = UserRepository(session)
     memberships = await repo.get_memberships(current_user.id)
-
-    return {
-        "id": str(current_user.id),
-        "email": current_user.email,
-        "display_name": current_user.display_name,
-        "avatar_url": current_user.avatar_url,
-        "is_active": current_user.is_active,
-        "last_login_at": (
-            current_user.last_login_at.isoformat()
-            if current_user.last_login_at
-            else None
-        ),
-        "memberships": [
-            {
-                "business_id": str(m.business_id),
-                "role": m.role,
-            }
-            for m in memberships
-        ],
-        "has_completed_onboarding": len(memberships) > 0,
-    }
+    return _user_response(current_user, memberships)
 
 
 @router.post("/logout", status_code=status.HTTP_200_OK)
@@ -315,40 +331,114 @@ async def update_me(
     session=Depends(get_db_session),
 ):
     """Update the authenticated user's mutable profile fields."""
-    if body.display_name is None and body.avatar_url is None:
+    payload = body.model_dump(exclude_none=True)
+    if not payload:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one field (display_name, avatar_url) must be provided",
+            detail="At least one field must be provided",
         )
 
     repo = UserRepository(session)
-    updated = await repo.update_profile(
-        current_user.id,
-        display_name=body.display_name,
-        avatar_url=body.avatar_url,
-    )
-
+    updated = await repo.update_profile(current_user.id, **payload)
     memberships = await repo.get_memberships(current_user.id)
+    return _user_response(updated, memberships)
 
+
+@router.post("/me/password", response_model=MessageResponse)
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Change the authenticated user's password."""
+    if not current_user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password change is not available for OAuth-only accounts",
+        )
+
+    if not verify_password(body.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    errors = validate_password(body.new_password)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=errors,
+        )
+
+    repo = UserRepository(session)
+    pw_hash = hash_password(body.new_password)
+    await repo.set_password(current_user.id, pw_hash)
+    return {"message": "Password updated successfully"}
+
+
+@router.post("/me/avatar")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Upload an avatar image for the authenticated user."""
+    import shutil, os, uuid as _uuid
+
+    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported image type")
+
+    upload_dir = os.path.join(os.getcwd(), "uploads", "avatars")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "png"
+    filename = f"{_uuid.uuid4().hex}.{ext}"
+    filepath = os.path.join(upload_dir, filename)
+
+    with open(filepath, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+
+    avatar_url = f"/uploads/avatars/{filename}"
+    repo = UserRepository(session)
+    await repo.update_profile(current_user.id, avatar_url=avatar_url)
+    return {"avatar_url": avatar_url}
+
+
+@router.delete("/me/avatar", response_model=MessageResponse)
+async def remove_avatar(
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Remove the authenticated user's avatar."""
+    import os
+
+    if current_user.avatar_url and current_user.avatar_url.startswith("/uploads/"):
+        filepath = os.path.join(os.getcwd(), current_user.avatar_url.lstrip("/"))
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+
+    repo = UserRepository(session)
+    await repo.update_profile(current_user.id, avatar_url="")
+    return {"message": "Avatar removed"}
+
+
+@router.get("/connections")
+async def get_connections(
+    current_user=Depends(get_current_user),
+):
+    """Return linked authentication providers for the user."""
+    google_connected = (
+        current_user.external_provider == "google" and current_user.external_id is not None
+    )
     return {
-        "id": str(updated.id),
-        "email": updated.email,
-        "display_name": updated.display_name,
-        "avatar_url": updated.avatar_url,
-        "is_active": updated.is_active,
-        "last_login_at": (
-            updated.last_login_at.isoformat()
-            if updated.last_login_at
-            else None
-        ),
-        "memberships": [
+        "connections": [
             {
-                "business_id": str(m.business_id),
-                "role": m.role,
-            }
-            for m in memberships
-        ],
-        "has_completed_onboarding": len(memberships) > 0,
+                "provider": "google",
+                "connected": google_connected,
+                "email": current_user.email if google_connected else None,
+            },
+        ]
     }
 
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime
 from datetime import date
 from decimal import Decimal
+from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -58,30 +60,70 @@ class RunRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    # ── Filter helpers ───────────────────────────────────────
+
+    def _apply_filters(
+        self,
+        stmt,
+        *,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+    ):
+        R = AgentRunModel
+        filters = []
+        if status is not None:
+            filters.append(R.status == status)
+        if search is not None:
+            like = f"%{search}%"
+            filters.append(or_(R.objective.ilike(like), R.constraints.ilike(like)))
+        if from_date is not None:
+            filters.append(R.created_at >= datetime.datetime.combine(from_date, datetime.time.min))
+        if to_date is not None:
+            filters.append(R.created_at <= datetime.datetime.combine(to_date, datetime.time.max))
+        if filters:
+            stmt = stmt.where(and_(*filters))
+        return stmt
+
     async def list_by_business(
-        self, business_id: UUID, limit: int = 50, offset: int = 0
-    ) -> list[AgentRunModel]:
-        stmt = (
-            select(AgentRunModel)
-            .where(AgentRunModel.business_id == business_id)
-            .order_by(AgentRunModel.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+        self,
+        business_id: UUID,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+    ) -> tuple[list[AgentRunModel], int]:
+        R = AgentRunModel
+        base = select(R).where(R.business_id == business_id).order_by(R.created_at.desc())
+        base = self._apply_filters(base, status=status, search=search, from_date=from_date, to_date=to_date)
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self._session.execute(count_stmt)).scalar_one()
+        rows_stmt = base.limit(limit).offset(offset)
+        rows = list((await self._session.execute(rows_stmt)).scalars().all())
+        return rows, total
 
     async def list_all(
-        self, limit: int = 50, offset: int = 0
-    ) -> list[AgentRunModel]:
-        stmt = (
-            select(AgentRunModel)
-            .order_by(AgentRunModel.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+    ) -> tuple[list[AgentRunModel], int]:
+        R = AgentRunModel
+        base = select(R).order_by(R.created_at.desc())
+        base = self._apply_filters(base, status=status, search=search, from_date=from_date, to_date=to_date)
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self._session.execute(count_stmt)).scalar_one()
+        rows_stmt = base.limit(limit).offset(offset)
+        rows = list((await self._session.execute(rows_stmt)).scalars().all())
+        return rows, total
 
     async def update_status(
         self, run_id: UUID, status: str, error_message: str | None = None

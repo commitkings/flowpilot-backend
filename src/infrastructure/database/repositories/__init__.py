@@ -3,6 +3,7 @@ from src.infrastructure.database.repositories.batch_repository import BatchRepos
 from src.infrastructure.database.repositories.candidate_repository import CandidateRepository
 from src.infrastructure.database.repositories.execution_detail_repository import ExecutionDetailRepository
 from src.infrastructure.database.repositories.institution_repository import InstitutionRepository
+from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 from src.infrastructure.database.repositories.password_reset_token_repository import (
     PasswordResetTokenRepository,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "CandidateRepository",
     "ExecutionDetailRepository",
     "InstitutionRepository",
+    "NotificationRepository",
     "PasswordResetTokenRepository",
     "PlanStepRepository",
     "RunRepository",

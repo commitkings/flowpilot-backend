@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -348,21 +348,39 @@ async def create_run(
 
 @router.get("/runs")
 async def list_runs(
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    from_date: Optional[date] = Query(None),
+    to_date: Optional[date] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
     run_repo = RunRepository(session)
-    runs = await run_repo.list_all()
-    return [
-        {
-            "run_id": str(run.id),
-            "objective": run.objective,
-            "status": run.status,
-            "created_at": run.created_at.isoformat(),
-            "current_step": _current_step_from_status(run.status),
-        }
-        for run in runs
-    ]
+    runs, total = await run_repo.list_all(
+        status=status,
+        search=search,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "runs": [
+            {
+                "run_id": str(run.id),
+                "objective": run.objective,
+                "status": run.status,
+                "created_at": run.created_at.isoformat(),
+                "current_step": _current_step_from_status(run.status),
+            }
+            for run in runs
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/runs/{run_id}", response_model=RunResponse)

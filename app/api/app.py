@@ -9,10 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.routes.runs import router as runs_router
+from app.api.routes.account import router as account_router
 from app.api.routes.approval import router as approval_router
+from app.api.routes.approvals_queue import router as approvals_queue_router
 from app.api.routes.audit import router as audit_router
 from app.api.routes.institutions import router as institutions_router
+from app.api.routes.notifications import router as notifications_router
 from app.api.routes.onboarding import router as onboarding_router
+from app.api.routes.org import router as org_router
+from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
 from app.api.auth import auth_router
 from src.config.settings import Settings
@@ -70,12 +75,24 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
+app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
 app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
+app.include_router(approvals_queue_router, prefix="/api/v1", tags=["approvals-queue"])
 app.include_router(audit_router, prefix="/api/v1", tags=["audit"])
 app.include_router(institutions_router, prefix="/api/v1", tags=["institutions"])
+app.include_router(notifications_router, prefix="/api/v1", tags=["notifications"])
 app.include_router(onboarding_router, prefix="/api/v1", tags=["onboarding"])
+app.include_router(org_router, prefix="/api/v1", tags=["org"])
+app.include_router(team_router, prefix="/api/v1", tags=["team"])
 app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
+
+# Serve uploaded files (avatars, etc.)
+from fastapi.staticfiles import StaticFiles
+
+_uploads_dir = os.path.join(os.getcwd(), "uploads")
+os.makedirs(_uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 
 
 @app.get("/health")
