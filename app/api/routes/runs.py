@@ -1,5 +1,7 @@
+import asyncio
 import csv
 import io
+import json as json_mod
 import logging
 import uuid
 from datetime import date
@@ -7,11 +9,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from src.agents.orchestrator import RunOrchestrator
+from src.agents.event_publisher import EventPublisher, subscribe, unsubscribe
 from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
@@ -19,8 +23,10 @@ from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
     InstitutionRepository,
+    PlanStepRepository,
     RunRepository,
     TransactionRepository,
+    RunEventRepository,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,8 @@ class CandidateResponse(BaseModel):
     risk_score: Optional[float] = None
     risk_reasons: Optional[list] = None
     risk_decision: Optional[str] = None
+    lookup_account_name: Optional[str] = None
+    lookup_match_score: Optional[float] = None
     approval_status: str = "pending"
     execution_status: str = "not_started"
 
@@ -176,6 +184,8 @@ def _candidates_to_response(candidates) -> list[CandidateResponse]:
             risk_score=float(c.risk_score) if c.risk_score is not None else None,
             risk_reasons=c.risk_reasons,
             risk_decision=c.risk_decision,
+            lookup_account_name=c.lookup_account_name,
+            lookup_match_score=float(c.lookup_match_score) if c.lookup_match_score is not None else None,
             approval_status=c.approval_status,
             execution_status=c.execution_status,
         )
@@ -298,12 +308,14 @@ async def create_run(
         "current_step": "created",
         "error": None,
         "audit_entries": [],
+        "reasoning_log": [],
     }
 
     logger.info(f"Created run {run_id}: {request.objective[:80]}")
 
     try:
-        orchestrator = RunOrchestrator(session)
+        publisher = EventPublisher(run.id, session)
+        orchestrator = RunOrchestrator(session, publisher=publisher)
         state = await orchestrator.execute_run(run.id, state)
 
         # Derive final status from DB semantics, not agent current_step
@@ -571,3 +583,255 @@ async def upload_candidates_csv(
         "parse_errors": errors[:10] if errors else None,
         "total_rows_parsed": len(rows) + len(errors),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Run Steps — Agent transparency & detailed step information
+# --------------------------------------------------------------------------- #
+
+class StepSummaryResponse(BaseModel):
+    """Summary of a single pipeline step."""
+    id: str
+    agent_type: str
+    step_order: int
+    description: Optional[str] = None
+    status: str
+    progress_pct: Optional[int] = None
+    duration_ms: Optional[int] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    output_summary: Optional[dict] = None
+    error_message: Optional[str] = None
+
+
+class StepDetailResponse(StepSummaryResponse):
+    """Full detail for a single step, including input/output and audit entries."""
+    input_data: Optional[dict] = None
+    output_data: Optional[dict] = None
+    audit_entries: list[dict] = []
+
+
+def _summarize_output(output_data: dict | None, agent_type: str) -> dict | None:
+    """Extract a concise summary from step output_data for the timeline view."""
+    if not output_data:
+        return None
+    summary: dict = {}
+    if agent_type == "planner" and "plan_steps" in output_data:
+        steps = output_data["plan_steps"]
+        summary["step_count"] = len(steps) if isinstance(steps, list) else 0
+        summary["preview"] = [s.get("description", s.get("name", "?"))[:60] for s in (steps[:3] if isinstance(steps, list) else [])]
+    elif agent_type == "reconciliation":
+        if "transactions" in output_data:
+            summary["transaction_count"] = len(output_data["transactions"]) if isinstance(output_data["transactions"], list) else 0
+        if "total_transactions" in output_data:
+            summary["transaction_count"] = output_data["total_transactions"]
+        if "reconciled_ledger" in output_data:
+            ledger = output_data["reconciled_ledger"]
+            summary["total_inflow"] = ledger.get("total_inflow")
+            summary["total_outflow"] = ledger.get("total_outflow")
+            summary["pending_count"] = ledger.get("pending_count")
+            summary["failed_count"] = ledger.get("failed_count")
+    elif agent_type == "risk":
+        if "scored_candidates" in output_data:
+            candidates = output_data["scored_candidates"]
+            summary["candidates_scored"] = len(candidates) if isinstance(candidates, list) else 0
+            if isinstance(candidates, list):
+                decisions = {}
+                for c in candidates:
+                    d = c.get("risk_decision", "unknown")
+                    decisions[d] = decisions.get(d, 0) + 1
+                summary["decisions"] = decisions
+    elif agent_type == "execution":
+        if "candidate_execution_results" in output_data:
+            results = output_data["candidate_execution_results"]
+            summary["executed_count"] = len(results) if isinstance(results, list) else 0
+        if "batch_details" in output_data:
+            bd = output_data["batch_details"]
+            summary["batch_ref"] = bd.get("batch_reference") if isinstance(bd, dict) else None
+            if isinstance(bd, dict):
+                summary["submission_status"] = bd.get("submission_status")
+                summary["accepted_count"] = bd.get("accepted_count")
+                summary["rejected_count"] = bd.get("rejected_count")
+    elif agent_type == "audit":
+        if "audit_report" in output_data and isinstance(output_data["audit_report"], dict):
+            report = output_data["audit_report"]
+            summary["has_executive_summary"] = "executive_summary" in report
+            summary["preview"] = str(report.get("executive_summary", ""))[:120]
+    return summary or None
+
+
+@router.get("/runs/{run_id}/steps")
+async def get_run_steps(
+    run_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Get all pipeline steps for a run with output summaries."""
+    run_uuid = _parse_uuid(run_id, "run_id")
+    run_repo = RunRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    step_repo = PlanStepRepository(session)
+    steps = await step_repo.get_by_run(run_uuid)
+
+    return {
+        "run_id": run_id,
+        "steps": [
+            StepSummaryResponse(
+                id=str(s.id),
+                agent_type=s.agent_type,
+                step_order=s.step_order,
+                description=s.description,
+                status=s.status,
+                progress_pct=s.progress_pct,
+                duration_ms=s.duration_ms,
+                started_at=s.started_at.isoformat() if s.started_at else None,
+                completed_at=s.completed_at.isoformat() if s.completed_at else None,
+                output_summary=_summarize_output(s.output_data, s.agent_type),
+                error_message=s.error_message,
+            ).model_dump()
+            for s in steps
+        ],
+    }
+
+
+@router.get("/runs/{run_id}/steps/{step_id}")
+async def get_run_step_detail(
+    run_id: str,
+    step_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Get full detail for a single pipeline step including audit entries."""
+    run_uuid = _parse_uuid(run_id, "run_id")
+    step_uuid = _parse_uuid(step_id, "step_id")
+
+    run_repo = RunRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    step_repo = PlanStepRepository(session)
+    steps = await step_repo.get_by_run(run_uuid)
+    step = next((s for s in steps if s.id == step_uuid), None)
+    if step is None:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    audit_repo = AuditRepository(session)
+    all_audits = await audit_repo.get_by_run(run_uuid)
+    step_audits = [
+        {
+            "id": str(a.id),
+            "action": a.action,
+            "detail": a.detail,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        }
+        for a in all_audits
+        if a.step_id == step_uuid
+    ]
+
+    return StepDetailResponse(
+        id=str(step.id),
+        agent_type=step.agent_type,
+        step_order=step.step_order,
+        description=step.description,
+        status=step.status,
+        progress_pct=step.progress_pct,
+        duration_ms=step.duration_ms,
+        started_at=step.started_at.isoformat() if step.started_at else None,
+        completed_at=step.completed_at.isoformat() if step.completed_at else None,
+        output_summary=_summarize_output(step.output_data, step.agent_type),
+        error_message=step.error_message,
+        input_data=step.input_data,
+        output_data=step.output_data,
+        audit_entries=step_audits,
+    ).model_dump()
+
+
+# =====================================================================
+# SSE Streaming — GET /runs/{run_id}/events/stream
+# =====================================================================
+
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+@router.get("/runs/{run_id}/events/stream")
+async def stream_run_events(
+    run_id: str,
+    last_seq: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db_session),
+    _user=Depends(get_current_user),
+):
+    """Server-Sent Events stream for real-time run observability.
+
+    - Replays persisted events with sequence_num > last_seq
+    - Subscribes to live broadcast for new events
+    - Auto-closes when run reaches a terminal state
+    """
+    run_uuid = _parse_uuid(run_id, "run_id")
+    run_repo = RunRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    async def _event_generator():
+        event_repo = RunEventRepository(session)
+        seq = last_seq
+
+        # 1. Replay persisted events that the client missed
+        past_events = await event_repo.get_events_since(run_uuid, seq)
+        for evt in past_events:
+            payload = {
+                "seq": evt.sequence_num,
+                "type": evt.event_type,
+                "step_id": str(evt.step_id) if evt.step_id else None,
+                "payload": evt.payload,
+                "emitted_at": evt.emitted_at.isoformat() if evt.emitted_at else None,
+            }
+            seq = max(seq, evt.sequence_num)
+            yield f"id: {seq}\nevent: {evt.event_type}\ndata: {json_mod.dumps(payload)}\n\n"
+
+        # If already terminal, close after replay
+        current_run = await run_repo.get_by_id(run_uuid)
+        if current_run and current_run.status in _TERMINAL_STATUSES:
+            yield f"event: done\ndata: {json_mod.dumps({'status': current_run.status})}\n\n"
+            return
+
+        # 2. Subscribe to live broadcast
+        queue = subscribe(str(run_uuid))
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                seq = event.get("seq", seq + 1)
+                evt_type = event.get("type", "unknown")
+                payload = {
+                    "seq": seq,
+                    "type": evt_type,
+                    "step_id": event.get("step_id"),
+                    "payload": event.get("payload", {}),
+                    "emitted_at": event.get("emitted_at"),
+                }
+                yield f"id: {seq}\nevent: {evt_type}\ndata: {json_mod.dumps(payload, default=str)}\n\n"
+
+                if evt_type in ("run_completed", "run_failed"):
+                    yield f"event: done\ndata: {json_mod.dumps({'status': evt_type.replace('run_', '')})}\n\n"
+                    return
+        finally:
+            unsubscribe(str(run_uuid), queue)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

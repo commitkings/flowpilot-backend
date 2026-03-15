@@ -45,3 +45,7 @@ class AgentState(TypedDict, total=False):
 
     # Accumulated audit log entries (managed by orchestrator, not LangGraph reducer)
     audit_entries: list[dict]
+
+    # Reasoning capture: accumulated per-agent LLM reasoning entries
+    # Each entry: {agent_type, timestamp, thinking, token_usage}
+    reasoning_log: list[dict]

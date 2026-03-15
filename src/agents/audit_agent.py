@@ -18,6 +18,8 @@ class AuditAgent(BaseAgent):
         logger.info(f"[AuditAgent] Generating audit report for run {state.get('run_id')}")
 
         try:
+            await self.emit_progress("Generating audit report...")
+
             audit_entries = state.get("audit_entries", [])
 
             report = {

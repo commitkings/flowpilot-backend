@@ -8,6 +8,7 @@ from src.infrastructure.database.repositories.password_reset_token_repository im
     PasswordResetTokenRepository,
 )
 from src.infrastructure.database.repositories.plan_step_repository import PlanStepRepository
+from src.infrastructure.database.repositories.run_event_repository import RunEventRepository
 from src.infrastructure.database.repositories.run_repository import RunRepository
 from src.infrastructure.database.repositories.transaction_repository import TransactionRepository
 from src.infrastructure.database.repositories.user_repository import UserRepository
@@ -21,6 +22,7 @@ __all__ = [
     "NotificationRepository",
     "PasswordResetTokenRepository",
     "PlanStepRepository",
+    "RunEventRepository",
     "RunRepository",
     "TransactionRepository",
     "UserRepository",

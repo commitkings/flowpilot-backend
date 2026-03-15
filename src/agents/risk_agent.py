@@ -68,6 +68,11 @@ class RiskAgent(BaseAgent):
             }
 
         try:
+            await self.emit_progress(f"Scoring {len(candidates)} candidates...", {
+                "candidate_count": len(candidates),
+                "risk_tolerance": risk_tolerance,
+            })
+
             user_prompt = f"""Payout candidates to score:
 {json.dumps(candidates, indent=2)}
 

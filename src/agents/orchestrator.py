@@ -15,6 +15,7 @@ Design principles:
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from decimal import Decimal
 from typing import Optional
@@ -27,6 +28,7 @@ from src.agents.reconciliation_agent import ReconciliationAgent
 from src.agents.risk_agent import RiskAgent
 from src.agents.execution_agent import ExecutionAgent
 from src.agents.audit_agent import AuditAgent
+from src.agents.event_publisher import EventPublisher, EventType
 from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
@@ -68,8 +70,9 @@ _POST_APPROVAL_STEPS = {"execute", "audit"}
 class RunOrchestrator:
     """Executes FlowPilot agent pipeline with per-step DB persistence."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, publisher: Optional[EventPublisher] = None) -> None:
         self._session = session
+        self._publisher = publisher
         self._run_repo = RunRepository(session)
         self._plan_step_repo = PlanStepRepository(session)
         self._transaction_repo = TransactionRepository(session)
@@ -88,6 +91,9 @@ class RunOrchestrator:
         if an error occurs or no candidates need approval).
         """
         await self._run_repo.mark_started(run_id)
+
+        if self._publisher:
+            await self._publisher.run_started(state.get("objective", ""))
 
         for step_name, agent_type, run_status, agent in _PIPELINE:
             if step_name not in _PRE_APPROVAL_STEPS:
@@ -136,6 +142,13 @@ class RunOrchestrator:
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
         if final_status == "completed":
             await self._run_repo.mark_completed(run_id)
+
+        if self._publisher:
+            if final_status == "completed":
+                await self._publisher.run_completed("Pipeline finished successfully")
+            else:
+                await self._publisher.run_failed(state.get("error", "Unknown error"))
+
         await self._session.commit()
 
         return state
@@ -169,10 +182,20 @@ class RunOrchestrator:
         # 3. Track pre-existing error to distinguish "this step failed" from "prior step lingering"
         error_before = state.get("error")
 
-        # 4. Execute the agent
+        # --- Emit step_started event ---
+        if self._publisher:
+            desc = f"Running {agent.name}"
+            await self._publisher.step_started(step_name, agent_type, desc, step_id=step_id)
+            # Pass publisher + step_id to agent for reasoning/progress events
+            if hasattr(agent, "set_publisher"):
+                agent.set_publisher(self._publisher, step_id=step_id)
+
+        # 4. Execute the agent (with timing)
+        t0 = time.monotonic()
         try:
             result_state = await agent.run(state)
         except Exception as e:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.error(f"Run {run_id}: agent '{step_name}' raised: {e}")
             # Preserve original error if one existed
             if error_before:
@@ -180,12 +203,15 @@ class RunOrchestrator:
             else:
                 state["error"] = f"{agent.name} failed: {e}"
             state["current_step"] = f"{step_name}_failed"
+            if self._publisher:
+                await self._publisher.step_failed(step_name, agent_type, str(e), duration_ms=elapsed_ms, step_id=step_id)
             if step_id is not None:
                 await self._plan_step_repo.update_status(
                     step_id, "failed", error_message=str(e)
                 )
             await self._session.commit()
             return state
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         # 5. Guard: agent must return a dict
         if not isinstance(result_state, dict):
@@ -211,6 +237,11 @@ class RunOrchestrator:
         state.update(result_state)
         state.setdefault("audit_entries", [])
         state["audit_entries"].extend(new_audit_entries)
+
+        # 8b. Harvest reasoning entries from agent into state
+        state.setdefault("reasoning_log", [])
+        if hasattr(agent, "_reasoning_entries"):
+            state["reasoning_log"].extend(agent._reasoning_entries)
 
         # 9. Persist step-specific artifacts (may populate self._step_ids for plan step)
         #    Returns True if step status/output_data was already finalized.
@@ -239,10 +270,23 @@ class RunOrchestrator:
         if new_audit_entries:
             await self._persist_audit_entries(run_id, step_id, new_audit_entries)
 
+        # --- Emit step_completed or step_failed event ---
+        if self._publisher:
+            if step_failed:
+                await self._publisher.step_failed(
+                    step_name, agent_type, error_after or "Unknown error",
+                    duration_ms=elapsed_ms, step_id=step_id,
+                )
+            else:
+                summary = _step_summary(step_name, state)
+                await self._publisher.step_completed(
+                    step_name, agent_type, elapsed_ms, summary, step_id=step_id,
+                )
+
         # 14. Commit this step's changes (unless deferred for atomic finalization)
         if not defer_commit:
             await self._session.commit()
-        logger.info(f"Run {run_id}: completed step '{step_name}'")
+        logger.info(f"Run {run_id}: completed step '{step_name}' in {elapsed_ms}ms")
 
         return state
 
@@ -451,6 +495,14 @@ class RunOrchestrator:
         """Transition run to awaiting_approval status."""
         state["current_step"] = "awaiting_approval"
         await self._run_repo.update_status(run_id, "awaiting_approval")
+
+        if self._publisher:
+            n_candidates = len(state.get("candidates", []))
+            await self._publisher.approval_gate({
+                "candidates_count": n_candidates,
+                "message": f"{n_candidates} candidate(s) awaiting approval",
+            })
+
         await self._session.commit()
         logger.info(f"Run {run_id}: halted at approval gate")
 
@@ -479,6 +531,10 @@ class RunOrchestrator:
         # Atomic: audit step data + final status in one commit
         final_status = "failed"
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
+
+        if self._publisher:
+            await self._publisher.run_failed(state.get("error", "Unknown error"))
+
         await self._session.commit()
         return state
 
@@ -518,6 +574,30 @@ class RunOrchestrator:
 # ======================================================================
 # Pure mapping functions (no DB, no state mutation)
 # ======================================================================
+
+
+def _step_summary(step_name: str, state: AgentState) -> str:
+    """Generate a concise summary string for a completed step."""
+    if step_name == "plan":
+        n = len(state.get("plan_steps", []))
+        return f"Generated {n} step(s)"
+    elif step_name == "reconcile":
+        n = len(state.get("transactions", []))
+        ledger = state.get("reconciled_ledger", {})
+        unresolved = len(state.get("unresolved_references", []))
+        return f"Reconciled {n} transaction(s), {unresolved} unresolved"
+    elif step_name == "risk":
+        n = len(state.get("scored_candidates", []))
+        return f"Scored {n} candidate(s)"
+    elif step_name == "execute":
+        n = len(state.get("candidate_execution_results", []))
+        batch = state.get("batch_details") or {}
+        ref = batch.get("batch_reference", "")
+        return f"Executed {n} payout(s)" + (f", batch {ref[:20]}" if ref else "")
+    elif step_name == "audit":
+        report = state.get("audit_report") or {}
+        return (report.get("executive_summary") or "Audit complete")[:120]
+    return "Step completed"
 
 
 def _map_plan_steps(steps: list[dict]) -> list[dict]:

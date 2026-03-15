@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.routes.runs import _parse_uuid, _running_states
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
+from src.agents.event_publisher import EventPublisher
 from src.agents.state import AgentState
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
@@ -52,6 +53,8 @@ def _serialize_candidate(candidate) -> dict:
         "risk_score": float(candidate.risk_score) if candidate.risk_score is not None else None,
         "risk_reasons": candidate.risk_reasons,
         "risk_decision": candidate.risk_decision,
+        "lookup_account_name": candidate.lookup_account_name,
+        "lookup_match_score": float(candidate.lookup_match_score) if candidate.lookup_match_score is not None else None,
         "approval_status": candidate.approval_status,
         "execution_status": candidate.execution_status,
         "approved_by": str(candidate.approved_by) if candidate.approved_by else None,
@@ -199,6 +202,7 @@ async def _reconstruct_state_from_db(
         "current_step": "approved",
         "error": run.error_message,
         "audit_entries": [],
+        "reasoning_log": [],
     }
 
 
@@ -314,7 +318,8 @@ async def approve_candidates(
             )
 
         # Resume from execute→audit ONLY (no re-run of plan/reconcile/risk)
-        orchestrator = RunOrchestrator(session)
+        publisher = EventPublisher(run_uuid, session)
+        orchestrator = RunOrchestrator(session, publisher=publisher)
         state = await orchestrator.resume_after_approval(run_uuid, state)
 
         _running_states.pop(run_id, None)

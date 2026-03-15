@@ -91,11 +91,14 @@ class ReconciliationAgent(BaseAgent):
 
         try:
             start_date, end_date = self._resolve_window(state)
+            await self.emit_progress(f"Reconciling transactions for merchant {merchant_id}")
 
             if Settings.is_payout_simulated():
                 logger.info("[ReconciliationAgent] Demo mode enabled - skipping Interswitch transaction search")
+                await self.emit_progress("Demo mode — using simulated transaction data")
                 return self._build_simulated_result(state, merchant_id, start_date, end_date)
 
+            await self.emit_progress(f"Searching transactions from {start_date.date()} to {end_date.date()}")
             search_result = await self._search_client.quick_search(
                 merchant_id=merchant_id,
                 start_date=start_date,
@@ -104,6 +107,7 @@ class ReconciliationAgent(BaseAgent):
 
             transactions = search_result.get("transactions", [])
             logger.info(f"[ReconciliationAgent] Fetched {len(transactions)} transactions")
+            await self.emit_progress(f"Fetched {len(transactions)} transactions from Interswitch")
 
             audit_entries: list[dict] = [{
                 "agent_type": "reconciliation",
@@ -131,6 +135,7 @@ class ReconciliationAgent(BaseAgent):
 
             for ref in unresolved[:10]:
                 try:
+                    await self.emit_progress(f"Resolving pending reference {ref[:20]}…")
                     detail = await self._search_client.reference_search(
                         transaction_reference=ref,
                         merchant_id=merchant_id,
@@ -178,6 +183,10 @@ class ReconciliationAgent(BaseAgent):
             ledger = self._build_ledger(transactions)
 
             logger.info(f"[ReconciliationAgent] Ledger: {ledger}, unresolved: {len(unresolved)}, resolved: {len(resolved_refs)}")
+            await self.emit_progress(
+                f"Reconciliation complete — {len(transactions)} txns, "
+                f"{len(resolved_refs)} resolved, {len(unresolved)} unresolved"
+            )
 
             audit_entries.append({
                 "agent_type": "reconciliation",

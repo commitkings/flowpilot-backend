@@ -55,6 +55,8 @@ Risk tolerance: {state.get('risk_tolerance', 0.35)}
 Budget cap: {state.get('budget_cap', 'No limit')}"""
 
         try:
+            await self.emit_progress("Generating execution plan...")
+
             response = await self.llm_json_call(
                 system_prompt=PLANNER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,

@@ -58,6 +58,7 @@ class ExecutionAgent(BaseAgent):
             ]
 
         logger.info(f"[ExecutionAgent] Processing {len(approved_candidates)} approved candidates")
+        await self.emit_progress(f"Processing {len(approved_candidates)} approved candidates")
 
         if not approved_candidates:
             logger.warning("[ExecutionAgent] No approved candidates to process")
@@ -84,6 +85,7 @@ class ExecutionAgent(BaseAgent):
 
         try:
             # 1. Verify all approved candidates via customer-lookup + name matching
+            await self.emit_progress("Verifying recipient accounts via Interswitch lookup")
             lookup_results = await self._verify_recipients(run_id, approved_candidates, audit_entries)
 
             # 2. Split into verified vs failed/mismatched
@@ -101,6 +103,7 @@ class ExecutionAgent(BaseAgent):
                 logger.warning(
                     f"[ExecutionAgent] {len(failed_candidates)} candidates failed verification"
                 )
+                await self.emit_progress(f"{len(failed_candidates)} candidates failed verification")
 
             # 3. Build execution results for failed lookups (requires_followup)
             candidate_execution_results: list[dict] = [
@@ -116,10 +119,12 @@ class ExecutionAgent(BaseAgent):
             # 4. Execute payouts for verified candidates
             batch_details = None
             if verified_candidates:
+                await self.emit_progress(f"Executing payouts for {len(verified_candidates)} verified candidates")
                 batch_details, exec_results = await self._execute_payouts(
                     run_id, verified_candidates, audit_entries
                 )
                 # 5. Poll for final status on pending items
+                await self.emit_progress("Polling payout status for pending items")
                 exec_results = await self._poll_payout_statuses(exec_results, audit_entries)
                 candidate_execution_results.extend(exec_results)
 
@@ -165,9 +170,11 @@ class ExecutionAgent(BaseAgent):
             lookup_match_score, transaction_reference
         """
         results = []
-        for c in candidates:
+        total = len(candidates)
+        for idx, c in enumerate(candidates, 1):
             candidate_id = c.get("candidate_id")
             txn_ref = f"FP_{run_id}_{candidate_id}"
+            await self.emit_progress(f"Verifying account {idx}/{total}: {c.get('account_number', '???')}")
             try:
                 raw = await self._gateway.lookup_customer(
                     institution_code=c["institution_code"],
