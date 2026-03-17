@@ -13,6 +13,7 @@ from app.api.routes.account import router as account_router
 from app.api.routes.approval import router as approval_router
 from app.api.routes.approvals_queue import router as approvals_queue_router
 from app.api.routes.audit import router as audit_router
+from app.api.routes.chat import router as chat_router
 from app.api.routes.institutions import router as institutions_router
 from app.api.routes.notifications import router as notifications_router
 from app.api.routes.onboarding import router as onboarding_router
@@ -21,7 +22,11 @@ from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
 from app.api.auth import auth_router
 from src.config.settings import Settings
-from src.infrastructure.database.connection import close_db, get_session_factory, init_db
+from src.infrastructure.database.connection import (
+    close_db,
+    get_session_factory,
+    init_db,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +66,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_cors_origins = [o.strip() for o in os.getenv(
-    "CORS_ALLOWED_ORIGINS",
-    "http://localhost:3001,http://127.0.0.1:3001",
-).split(",")]
+_cors_origins = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:3001,http://127.0.0.1:3001",
+    ).split(",")
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +84,7 @@ app.add_middleware(
 
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
+app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
 app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
 app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
 app.include_router(approvals_queue_router, prefix="/api/v1", tags=["approvals-queue"])

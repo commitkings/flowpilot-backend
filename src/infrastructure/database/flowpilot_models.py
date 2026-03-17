@@ -58,9 +58,7 @@ class UserModel(Base):
     department: Mapped[Optional[str]] = mapped_column(String(100))
     external_provider: Mapped[Optional[str]] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
-    last_login_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP(timezone=True)
-    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -197,9 +195,7 @@ class BusinessModel(Base):
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
 
-    __table_args__ = (
-        Index("business_is_active_idx", "is_active"),
-    )
+    __table_args__ = (Index("business_is_active_idx", "is_active"),)
 
     members: Mapped[list["BusinessMemberModel"]] = relationship(
         back_populates="business",
@@ -273,8 +269,6 @@ class BusinessConfigModel(Base):
     business: Mapped["BusinessModel"] = relationship(back_populates="config")
 
 
-
-
 # =========================================================================== #
 #  REFERENCE DATA (1 table)
 # =========================================================================== #
@@ -298,9 +292,7 @@ class InstitutionModel(Base):
     cbn_code: Mapped[Optional[str]] = mapped_column(String(10))
     institution_type: Mapped[Optional[str]] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
-    last_synced_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP(timezone=True)
-    )
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
@@ -501,9 +493,7 @@ class RunStepModel(Base):
 class RunEventModel(Base):
     __tablename__ = "run_event"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, Identity(always=True), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("agent_run.id", ondelete="CASCADE"),
@@ -569,9 +559,7 @@ class ReconciledTransactionModel(Base):
     counterparty_name: Mapped[Optional[str]] = mapped_column(String(255))
     counterparty_bank: Mapped[Optional[str]] = mapped_column(String(100))
     has_anomaly: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
-    anomaly_count: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("0")
-    )
+    anomaly_count: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
     raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
@@ -586,9 +574,7 @@ class ReconciledTransactionModel(Base):
             "interswitch_ref",
             name="reconciled_transaction_run_ref_unique",
         ),
-        CheckConstraint(
-            "amount >= 0", name="reconciled_transaction_amount_check"
-        ),
+        CheckConstraint("amount >= 0", name="reconciled_transaction_amount_check"),
         CheckConstraint(
             "direction IN ('inflow', 'outflow')",
             name="reconciled_transaction_direction_check",
@@ -705,15 +691,11 @@ class PayoutCandidateModel(Base):
     risk_reasons: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
     risk_decision: Mapped[Optional[str]] = mapped_column(Text)
 
-    lookup_status: Mapped[str] = mapped_column(
-        Text, server_default=text("'pending'")
-    )
+    lookup_status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
     lookup_account_name: Mapped[Optional[str]] = mapped_column(String(255))
     lookup_match_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
 
-    approval_status: Mapped[str] = mapped_column(
-        Text, server_default=text("'pending'")
-    )
+    approval_status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
     approved_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
@@ -800,7 +782,6 @@ class PayoutCandidateModel(Base):
     )
 
 
-
 # --------------------------------------------------------------------------- #
 # 13. risk_score_feature — per-candidate explainability
 # --------------------------------------------------------------------------- #
@@ -824,9 +805,7 @@ class RiskScoreFeatureModel(Base):
     historical_frequency: Mapped[Optional[int]] = mapped_column(Integer)
     amount_deviation_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
     avg_historical_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
-    duplicate_similarity_score: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(5, 4)
-    )
+    duplicate_similarity_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
     lookup_mismatch_flag: Mapped[Optional[bool]] = mapped_column(Boolean)
     account_anomaly_count: Mapped[Optional[int]] = mapped_column(SmallInteger)
     account_age_days: Mapped[Optional[int]] = mapped_column(Integer)
@@ -838,15 +817,11 @@ class RiskScoreFeatureModel(Base):
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
 
-    __table_args__ = (
-        Index("risk_score_feature_run_id_idx", "run_id"),
-    )
+    __table_args__ = (Index("risk_score_feature_run_id_idx", "run_id"),)
 
     candidate: Mapped["PayoutCandidateModel"] = relationship(
         back_populates="risk_score_features",
     )
-
-
 
 
 # =========================================================================== #
@@ -878,12 +853,8 @@ class PayoutBatchModel(Base):
     source_account_id: Mapped[str] = mapped_column(String(100))
     total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     item_count: Mapped[int] = mapped_column(SmallInteger)
-    accepted_count: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("0")
-    )
-    rejected_count: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("0")
-    )
+    accepted_count: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
+    rejected_count: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
     submission_status: Mapped[str] = mapped_column(
         Text, server_default=text("'pending'")
     )
@@ -941,9 +912,7 @@ class CustomerLookupResultModel(Base):
     http_status_code: Mapped[int] = mapped_column(SmallInteger)
     response_message: Mapped[Optional[str]] = mapped_column(Text)
     raw_response: Mapped[dict] = mapped_column(JSONB)
-    attempt_number: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("1")
-    )
+    attempt_number: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
     duration_ms: Mapped[int] = mapped_column(Integer)
     called_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -966,9 +935,7 @@ class CustomerLookupResultModel(Base):
 class PayoutExecutionModel(Base):
     __tablename__ = "payout_execution"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, Identity(always=True), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     candidate_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("payout_candidate.id", ondelete="CASCADE"),
@@ -983,9 +950,7 @@ class PayoutExecutionModel(Base):
     response_message: Mapped[Optional[str]] = mapped_column(Text)
     execution_status: Mapped[str] = mapped_column(Text)
     raw_response: Mapped[dict] = mapped_column(JSONB)
-    attempt_number: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("1")
-    )
+    attempt_number: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
     duration_ms: Mapped[int] = mapped_column(Integer)
     called_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -1025,16 +990,13 @@ class PayoutExecutionModel(Base):
 # =========================================================================== #
 
 
-
 # --------------------------------------------------------------------------- #
 # 19. audit_log — agent action trail (BIGINT PK, BRIN-indexed, immutable)
 # --------------------------------------------------------------------------- #
 class AuditLogModel(Base):
     __tablename__ = "audit_log"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, Identity(always=True), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("agent_run.id", ondelete="CASCADE"),
@@ -1083,9 +1045,7 @@ class AuditLogModel(Base):
 class ApiCallLogModel(Base):
     __tablename__ = "api_call_log"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, Identity(always=True), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("agent_run.id", ondelete="CASCADE"),
@@ -1135,9 +1095,7 @@ class ApiCallLogModel(Base):
 class NotificationOutboxModel(Base):
     __tablename__ = "notification_outbox"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger, Identity(always=True), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="CASCADE"),
@@ -1157,9 +1115,7 @@ class NotificationOutboxModel(Base):
     extra_data: Mapped[Optional[dict]] = mapped_column(JSONB)
     is_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     sent_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
-    send_attempts: Mapped[int] = mapped_column(
-        SmallInteger, server_default=text("0")
-    )
+    send_attempts: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
     last_attempt_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True)
     )
@@ -1214,9 +1170,7 @@ class NotificationModel(Base):
     )
     title: Mapped[str] = mapped_column(String(255))
     message: Mapped[str] = mapped_column(Text)
-    type: Mapped[str] = mapped_column(
-        String(32), server_default=text("'info'")
-    )
+    type: Mapped[str] = mapped_column(String(32), server_default=text("'info'"))
     resource_type: Mapped[Optional[str]] = mapped_column(String(64))
     resource_id: Mapped[Optional[str]] = mapped_column(String(64))
     is_read: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
@@ -1230,8 +1184,120 @@ class NotificationModel(Base):
             "type IN ('info', 'warning', 'success', 'error')",
             name="notification_type_check",
         ),
-        Index("notification_user_unread_idx", "user_id", "is_read",
-              postgresql_where=text("is_read = false")),
+        Index(
+            "notification_user_unread_idx",
+            "user_id",
+            "is_read",
+            postgresql_where=text("is_read = false"),
+        ),
+    )
+
+
+# =========================================================================== #
+#  CONVERSATIONAL INTENT (2 tables)
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# 22. conversation — multi-turn chat session for intent extraction
+# --------------------------------------------------------------------------- #
+class ConversationModel(Base):
+    __tablename__ = "conversation"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+    )
+    title: Mapped[Optional[str]] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(Text, server_default=text("'gathering'"))
+    current_intent: Mapped[Optional[str]] = mapped_column(String(64))
+    extracted_slots: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'"))
+    resolved_run_config: Mapped[Optional[dict]] = mapped_column(JSONB)
+    run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="SET NULL"),
+    )
+    message_count: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('gathering', 'confirming', 'executing', 'completed', 'abandoned')",
+            name="conversation_status_check",
+        ),
+        CheckConstraint(
+            "current_intent IS NULL OR current_intent IN ("
+            "'create_payout_run', 'check_run_status', 'explain_system', "
+            "'modify_config', 'greeting', 'farewell', 'unclear')",
+            name="conversation_intent_check",
+        ),
+        Index("conversation_business_id_idx", "business_id"),
+        Index("conversation_user_id_idx", "user_id"),
+        Index("conversation_status_idx", "status"),
+        Index("conversation_run_id_idx", "run_id"),
+        Index(
+            "conversation_user_updated_idx",
+            "user_id",
+            text("updated_at DESC"),
+        ),
+    )
+
+    messages: Mapped[list["ConversationMessageModel"]] = relationship(
+        back_populates="conversation",
+        order_by="ConversationMessageModel.id",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 23. conversation_message — individual chat turn
+# --------------------------------------------------------------------------- #
+class ConversationMessageModel(Base):
+    __tablename__ = "conversation_message"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation.id", ondelete="CASCADE"),
+    )
+    role: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text)
+    intent_classification: Mapped[Optional[str]] = mapped_column(String(64))
+    extracted_slots: Mapped[Optional[dict]] = mapped_column(JSONB)
+    confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
+    token_usage: Mapped[Optional[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('user', 'assistant', 'system')",
+            name="conversation_message_role_check",
+        ),
+        Index("conversation_message_conversation_id_idx", "conversation_id"),
+        Index(
+            "conversation_message_created_at_idx",
+            "created_at",
+            postgresql_using="brin",
+        ),
+    )
+
+    conversation: Mapped["ConversationModel"] = relationship(
+        back_populates="messages",
     )
 
 
