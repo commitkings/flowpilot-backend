@@ -1,13 +1,15 @@
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from groq import AsyncGroq
 
+from src.agents.tools import ToolRegistry, ToolCall, ToolResult, parse_tool_calls_from_response
 from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMCallResult:
-    """Structured result from an LLM call including reasoning metadata."""
     content: str
     model: str = ""
     prompt_summary: str = ""
@@ -24,12 +25,30 @@ class LLMCallResult:
     duration_ms: int = 0
 
 
-# Maps "PlannerAgent" -> "planner", "ReconciliationAgent" -> "reconciliation", etc.
 _AGENT_TYPE_RE = re.compile(r"Agent$", re.IGNORECASE)
 
 
 def _normalize_agent_type(name: str) -> str:
     return _AGENT_TYPE_RE.sub("", name).lower()
+
+
+MAX_REACT_ITERATIONS = 15
+REACT_SYSTEM_SUFFIX = """
+
+## Tool Use Protocol
+
+You have access to tools. To accomplish your task, you MUST use tools to gather real data — never fabricate data or assume values.
+
+When you have gathered enough information via tools, produce your final answer.
+
+Always think step-by-step:
+1. THINK: What do I need to find out next?
+2. ACT: Call the appropriate tool.
+3. OBSERVE: Read the tool result.
+4. REPEAT or CONCLUDE: Either call another tool or produce the final answer.
+
+If a tool call fails, reason about why and try an alternative approach.
+"""
 
 
 class BaseAgent:
@@ -38,12 +57,12 @@ class BaseAgent:
         self.name = name
         self._agent_type_key = _normalize_agent_type(name)
         self._client: Optional[AsyncGroq] = None
-        self._event_publisher = None  # Set by orchestrator before agent.run()
+        self._event_publisher = None
         self._current_step_id: Optional[UUID] = None
         self._reasoning_entries: list[dict] = []
+        self.registry = ToolRegistry()
 
     def set_publisher(self, publisher, step_id: Optional[UUID] = None) -> None:
-        """Attach an EventPublisher and current step_id for event correlation."""
         self._event_publisher = publisher
         self._current_step_id = step_id
         self._reasoning_entries = []
@@ -56,6 +75,108 @@ class BaseAgent:
                 raise ValueError("GROQ_API_KEY not configured")
             self._client = AsyncGroq(api_key=api_key)
         return self._client
+
+    async def reason_and_act(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        max_iterations: int = MAX_REACT_ITERATIONS,
+    ) -> str:
+        model = model or Settings.GROQ_LLM_MODEL
+        full_system = system_prompt + REACT_SYSTEM_SUFFIX
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        tools_schema = self.registry.to_llm_tools() if self.registry.tools else None
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+            logger.info(f"[{self.name}] ReAct iteration {iteration}/{max_iterations}")
+
+            kwargs: dict[str, Any] = dict(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if tools_schema:
+                kwargs["tools"] = tools_schema
+                kwargs["tool_choice"] = "auto"
+
+            t0 = time.monotonic()
+            response = await self.llm_client.chat.completions.create(**kwargs)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+            msg = response.choices[0].message
+            usage = response.usage
+            prompt_tokens = usage.prompt_tokens if usage else 0
+            completion_tokens = usage.completion_tokens if usage else 0
+
+            self._record_reasoning(
+                thinking=msg.content[:500] if msg.content else f"[tool_calls: {len(msg.tool_calls or [])}]",
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_ms=elapsed_ms,
+                iteration=iteration,
+            )
+
+            tool_calls = parse_tool_calls_from_response(msg)
+            if not tool_calls:
+                final_content = msg.content or ""
+                logger.info(f"[{self.name}] ReAct concluded after {iteration} iteration(s)")
+                return final_content
+
+            messages.append(self._assistant_message_from_response(msg))
+
+            for tc in tool_calls:
+                await self._emit_tool_call_event(tc)
+                result = await self.registry.execute(tc)
+                await self._emit_tool_result_event(tc, result)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": result.to_message_content(),
+                })
+
+        logger.warning(f"[{self.name}] ReAct hit max iterations ({max_iterations})")
+        last_content = ""
+        for m in reversed(messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                last_content = m["content"]
+                break
+        return last_content or '{"error": "Agent reached maximum reasoning iterations without a final answer"}'
+
+    async def reason_and_act_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+        max_iterations: int = MAX_REACT_ITERATIONS,
+    ) -> str:
+        json_instruction = (
+            "\n\nIMPORTANT: When you are ready to give your final answer (after using tools), "
+            "respond with ONLY a valid JSON object. No markdown, no explanation — just the JSON."
+        )
+        raw = await self.reason_and_act(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt + json_instruction,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_iterations=max_iterations,
+        )
+        return self._extract_json(raw)
 
     async def llm_call(
         self,
@@ -95,7 +216,6 @@ class BaseAgent:
         max_tokens: int = 4096,
         json_mode: bool = False,
     ) -> LLMCallResult:
-        """Core LLM call that captures full reasoning metadata."""
         model = model or Settings.GROQ_LLM_MODEL
         logger.info(f"[{self.name}] LLM call: model={model}")
 
@@ -120,7 +240,6 @@ class BaseAgent:
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
 
-        # Build a short summary of the prompt (first 200 chars of user prompt)
         prompt_summary = user_prompt[:200] + ("..." if len(user_prompt) > 200 else "")
 
         result = LLMCallResult(
@@ -137,35 +256,17 @@ class BaseAgent:
             f"{prompt_tokens}+{completion_tokens} tokens, {elapsed_ms}ms"
         )
 
-        reasoning_entry = {
-            "agent_type": self._agent_type_key,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "thinking": content[:500],
-            "token_usage": {
-                "model": model,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "duration_ms": elapsed_ms,
-            },
-        }
-        self._reasoning_entries.append(reasoning_entry)
-
-        if self._event_publisher:
-            try:
-                await self._event_publisher.reasoning(
-                    agent_type=self._agent_type_key,
-                    thinking=content[:500],
-                    prompt_summary=prompt_summary,
-                    token_usage=reasoning_entry["token_usage"],
-                    step_id=self._current_step_id,
-                )
-            except Exception:
-                logger.debug(f"[{self.name}] Failed to emit reasoning event", exc_info=True)
+        self._record_reasoning(
+            thinking=content[:500],
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            duration_ms=elapsed_ms,
+        )
 
         return result
 
     async def emit_progress(self, message: str, metadata: dict | None = None) -> None:
-        """Emit a progress event (for non-LLM operations like API calls)."""
         if self._event_publisher:
             try:
                 await self._event_publisher.step_progress(
@@ -174,3 +275,109 @@ class BaseAgent:
                 )
             except Exception:
                 logger.debug(f"[{self.name}] Failed to emit progress event", exc_info=True)
+
+    def _record_reasoning(
+        self,
+        thinking: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        duration_ms: int,
+        iteration: int | None = None,
+    ) -> None:
+        entry = {
+            "agent_type": self._agent_type_key,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "thinking": thinking,
+            "token_usage": {
+                "model": model,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "duration_ms": duration_ms,
+            },
+        }
+        if iteration is not None:
+            entry["react_iteration"] = iteration
+        self._reasoning_entries.append(entry)
+
+        if self._event_publisher:
+            try:
+                import asyncio
+                asyncio.ensure_future(self._event_publisher.reasoning(
+                    agent_type=self._agent_type_key,
+                    thinking=thinking,
+                    prompt_summary=f"ReAct iteration {iteration}" if iteration else None,
+                    token_usage=entry["token_usage"],
+                    step_id=self._current_step_id,
+                ))
+            except Exception:
+                logger.debug(f"[{self.name}] Failed to emit reasoning event", exc_info=True)
+
+    async def _emit_tool_call_event(self, call: ToolCall) -> None:
+        if self._event_publisher:
+            try:
+                await self._event_publisher.step_progress(
+                    self._agent_type_key,
+                    f"Calling tool: {call.tool_name}",
+                    detail={"tool": call.tool_name, "arguments": call.arguments},
+                    step_id=self._current_step_id,
+                )
+            except Exception:
+                logger.debug(f"[{self.name}] Failed to emit tool call event", exc_info=True)
+
+    async def _emit_tool_result_event(self, call: ToolCall, result: ToolResult) -> None:
+        if self._event_publisher:
+            try:
+                detail: dict[str, Any] = {
+                    "tool": call.tool_name,
+                    "success": result.success,
+                    "duration_ms": result.duration_ms,
+                }
+                if not result.success:
+                    detail["error"] = result.error
+                msg = f"Tool {call.tool_name}: {'OK' if result.success else 'FAILED'} ({result.duration_ms}ms)"
+                await self._event_publisher.step_progress(
+                    self._agent_type_key, msg, detail=detail,
+                    step_id=self._current_step_id,
+                )
+            except Exception:
+                logger.debug(f"[{self.name}] Failed to emit tool result event", exc_info=True)
+
+    @staticmethod
+    def _assistant_message_from_response(msg) -> dict[str, Any]:
+        m: dict[str, Any] = {"role": "assistant"}
+        if msg.content:
+            m["content"] = msg.content
+        if msg.tool_calls:
+            m["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        return m
+
+    @staticmethod
+    def _extract_json(raw: str) -> str:
+        stripped = raw.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return stripped
+
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
+        if fence_match:
+            return fence_match.group(1).strip()
+
+        brace_match = re.search(r"\{.*\}", stripped, re.DOTALL)
+        if brace_match:
+            return brace_match.group(0)
+
+        bracket_match = re.search(r"\[.*\]", stripped, re.DOTALL)
+        if bracket_match:
+            return bracket_match.group(0)
+
+        return stripped

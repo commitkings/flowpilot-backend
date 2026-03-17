@@ -5,11 +5,13 @@ Replaces LangGraph's StateGraph with explicit step-by-step execution,
 per-step DB persistence, approval gate halting, and resume-from-step.
 
 Design principles:
-  - Agents remain pure (return state, no DB awareness)
+  - Agents use a ReAct (Reason → Act → Observe) loop with tool calling
+  - Orchestrator passes db_session to agents that need DB access for tools
   - Orchestrator owns all persistence (plan_step, transaction, audit_log)
   - Approval gate is a state transition, not an agent node
   - Resume after approval executes only execute→audit (no re-run)
   - Each audit_log entry is correlated with its plan_step via step_id FK
+  - Tool call logs are accumulated across steps in state["tool_call_log"]
 """
 
 from __future__ import annotations
@@ -70,7 +72,9 @@ _POST_APPROVAL_STEPS = {"execute", "audit"}
 class RunOrchestrator:
     """Executes FlowPilot agent pipeline with per-step DB persistence."""
 
-    def __init__(self, session: AsyncSession, publisher: Optional[EventPublisher] = None) -> None:
+    def __init__(
+        self, session: AsyncSession, publisher: Optional[EventPublisher] = None
+    ) -> None:
         self._session = session
         self._publisher = publisher
         self._run_repo = RunRepository(session)
@@ -82,9 +86,7 @@ class RunOrchestrator:
         self._exec_detail_repo = ExecutionDetailRepository(session)
         self._step_ids: dict[str, uuid.UUID] = {}  # agent_type → plan_step.id
 
-    async def execute_run(
-        self, run_id: uuid.UUID, state: AgentState
-    ) -> AgentState:
+    async def execute_run(self, run_id: uuid.UUID, state: AgentState) -> AgentState:
         """Execute the full pre-approval pipeline: plan → reconcile → risk → [halt].
 
         Returns the state after halting at the approval gate (or after audit
@@ -129,7 +131,12 @@ class RunOrchestrator:
             # Defer commit for the last step so final status + step data are atomic
             is_last = step_name == "audit"
             state = await self._execute_step(
-                run_id, step_name, agent_type, run_status, agent, state,
+                run_id,
+                step_name,
+                agent_type,
+                run_status,
+                agent,
+                state,
                 defer_commit=is_last,
             )
 
@@ -185,15 +192,18 @@ class RunOrchestrator:
         # --- Emit step_started event ---
         if self._publisher:
             desc = f"Running {agent.name}"
-            await self._publisher.step_started(step_name, agent_type, desc, step_id=step_id)
+            await self._publisher.step_started(
+                step_name, agent_type, desc, step_id=step_id
+            )
             # Pass publisher + step_id to agent for reasoning/progress events
             if hasattr(agent, "set_publisher"):
                 agent.set_publisher(self._publisher, step_id=step_id)
 
         # 4. Execute the agent (with timing)
+        #    Pass db_session so agents with DB-backed tools can query directly
         t0 = time.monotonic()
         try:
-            result_state = await agent.run(state)
+            result_state = await agent.run(state, db_session=self._session)
         except Exception as e:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             logger.error(f"Run {run_id}: agent '{step_name}' raised: {e}")
@@ -204,7 +214,13 @@ class RunOrchestrator:
                 state["error"] = f"{agent.name} failed: {e}"
             state["current_step"] = f"{step_name}_failed"
             if self._publisher:
-                await self._publisher.step_failed(step_name, agent_type, str(e), duration_ms=elapsed_ms, step_id=step_id)
+                await self._publisher.step_failed(
+                    step_name,
+                    agent_type,
+                    str(e),
+                    duration_ms=elapsed_ms,
+                    step_id=step_id,
+                )
             if step_id is not None:
                 await self._plan_step_repo.update_status(
                     step_id, "failed", error_message=str(e)
@@ -220,7 +236,9 @@ class RunOrchestrator:
             state["error"] = f"{error_before} | {err_msg}" if error_before else err_msg
             state["current_step"] = f"{step_name}_failed"
             if step_id is not None:
-                await self._plan_step_repo.update_status(step_id, "failed", error_message=err_msg)
+                await self._plan_step_repo.update_status(
+                    step_id, "failed", error_message=err_msg
+                )
             await self._session.commit()
             return state
 
@@ -243,6 +261,11 @@ class RunOrchestrator:
         if hasattr(agent, "_reasoning_entries"):
             state["reasoning_log"].extend(agent._reasoning_entries)
 
+        # 8c. Harvest tool call log entries from agent's registry
+        state.setdefault("tool_call_log", [])
+        if hasattr(agent, "registry") and hasattr(agent.registry, "call_log"):
+            state["tool_call_log"].extend(agent.registry.call_log)
+
         # 9. Persist step-specific artifacts (may populate self._step_ids for plan step)
         #    Returns True if step status/output_data was already finalized.
         step_finalized = await self._persist_step_artifacts(run_id, step_name, state)
@@ -259,12 +282,15 @@ class RunOrchestrator:
             node_output = result_state if isinstance(result_state, dict) else None
             if step_failed:
                 await self._plan_step_repo.update_status(
-                    step_id, "failed",
+                    step_id,
+                    "failed",
                     output_data=node_output,
                     error_message=error_after,
                 )
             else:
-                await self._plan_step_repo.mark_completed(step_id, output_data=node_output)
+                await self._plan_step_repo.mark_completed(
+                    step_id, output_data=node_output
+                )
 
         # 13. Persist audit entries with step_id correlation
         if new_audit_entries:
@@ -274,13 +300,20 @@ class RunOrchestrator:
         if self._publisher:
             if step_failed:
                 await self._publisher.step_failed(
-                    step_name, agent_type, error_after or "Unknown error",
-                    duration_ms=elapsed_ms, step_id=step_id,
+                    step_name,
+                    agent_type,
+                    error_after or "Unknown error",
+                    duration_ms=elapsed_ms,
+                    step_id=step_id,
                 )
             else:
                 summary = _step_summary(step_name, state)
                 await self._publisher.step_completed(
-                    step_name, agent_type, elapsed_ms, summary, step_id=step_id,
+                    step_name,
+                    agent_type,
+                    elapsed_ms,
+                    summary,
+                    step_id=step_id,
                 )
 
         # 14. Commit this step's changes (unless deferred for atomic finalization)
@@ -316,8 +349,14 @@ class RunOrchestrator:
         elif step_name == "reconcile" and state.get("transactions"):
             mapped_txns = _map_transactions(state["transactions"])
             if mapped_txns:
-                business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else None
-                await self._transaction_repo.create_batch(run_id, business_id, mapped_txns)
+                business_id = (
+                    uuid.UUID(state["business_id"])
+                    if state.get("business_id")
+                    else None
+                )
+                await self._transaction_repo.create_batch(
+                    run_id, business_id, mapped_txns
+                )
 
             # Persist reconciliation summary on plan_step output_data
             resolved = state.get("resolved_references", [])
@@ -353,9 +392,13 @@ class RunOrchestrator:
                         run_id=run_id,
                     )
                 except Exception as e:
-                    logger.warning(f"Run {run_id}: failed to update risk for candidate {candidate_id}: {e}")
+                    logger.warning(
+                        f"Run {run_id}: failed to update risk for candidate {candidate_id}: {e}"
+                    )
             if skipped:
-                logger.warning(f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)")
+                logger.warning(
+                    f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)"
+                )
             return False
 
         elif step_name == "execute":
@@ -369,6 +412,7 @@ class RunOrchestrator:
     ) -> None:
         """Persist lookup results, payout_batch, and execution references."""
         from datetime import datetime, timezone
+
         persist_errors: list[str] = []
 
         # 1. Persist lookup results on payout_candidate rows + detail table
@@ -394,7 +438,8 @@ class RunOrchestrator:
                     run_id=run_id,
                     account_number=lr.get("lookup_account_name", ""),  # from raw data
                     institution_code=lr.get("institution_code", ""),
-                    can_credit=lr.get("lookup_status") == "success" or lr.get("lookup_status") == "mismatch",
+                    can_credit=lr.get("lookup_status") == "success"
+                    or lr.get("lookup_status") == "mismatch",
                     name_returned=lr.get("lookup_account_name"),
                     similarity_score=(
                         Decimal(str(match_score)) if match_score is not None else None
@@ -420,7 +465,11 @@ class RunOrchestrator:
                 persist_errors.append(msg)
             else:
                 try:
-                    business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else run_id
+                    business_id = (
+                        uuid.UUID(state["business_id"])
+                        if state.get("business_id")
+                        else run_id
+                    )
                     batch = await self._batch_repo.create(
                         run_id=run_id,
                         business_id=business_id,
@@ -429,7 +478,9 @@ class RunOrchestrator:
                         source_account_id=batch_details.get("source_account_id", ""),
                         total_amount=Decimal(str(batch_details.get("total_amount", 0))),
                         item_count=item_count,
-                        submission_status=batch_details.get("submission_status", "pending"),
+                        submission_status=batch_details.get(
+                            "submission_status", "pending"
+                        ),
                         accepted_count=batch_details.get("accepted_count", 0),
                         rejected_count=batch_details.get("rejected_count", 0),
                     )
@@ -489,19 +540,19 @@ class RunOrchestrator:
     # Internal: approval gate
     # ------------------------------------------------------------------
 
-    async def _enter_approval_gate(
-        self, run_id: uuid.UUID, state: AgentState
-    ) -> None:
+    async def _enter_approval_gate(self, run_id: uuid.UUID, state: AgentState) -> None:
         """Transition run to awaiting_approval status."""
         state["current_step"] = "awaiting_approval"
         await self._run_repo.update_status(run_id, "awaiting_approval")
 
         if self._publisher:
             n_candidates = len(state.get("candidates", []))
-            await self._publisher.approval_gate({
-                "candidates_count": n_candidates,
-                "message": f"{n_candidates} candidate(s) awaiting approval",
-            })
+            await self._publisher.approval_gate(
+                {
+                    "candidates_count": n_candidates,
+                    "message": f"{n_candidates} candidate(s) awaiting approval",
+                }
+            )
 
         await self._session.commit()
         logger.info(f"Run {run_id}: halted at approval gate")
@@ -510,9 +561,7 @@ class RunOrchestrator:
     # Internal: error routing
     # ------------------------------------------------------------------
 
-    async def _route_to_audit(
-        self, run_id: uuid.UUID, state: AgentState
-    ) -> AgentState:
+    async def _route_to_audit(self, run_id: uuid.UUID, state: AgentState) -> AgentState:
         """On error, skip remaining steps and run audit agent for the report."""
         logger.warning(f"Run {run_id}: error detected, routing to audit")
 
@@ -524,7 +573,12 @@ class RunOrchestrator:
             if step_name != "audit":
                 continue
             state = await self._execute_step(
-                run_id, step_name, agent_type, run_status, agent, state,
+                run_id,
+                step_name,
+                agent_type,
+                run_status,
+                agent,
+                state,
                 defer_commit=True,  # Atomic with final status update below
             )
 
@@ -613,12 +667,15 @@ def _map_plan_steps(steps: list[dict]) -> list[dict]:
     ]
     # Ensure a planner step exists at order 0
     if not any(step["agent_type"] == "planner" for step in mapped):
-        mapped.insert(0, {
-            "agent_type": "planner",
-            "step_order": 0,
-            "description": "Generate execution plan",
-            "status": "pending",
-        })
+        mapped.insert(
+            0,
+            {
+                "agent_type": "planner",
+                "step_order": 0,
+                "description": "Generate execution plan",
+                "status": "pending",
+            },
+        )
     return mapped
 
 
@@ -631,21 +688,25 @@ def _map_transactions(txns: list[dict]) -> list[dict]:
         status = t.get("status")
         if not ref or amount is None or status is None:
             continue
-        mapped.append({
-            "interswitch_ref": ref,
-            "amount": amount,
-            "currency": t.get("currency", "NGN"),
-            "direction": t.get("direction", "inflow"),
-            "status": status,
-            "channel": t.get("channel"),
-            "narration": t.get("narration"),
-            "transaction_timestamp": t.get("timestamp"),
-            "settlement_date": t.get("settlementDate"),
-            "counterparty_name": t.get("counterpartyName"),
-            "counterparty_bank": t.get("counterpartyBank"),
-            "has_anomaly": t.get("isAnomaly", False),
-            "anomaly_count": len(t.get("anomalies", [])) if t.get("isAnomaly") else 0,
-        })
+        mapped.append(
+            {
+                "interswitch_ref": ref,
+                "amount": amount,
+                "currency": t.get("currency", "NGN"),
+                "direction": t.get("direction", "inflow"),
+                "status": status,
+                "channel": t.get("channel"),
+                "narration": t.get("narration"),
+                "transaction_timestamp": t.get("timestamp"),
+                "settlement_date": t.get("settlementDate"),
+                "counterparty_name": t.get("counterpartyName"),
+                "counterparty_bank": t.get("counterpartyBank"),
+                "has_anomaly": t.get("isAnomaly", False),
+                "anomaly_count": len(t.get("anomalies", []))
+                if t.get("isAnomaly")
+                else 0,
+            }
+        )
     return mapped
 
 
@@ -653,16 +714,18 @@ def _map_candidates(candidates: list[dict]) -> list[dict]:
     """Map RiskAgent scored_candidate dicts to PayoutCandidateModel column names."""
     mapped: list[dict] = []
     for c in candidates:
-        mapped.append({
-            "institution_code": c.get("institution_code"),
-            "beneficiary_name": c.get("beneficiary_name"),
-            "account_number": c.get("account_number"),
-            "amount": c.get("amount"),
-            "currency": c.get("currency", "NGN"),
-            "purpose": c.get("purpose"),
-            "risk_score": c.get("risk_score"),
-            "risk_reasons": c.get("risk_reasons"),
-            "risk_decision": c.get("risk_decision"),
-            "approval_status": "pending",
-        })
+        mapped.append(
+            {
+                "institution_code": c.get("institution_code"),
+                "beneficiary_name": c.get("beneficiary_name"),
+                "account_number": c.get("account_number"),
+                "amount": c.get("amount"),
+                "currency": c.get("currency", "NGN"),
+                "purpose": c.get("purpose"),
+                "risk_score": c.get("risk_score"),
+                "risk_reasons": c.get("risk_reasons"),
+                "risk_decision": c.get("risk_decision"),
+                "approval_status": "pending",
+            }
+        )
     return mapped

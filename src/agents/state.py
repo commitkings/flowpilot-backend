@@ -49,3 +49,7 @@ class AgentState(TypedDict, total=False):
     # Reasoning capture: accumulated per-agent LLM reasoning entries
     # Each entry: {agent_type, timestamp, thinking, token_usage}
     reasoning_log: list[dict]
+
+    # Tool-use observability: accumulated tool call records per run
+    # Each entry: {agent_type, tool_name, arguments, success, duration_ms, iteration}
+    tool_call_log: list[dict]
