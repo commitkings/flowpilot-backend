@@ -21,7 +21,10 @@ class CandidateRepository:
         self._session = session
 
     async def create_batch(
-        self, run_id: UUID, candidates: list[dict], business_id: UUID | None = None,
+        self,
+        run_id: UUID,
+        candidates: list[dict],
+        business_id: UUID | None = None,
     ) -> list[PayoutCandidateModel]:
         models = [
             PayoutCandidateModel(run_id=run_id, business_id=business_id, **candidate)
@@ -37,21 +40,17 @@ class CandidateRepository:
         approval_status: str | None = None,
         risk_decision: str | None = None,
     ) -> list[PayoutCandidateModel]:
-        stmt = select(PayoutCandidateModel).where(
-            PayoutCandidateModel.run_id == run_id
-        )
+        stmt = select(PayoutCandidateModel).where(PayoutCandidateModel.run_id == run_id)
         if approval_status is not None:
-            stmt = stmt.where(
-                PayoutCandidateModel.approval_status == approval_status
-            )
+            stmt = stmt.where(PayoutCandidateModel.approval_status == approval_status)
         if risk_decision is not None:
-            stmt = stmt.where(
-                PayoutCandidateModel.risk_decision == risk_decision
-            )
+            stmt = stmt.where(PayoutCandidateModel.risk_decision == risk_decision)
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
-    async def approve(self, candidate_ids: list[UUID], approved_by: UUID, run_id: UUID) -> int:
+    async def approve(
+        self, candidate_ids: list[UUID], approved_by: UUID, run_id: UUID
+    ) -> int:
         stmt = (
             update(PayoutCandidateModel)
             .where(
@@ -195,9 +194,13 @@ class CandidateRepository:
             like = f"%{search}%"
             filters.append(C.beneficiary_name.ilike(like))
         if from_date is not None:
-            filters.append(C.created_at >= datetime.datetime.combine(from_date, datetime.time.min))
+            filters.append(
+                C.created_at >= datetime.datetime.combine(from_date, datetime.time.min)
+            )
         if to_date is not None:
-            filters.append(C.created_at <= datetime.datetime.combine(to_date, datetime.time.max))
+            filters.append(
+                C.created_at <= datetime.datetime.combine(to_date, datetime.time.max)
+            )
         if filters:
             stmt = stmt.where(and_(*filters))
         return stmt
@@ -219,12 +222,205 @@ class CandidateRepository:
         C = PayoutCandidateModel
         base = select(C).order_by(C.created_at.desc())
         base = self._apply_filters(
-            base, business_id=business_id, run_id=run_id,
-            approval_status=approval_status, risk_decision=risk_decision,
-            search=search, from_date=from_date, to_date=to_date,
+            base,
+            business_id=business_id,
+            run_id=run_id,
+            approval_status=approval_status,
+            risk_decision=risk_decision,
+            search=search,
+            from_date=from_date,
+            to_date=to_date,
         )
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self._session.execute(count_stmt)).scalar_one()
         rows_stmt = base.limit(limit).offset(offset)
         rows = list((await self._session.execute(rows_stmt)).scalars().all())
         return rows, total
+
+    # ── Historical query methods for risk analysis (Phase 4) ──────
+
+    async def get_historical_payouts_to_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+        days: int = 30,
+        exclude_run_id: Optional[UUID] = None,
+    ) -> list[PayoutCandidateModel]:
+        """
+        Get past payouts to a specific account for velocity/history analysis.
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+            days: Number of days to look back (default 30)
+            exclude_run_id: Optional run ID to exclude (current run)
+
+        Returns:
+            List of historical payout candidates to this account
+        """
+        C = PayoutCandidateModel
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+        filters = [
+            C.business_id == business_id,
+            C.account_number == account_number,
+            C.created_at >= cutoff,
+        ]
+        if exclude_run_id is not None:
+            filters.append(C.run_id != exclude_run_id)
+
+        stmt = select(C).where(and_(*filters)).order_by(C.created_at.desc())
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_name_variations_for_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+        exclude_run_id: Optional[UUID] = None,
+    ) -> list[str]:
+        """
+        Get all distinct beneficiary names used for an account historically.
+
+        Used for detecting name inconsistencies (same account, different names).
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+            exclude_run_id: Optional run ID to exclude (current run)
+
+        Returns:
+            List of distinct beneficiary names used for this account
+        """
+        C = PayoutCandidateModel
+
+        filters = [
+            C.business_id == business_id,
+            C.account_number == account_number,
+        ]
+        if exclude_run_id is not None:
+            filters.append(C.run_id != exclude_run_id)
+
+        stmt = select(func.distinct(C.beneficiary_name)).where(and_(*filters))
+        result = await self._session.execute(stmt)
+        return [name for name in result.scalars().all() if name]
+
+    async def get_first_payout_date_for_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+    ) -> Optional[datetime.datetime]:
+        """
+        Get the date of the first payout to an account (account age).
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+
+        Returns:
+            The created_at timestamp of the earliest payout, or None if new
+        """
+        C = PayoutCandidateModel
+
+        stmt = select(func.min(C.created_at)).where(
+            C.business_id == business_id,
+            C.account_number == account_number,
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_last_payout_date_for_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+        exclude_run_id: Optional[UUID] = None,
+    ) -> Optional[datetime.datetime]:
+        """
+        Get the date of the most recent payout to an account.
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+            exclude_run_id: Optional run ID to exclude (current run)
+
+        Returns:
+            The created_at timestamp of the most recent payout, or None
+        """
+        C = PayoutCandidateModel
+
+        filters = [
+            C.business_id == business_id,
+            C.account_number == account_number,
+        ]
+        if exclude_run_id is not None:
+            filters.append(C.run_id != exclude_run_id)
+
+        stmt = select(func.max(C.created_at)).where(and_(*filters))
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_average_amount_for_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+        exclude_run_id: Optional[UUID] = None,
+    ) -> Optional[Decimal]:
+        """
+        Get the average payout amount to an account historically.
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+            exclude_run_id: Optional run ID to exclude (current run)
+
+        Returns:
+            The average amount, or None if no history
+        """
+        C = PayoutCandidateModel
+
+        filters = [
+            C.business_id == business_id,
+            C.account_number == account_number,
+        ]
+        if exclude_run_id is not None:
+            filters.append(C.run_id != exclude_run_id)
+
+        stmt = select(func.avg(C.amount)).where(and_(*filters))
+        result = await self._session.execute(stmt)
+        avg = result.scalar_one_or_none()
+        return Decimal(str(avg)) if avg is not None else None
+
+    async def count_payouts_to_account(
+        self,
+        business_id: UUID,
+        account_number: str,
+        days: Optional[int] = None,
+        exclude_run_id: Optional[UUID] = None,
+    ) -> int:
+        """
+        Count historical payouts to an account.
+
+        Args:
+            business_id: The business ID to scope the query
+            account_number: The account number to search for
+            days: Optional number of days to look back (None = all time)
+            exclude_run_id: Optional run ID to exclude (current run)
+
+        Returns:
+            Count of payouts to this account
+        """
+        C = PayoutCandidateModel
+
+        filters = [
+            C.business_id == business_id,
+            C.account_number == account_number,
+        ]
+        if days is not None:
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            filters.append(C.created_at >= cutoff)
+        if exclude_run_id is not None:
+            filters.append(C.run_id != exclude_run_id)
+
+        stmt = select(func.count()).select_from(C).where(and_(*filters))
+        result = await self._session.execute(stmt)
+        return result.scalar_one()
