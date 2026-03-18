@@ -20,7 +20,7 @@ import logging
 import time
 import uuid
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,23 +50,16 @@ _risk = RiskAgent()
 _execution = ExecutionAgent()
 _audit = AuditAgent()
 
-# Pipeline definition: (step_name, agent_type, run_status, agent_instance)
-# run_status is the DB status to set DURING execution of this step.
-# None means "don't update status" (caller controls final status).
-_PIPELINE = [
-    ("plan", "planner", "planning", _planner),
-    ("reconcile", "reconciliation", "reconciling", _reconciliation),
-    ("risk", "risk", "scoring", _risk),
-    # approval_gate is handled as a state transition between risk and execute
-    ("execute", "execution", "executing", _execution),
-    ("audit", "audit", None, _audit),  # None: caller sets final status
-]
+AgentRegistryEntry = tuple[str, str | None, Any]
+PipelineEntry = tuple[str, str, str | None, Any]
 
-# Steps that run before the approval gate
-_PRE_APPROVAL_STEPS = {"plan", "reconcile", "risk"}
-
-# Steps that run after the approval gate
-_POST_APPROVAL_STEPS = {"execute", "audit"}
+_AGENT_REGISTRY: dict[str, AgentRegistryEntry] = {
+    "planner": ("plan", "planning", _planner),
+    "reconciliation": ("reconcile", "reconciling", _reconciliation),
+    "risk": ("risk", "scoring", _risk),
+    "execution": ("execute", "executing", _execution),
+    "audit": ("audit", None, _audit),
+}
 
 
 class RunOrchestrator:
@@ -97,9 +90,38 @@ class RunOrchestrator:
         if self._publisher:
             await self._publisher.run_started(state.get("objective", ""))
 
-        for step_name, agent_type, run_status, agent in _PIPELINE:
-            if step_name not in _PRE_APPROVAL_STEPS:
-                continue
+        planner_step_name, planner_status, planner_agent = _AGENT_REGISTRY["planner"]
+        state = await self._execute_step(
+            run_id,
+            planner_step_name,
+            "planner",
+            planner_status,
+            planner_agent,
+            state,
+        )
+
+        if state.get("error"):
+            state = await self._route_to_audit(run_id, state)
+            return state
+
+        dynamic_pipeline = self._build_dynamic_pipeline(state)
+        has_execution = any(
+            agent_type == "execution" for _, agent_type, _, _ in dynamic_pipeline
+        )
+
+        if has_execution:
+            pre_approval_steps = [
+                entry
+                for entry in dynamic_pipeline
+                if entry[1] not in {"execution", "audit"}
+            ]
+        else:
+            pre_approval_steps = [
+                entry for entry in dynamic_pipeline if entry[1] != "audit"
+            ]
+
+        for step_name, agent_type, run_status, agent in pre_approval_steps:
+            self._apply_config_overrides(state, agent_type)
 
             state = await self._execute_step(
                 run_id, step_name, agent_type, run_status, agent, state
@@ -109,8 +131,33 @@ class RunOrchestrator:
                 state = await self._route_to_audit(run_id, state)
                 return state
 
-        # All pre-approval steps succeeded — enter approval gate
-        await self._enter_approval_gate(run_id, state)
+        if has_execution:
+            await self._enter_approval_gate(run_id, state)
+            return state
+
+        audit_step_name, audit_status, audit_agent = _AGENT_REGISTRY["audit"]
+        state = await self._execute_step(
+            run_id,
+            audit_step_name,
+            "audit",
+            audit_status,
+            audit_agent,
+            state,
+            defer_commit=True,
+        )
+
+        final_status = "failed" if state.get("error") else "completed"
+        await self._run_repo.update_status(run_id, final_status, state.get("error"))
+        if final_status == "completed":
+            await self._run_repo.mark_completed(run_id)
+
+        if self._publisher:
+            if final_status == "completed":
+                await self._publisher.run_completed("Pipeline finished successfully")
+            else:
+                await self._publisher.run_failed(state.get("error", "Unknown error"))
+
+        await self._session.commit()
         return state
 
     async def resume_after_approval(
@@ -124,10 +171,13 @@ class RunOrchestrator:
         # Load existing plan_step IDs so we can correlate audit entries
         await self._load_step_ids(run_id)
 
-        for step_name, agent_type, run_status, agent in _PIPELINE:
-            if step_name not in _POST_APPROVAL_STEPS:
-                continue
+        dynamic_pipeline = self._build_dynamic_pipeline(state)
+        post_approval_steps = [
+            entry for entry in dynamic_pipeline if entry[1] in {"execution", "audit"}
+        ]
 
+        for step_name, agent_type, run_status, agent in post_approval_steps:
+            self._apply_config_overrides(state, agent_type)
             # Defer commit for the last step so final status + step data are atomic
             is_last = step_name == "audit"
             state = await self._execute_step(
@@ -159,6 +209,111 @@ class RunOrchestrator:
         await self._session.commit()
 
         return state
+
+    def _build_dynamic_pipeline(self, state: AgentState) -> list[PipelineEntry]:
+        """Build an execution pipeline from the planner's plan_steps output.
+
+        Guardrails (non-negotiable):
+        - Risk scoring always runs before execution
+        - At least one analysis step (reconciliation or risk) must run
+        - Audit always runs last (auto-appended)
+        """
+        plan_steps = state.get("plan_steps") or []
+        sorted_steps = sorted(plan_steps, key=lambda step: step.get("order", 999))
+
+        pipeline: list[PipelineEntry] = []
+        for step in sorted_steps:
+            agent_type = step.get("agent_type")
+
+            if agent_type == "planner":
+                logger.warning(
+                    "Planner step found in plan_steps; skipping duplicate planner execution"
+                )
+                continue
+
+            if agent_type == "audit":
+                continue
+
+            if agent_type not in _AGENT_REGISTRY:
+                logger.warning(f"Unknown agent_type in plan: {agent_type}, skipping")
+                continue
+
+            step_name, run_status, agent_instance = _AGENT_REGISTRY[agent_type]
+            pipeline.append((step_name, agent_type, run_status, agent_instance))
+
+        if not pipeline:
+            return self._default_dynamic_pipeline()
+
+        pipeline = self._apply_guardrails(pipeline)
+
+        audit_step_name, audit_status, audit_agent = _AGENT_REGISTRY["audit"]
+        pipeline.append((audit_step_name, "audit", audit_status, audit_agent))
+        return pipeline
+
+    def _apply_guardrails(self, pipeline: list[PipelineEntry]) -> list[PipelineEntry]:
+        """Enforce non-negotiable ordering and presence rules."""
+        agent_types = [entry[1] for entry in pipeline]
+
+        has_risk = "risk" in agent_types
+        has_execution = "execution" in agent_types
+        has_reconciliation = "reconciliation" in agent_types
+
+        if not has_risk and not has_reconciliation:
+            logger.warning(
+                "Guardrail violation: no analysis step (reconciliation/risk). Injecting risk."
+            )
+            step_name, run_status, agent_instance = _AGENT_REGISTRY["risk"]
+            pipeline.insert(0, (step_name, "risk", run_status, agent_instance))
+            agent_types = [entry[1] for entry in pipeline]
+            has_risk = True
+
+        if has_execution and not has_risk:
+            logger.warning(
+                "Guardrail violation: execution without risk. Injecting risk before execution."
+            )
+            step_name, run_status, agent_instance = _AGENT_REGISTRY["risk"]
+            exec_idx = agent_types.index("execution")
+            pipeline.insert(exec_idx, (step_name, "risk", run_status, agent_instance))
+            agent_types = [entry[1] for entry in pipeline]
+
+        if has_execution and "risk" in agent_types:
+            risk_idx = agent_types.index("risk")
+            exec_idx = agent_types.index("execution")
+            if risk_idx > exec_idx:
+                logger.warning(
+                    "Guardrail violation: risk after execution. Reordering risk before execution."
+                )
+                risk_entry = pipeline.pop(risk_idx)
+                pipeline.insert(exec_idx, risk_entry)
+
+        return pipeline
+
+    def _default_dynamic_pipeline(self) -> list[PipelineEntry]:
+        """Fallback pipeline when the planner fails to produce usable steps."""
+        pipeline: list[PipelineEntry] = []
+        for agent_type in ("reconciliation", "risk", "execution", "audit"):
+            step_name, run_status, agent_instance = _AGENT_REGISTRY[agent_type]
+            pipeline.append((step_name, agent_type, run_status, agent_instance))
+        return pipeline
+
+    def _apply_config_overrides(self, state: AgentState, agent_type: str) -> None:
+        """Merge plan-specified config overrides into the shared state."""
+        for step in state.get("plan_steps", []):
+            if step.get("agent_type") != agent_type:
+                continue
+
+            overrides = step.get("config_overrides")
+            if not overrides:
+                return
+
+            if not isinstance(overrides, dict):
+                logger.warning(
+                    f"Invalid config_overrides for agent_type={agent_type}: expected dict"
+                )
+                return
+
+            state.update(overrides)
+            return
 
     # ------------------------------------------------------------------
     # Internal: step execution
@@ -569,18 +724,16 @@ class RunOrchestrator:
         if not self._step_ids:
             await self._load_step_ids(run_id)
 
-        for step_name, agent_type, run_status, agent in _PIPELINE:
-            if step_name != "audit":
-                continue
-            state = await self._execute_step(
-                run_id,
-                step_name,
-                agent_type,
-                run_status,
-                agent,
-                state,
-                defer_commit=True,  # Atomic with final status update below
-            )
+        step_name, run_status, agent = _AGENT_REGISTRY["audit"]
+        state = await self._execute_step(
+            run_id,
+            step_name,
+            "audit",
+            run_status,
+            agent,
+            state,
+            defer_commit=True,
+        )
 
         # Atomic: audit step data + final status in one commit
         final_status = "failed"
