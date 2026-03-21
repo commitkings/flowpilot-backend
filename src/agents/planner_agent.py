@@ -24,7 +24,18 @@ Your job: given an operator objective, USE YOUR TOOLS to gather information, the
 2. Use `query_business_config` to understand the business's risk appetite and preferences
 3. Use `check_wallet_balance` to check available funds (if the objective involves payouts)
 4. Use `get_recent_runs` to learn from past run outcomes
-5. Based on what you learn, produce a plan
+5. Use `get_historical_run_stats` to understand this business's typical payout patterns (Phase 7 memory)
+6. Based on what you learn, produce a plan
+
+## Historical Context (Phase 7 Memory):
+Always call `get_historical_run_stats` to understand this business's typical patterns.
+Use this information to:
+- Flag unusual batch sizes (significantly more/fewer candidates than avg_candidates_per_run)
+- Identify amount anomalies (amounts far outside the typical_amount_range p25-p75)
+- Note high-risk patterns (if overall_success_rate < 0.7, emphasize risk_assessment step)
+- If recurring_beneficiary_rate is high (>0.6), most payouts go to known beneficiaries
+- Include historical context in your risk_assessment field (e.g., "Historical success rate: 85%")
+- If common_failure_reasons shows patterns like "verification_failed", note extra verification may be needed
 
 ## Plan output format (your final answer must be this JSON):
 {
@@ -39,7 +50,7 @@ Your job: given an operator objective, USE YOUR TOOLS to gather information, the
     }
   ],
   "summary": "Brief plan summary explaining reasoning",
-  "risk_assessment": "Pre-execution risk notes based on wallet balance, past runs, business config",
+  "risk_assessment": "Pre-execution risk notes based on wallet balance, past runs, business config, AND historical patterns",
   "estimated_candidates": 0
 }
 
@@ -238,6 +249,98 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
             logger.error(f"get_recent_runs failed: {e}", exc_info=True)
             return {"error": str(e), "runs": []}
 
+    # ─── Tool: get_historical_run_stats (Phase 7 Memory) ───────────────────
+
+    async def get_historical_run_stats(lookback_days: int = 30) -> dict[str, Any]:
+        """
+        Get comprehensive historical run statistics for this business from the memory system.
+        
+        Queries run_outcome_memory and business_pattern_profile to provide:
+        - Run counts and success rates
+        - Typical amounts (mean, percentiles, std dev)
+        - Common failure reasons
+        - Recurring beneficiary patterns
+        
+        Use this to inform planning decisions and identify anomalies.
+        """
+        if db_session is None:
+            return {
+                "business_id": state.get("business_id"),
+                "lookback_days": lookback_days,
+                "error": "No database session available",
+            }
+
+        business_id = state.get("business_id")
+        if not business_id:
+            return {
+                "lookback_days": lookback_days,
+                "error": "No business_id in state",
+            }
+
+        try:
+            from uuid import UUID
+            from src.infrastructure.database.repositories.run_outcome_repository import (
+                RunOutcomeRepository,
+            )
+            from src.infrastructure.database.repositories.business_pattern_repository import (
+                BusinessPatternRepository,
+            )
+
+            bid = UUID(business_id) if isinstance(business_id, str) else business_id
+
+            outcome_repo = RunOutcomeRepository(db_session)
+            pattern_repo = BusinessPatternRepository(db_session)
+
+            # Get recent run stats from outcomes
+            stats = await outcome_repo.get_business_stats(bid, lookback_days)
+            
+            # Get pattern profile
+            pattern = await pattern_repo.get_profile(bid)
+
+            result = {
+                "business_id": str(bid),
+                "lookback_days": lookback_days,
+                "memory_available": True,
+                # From outcome aggregation
+                "total_runs": stats.get("total_runs", 0) if stats else 0,
+                "total_candidates": stats.get("total_candidates", 0) if stats else 0,
+                "overall_success_rate": stats.get("success_rate", 0.0) if stats else 0.0,
+                "common_failure_reasons": stats.get("failure_breakdown", {}) if stats else {},
+            }
+
+            if pattern:
+                result.update({
+                    "pattern_profile": {
+                        "avg_candidates_per_run": float(pattern.avg_candidates_per_run) if pattern.avg_candidates_per_run else None,
+                        "avg_amount_per_candidate": float(pattern.avg_amount_per_candidate) if pattern.avg_amount_per_candidate else None,
+                        "amount_std_dev": float(pattern.amount_std_dev) if pattern.amount_std_dev else None,
+                        "typical_amount_range": {
+                            "p25": float(pattern.amount_p25) if pattern.amount_p25 else None,
+                            "p50": float(pattern.amount_p50) if pattern.amount_p50 else None,
+                            "p75": float(pattern.amount_p75) if pattern.amount_p75 else None,
+                            "p95": float(pattern.amount_p95) if pattern.amount_p95 else None,
+                        },
+                        "recurring_beneficiary_rate": float(pattern.recurring_beneficiary_rate) if pattern.recurring_beneficiary_rate else None,
+                        "total_payouts": pattern.total_payouts,
+                        "total_amount_paid": float(pattern.total_amount_paid) if pattern.total_amount_paid else 0.0,
+                        "last_run_at": pattern.last_run_at.isoformat() if pattern.last_run_at else None,
+                    }
+                })
+            else:
+                result["pattern_profile"] = {
+                    "note": "No historical pattern profile for this business yet"
+                }
+
+            return result
+
+        except Exception as e:
+            logger.error(f"get_historical_run_stats failed: {e}", exc_info=True)
+            return {
+                "business_id": str(business_id) if business_id else None,
+                "lookback_days": lookback_days,
+                "error": str(e),
+            }
+
     return [
         Tool(
             name="check_available_data",
@@ -270,6 +373,26 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
                 ),
             ],
             execute=get_recent_runs,
+        ),
+        Tool(
+            name="get_historical_run_stats",
+            description=(
+                "Get comprehensive historical statistics for this business from the memory system including "
+                "success rates, failure patterns, typical payout amounts (mean, percentiles), and recurring "
+                "beneficiary patterns. Use this to inform planning decisions and identify anomalies in the "
+                "current batch. If avg_candidates_per_run or amount ranges differ significantly from the "
+                "current request, flag it in risk_assessment."
+            ),
+            parameters=[
+                ToolParam(
+                    name="lookback_days",
+                    param_type=ToolParamType.INTEGER,
+                    description="Number of days to look back for statistics (default: 30)",
+                    required=False,
+                    default=30,
+                ),
+            ],
+            execute=get_historical_run_stats,
         ),
     ]
 

@@ -86,6 +86,15 @@ You may adjust the final score by ±0.1 if you identify factors the model missed
 - **days_since_last_payout**: Very recent payout to same account (< 7 days)
 - **account_age_factor**: New accounts (first seen < 30 days ago) get slight premium
 
+## Memory-Aware Risk Assessment (Phase 7):
+For each candidate, call `get_beneficiary_reputation` to check their historical payout reputation.
+Factor the reputation score into your risk assessment:
+- Beneficiaries with success_rate < 0.5 should receive elevated risk scores (+0.1 to +0.2)
+- Beneficiaries with failed_payouts > 2 and last_failure_reason containing "verification" are high risk
+- New beneficiaries (not found in memory) should be flagged for extra verification
+- Consider last_failure_reason when similar patterns might recur
+- Beneficiaries with reputation_score > 0.8 and successful_payouts > 5 can receive slight risk reduction (-0.05)
+
 ## Final Answer Format (JSON):
 {
   "scored_candidates": [
@@ -929,6 +938,72 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
 
         return result
 
+    # ─── Tool 9: get_beneficiary_reputation (Phase 7 Memory) ───────────────
+
+    async def get_beneficiary_reputation(account_number: str, bank_code: str) -> dict[str, Any]:
+        """
+        Query historical reputation for a beneficiary from the memory system.
+        
+        This queries the beneficiary_reputation table which aggregates outcomes
+        across all past payout attempts to this account, providing:
+        - Success rate and payout counts
+        - Reputation score (0-1 Bayesian estimate)
+        - Last outcome and failure reason
+        - Average payout amount
+        
+        Use this to factor historical performance into risk scoring.
+        """
+        if not db_session:
+            return {
+                "found": False,
+                "account_number": account_number,
+                "bank_code": bank_code,
+                "error": "No database session available",
+            }
+
+        try:
+            from src.infrastructure.database.repositories.beneficiary_reputation_repository import (
+                BeneficiaryReputationRepository,
+            )
+
+            repo = BeneficiaryReputationRepository(db_session)
+            rep = await repo.get_reputation(account_number, bank_code)
+
+            if not rep:
+                return {
+                    "found": False,
+                    "account_number": account_number,
+                    "bank_code": bank_code,
+                    "message": "No historical data for this beneficiary",
+                }
+
+            return {
+                "found": True,
+                "account_number": account_number,
+                "bank_code": bank_code,
+                "beneficiary_name": rep.beneficiary_name,
+                "total_attempts": rep.total_attempts,
+                "successful_payouts": rep.successful_payouts,
+                "failed_payouts": rep.failed_payouts,
+                "success_rate": float(rep.success_rate) if rep.success_rate else 0.0,
+                "reputation_score": float(rep.reputation_score) if rep.reputation_score else 0.5,
+                "last_outcome": rep.last_outcome,
+                "last_failure_reason": rep.last_failure_reason,
+                "last_payout_at": rep.last_payout_at.isoformat() if rep.last_payout_at else None,
+                "total_amount_paid": float(rep.total_amount_paid) if rep.total_amount_paid else 0.0,
+                "average_amount": float(rep.average_amount) if rep.average_amount else None,
+                "first_seen_at": rep.first_seen_at.isoformat() if rep.first_seen_at else None,
+            }
+
+        except Exception as e:
+            logger.warning(f"Reputation lookup failed for {account_number}: {e}")
+            return {
+                "found": False,
+                "account_number": account_number,
+                "bank_code": bank_code,
+                "error": str(e),
+            }
+
     # ─── Build and return tools ────────────────────────────────────────────
 
     return [
@@ -1042,6 +1117,30 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 ),
             ],
             execute=lookup_beneficiary_history,
+        ),
+        Tool(
+            name="get_beneficiary_reputation",
+            description=(
+                "Query historical payout reputation for a beneficiary by account number and bank code. "
+                "Returns success rate, failure patterns, reputation score (0-1), and payout history. "
+                "Use this to factor historical performance into risk scoring. "
+                "Beneficiaries with success_rate < 0.5 or low reputation_score should receive elevated risk."
+            ),
+            parameters=[
+                ToolParam(
+                    name="account_number",
+                    param_type=ToolParamType.STRING,
+                    description="Beneficiary account number",
+                    required=True,
+                ),
+                ToolParam(
+                    name="bank_code",
+                    param_type=ToolParamType.STRING,
+                    description="Bank code (institution code)",
+                    required=True,
+                ),
+            ],
+            execute=get_beneficiary_reputation,
         ),
     ]
 

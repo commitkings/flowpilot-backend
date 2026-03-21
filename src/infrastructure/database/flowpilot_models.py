@@ -1302,6 +1302,166 @@ class ConversationMessageModel(Base):
 
 
 # =========================================================================== #
+#  MEMORY & LEARNING (3 tables) — Phase 7
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# 24. run_outcome_memory — per-candidate outcomes from each run
+# --------------------------------------------------------------------------- #
+class RunOutcomeMemoryModel(Base):
+    __tablename__ = "run_outcome_memory"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="CASCADE"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+    )
+    candidate_account_number: Mapped[str] = mapped_column(String(20))
+    candidate_bank_code: Mapped[str] = mapped_column(String(10))
+    candidate_name: Mapped[Optional[str]] = mapped_column(String(255))
+    amount: Mapped[Decimal] = mapped_column(Numeric(15, 2))
+    outcome: Mapped[str] = mapped_column(String(20))  # success, failed, rejected, pending
+    failure_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    risk_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
+    risk_decision: Mapped[Optional[str]] = mapped_column(String(20))
+    execution_duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('success', 'failed', 'rejected', 'pending', 'skipped')",
+            name="run_outcome_memory_outcome_check",
+        ),
+        CheckConstraint(
+            "risk_score IS NULL OR (risk_score >= 0.0000 AND risk_score <= 1.0000)",
+            name="run_outcome_memory_risk_score_check",
+        ),
+        Index("run_outcome_memory_account_bank_idx", "candidate_account_number", "candidate_bank_code"),
+        Index("run_outcome_memory_business_id_idx", "business_id"),
+        Index("run_outcome_memory_outcome_idx", "outcome"),
+        Index("run_outcome_memory_run_id_idx", "run_id"),
+        Index("run_outcome_memory_created_at_idx", "created_at", postgresql_using="brin"),
+    )
+
+    agent_run: Mapped["AgentRunModel"] = relationship()
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 25. beneficiary_reputation — aggregated per-account reputation
+# --------------------------------------------------------------------------- #
+class BeneficiaryReputationModel(Base):
+    __tablename__ = "beneficiary_reputation"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    account_number: Mapped[str] = mapped_column(String(20))
+    bank_code: Mapped[str] = mapped_column(String(10))
+    beneficiary_name: Mapped[Optional[str]] = mapped_column(String(255))
+    total_attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    successful_payouts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    failed_payouts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    success_rate: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), server_default=text("0.0000")
+    )
+    total_amount_paid: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), server_default=text("0.00")
+    )
+    average_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    last_outcome: Mapped[Optional[str]] = mapped_column(String(20))
+    last_failure_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    last_payout_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    reputation_score: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), server_default=text("0.5000")
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        UniqueConstraint("account_number", "bank_code", name="beneficiary_reputation_account_bank_uq"),
+        CheckConstraint(
+            "success_rate >= 0.0000 AND success_rate <= 1.0000",
+            name="beneficiary_reputation_success_rate_check",
+        ),
+        CheckConstraint(
+            "reputation_score >= 0.0000 AND reputation_score <= 1.0000",
+            name="beneficiary_reputation_score_check",
+        ),
+        Index("beneficiary_reputation_reputation_idx", "reputation_score"),
+        Index("beneficiary_reputation_success_rate_idx", "success_rate"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 26. business_pattern_profile — learned patterns per business
+# --------------------------------------------------------------------------- #
+class BusinessPatternProfileModel(Base):
+    __tablename__ = "business_pattern_profile"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    total_runs: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    total_payouts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    total_amount_paid: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), server_default=text("0.00")
+    )
+    avg_candidates_per_run: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    avg_amount_per_candidate: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    amount_std_dev: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    amount_p25: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    amount_p50: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    amount_p75: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    amount_p95: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2))
+    overall_success_rate: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), server_default=text("0.0000")
+    )
+    common_failure_reasons: Mapped[dict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb")
+    )
+    recurring_beneficiary_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "overall_success_rate >= 0.0000 AND overall_success_rate <= 1.0000",
+            name="business_pattern_profile_success_rate_check",
+        ),
+        Index("business_pattern_profile_business_id_idx", "business_id"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# =========================================================================== #
 #  Backward-compatibility aliases (for existing imports)
 # =========================================================================== #
 OperatorModel = UserModel

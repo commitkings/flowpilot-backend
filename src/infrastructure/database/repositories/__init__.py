@@ -1,5 +1,11 @@
 from src.infrastructure.database.repositories.audit_repository import AuditRepository
 from src.infrastructure.database.repositories.batch_repository import BatchRepository
+from src.infrastructure.database.repositories.beneficiary_reputation_repository import (
+    BeneficiaryReputationRepository,
+)
+from src.infrastructure.database.repositories.business_pattern_repository import (
+    BusinessPatternRepository,
+)
 from src.infrastructure.database.repositories.candidate_repository import (
     CandidateRepository,
 )
@@ -27,6 +33,9 @@ from src.infrastructure.database.repositories.risk_feature_repository import (
 from src.infrastructure.database.repositories.run_event_repository import (
     RunEventRepository,
 )
+from src.infrastructure.database.repositories.run_outcome_repository import (
+    RunOutcomeRepository,
+)
 from src.infrastructure.database.repositories.run_repository import RunRepository
 from src.infrastructure.database.repositories.transaction_repository import (
     TransactionRepository,
@@ -36,6 +45,8 @@ from src.infrastructure.database.repositories.user_repository import UserReposit
 __all__ = [
     "AuditRepository",
     "BatchRepository",
+    "BeneficiaryReputationRepository",
+    "BusinessPatternRepository",
     "CandidateRepository",
     "ConversationRepository",
     "ExecutionDetailRepository",
@@ -45,6 +56,7 @@ __all__ = [
     "PlanStepRepository",
     "RiskFeatureRepository",
     "RunEventRepository",
+    "RunOutcomeRepository",
     "RunRepository",
     "TransactionRepository",
     "UserRepository",

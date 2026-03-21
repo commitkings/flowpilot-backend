@@ -34,9 +34,12 @@ from src.agents.event_publisher import EventPublisher, EventType
 from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
+    BeneficiaryReputationRepository,
+    BusinessPatternRepository,
     CandidateRepository,
     ExecutionDetailRepository,
     PlanStepRepository,
+    RunOutcomeRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -150,6 +153,7 @@ class RunOrchestrator:
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
         if final_status == "completed":
             await self._run_repo.mark_completed(run_id)
+            await self._persist_run_outcomes(run_id, state)
 
         if self._publisher:
             if final_status == "completed":
@@ -199,6 +203,7 @@ class RunOrchestrator:
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
         if final_status == "completed":
             await self._run_repo.mark_completed(run_id)
+            await self._persist_run_outcomes(run_id, state)
 
         if self._publisher:
             if final_status == "completed":
@@ -744,6 +749,103 @@ class RunOrchestrator:
 
         await self._session.commit()
         return state
+
+    # ------------------------------------------------------------------
+    # Internal: Memory persistence (Phase 7)
+    # ------------------------------------------------------------------
+
+    async def _persist_run_outcomes(
+        self, run_id: uuid.UUID, state: AgentState
+    ) -> None:
+        """Persist structured outcomes after run completion for memory/learning.
+
+        This hook extracts candidate outcomes from state, stores them in
+        run_outcome_memory, updates beneficiary reputations, and refreshes
+        business pattern profiles.
+        """
+        business_id = state.get("business_id")
+        if not business_id:
+            logger.warning(f"Run {run_id}: no business_id in state, skipping outcome persistence")
+            return
+
+        outcome_repo = RunOutcomeRepository(self._session)
+        reputation_repo = BeneficiaryReputationRepository(self._session)
+        pattern_repo = BusinessPatternRepository(self._session)
+
+        scored_candidates = state.get("scored_candidates", [])
+        exec_results = state.get("candidate_execution_results", [])
+        lookup_results = state.get("candidate_lookup_results", [])
+
+        exec_by_id = {er.get("candidate_id"): er for er in exec_results}
+        lookup_by_id = {lr.get("candidate_id"): lr for lr in lookup_results}
+
+        outcomes = []
+        for candidate in scored_candidates:
+            cid = candidate.get("candidate_id")
+            exec_result = exec_by_id.get(cid, {})
+            lookup_result = lookup_by_id.get(cid, {})
+
+            exec_status = exec_result.get("execution_status", "")
+            lookup_status = lookup_result.get("lookup_status", "")
+
+            if exec_status == "success":
+                outcome = "success"
+                failure_reason = None
+            elif exec_status == "failed":
+                outcome = "failed"
+                failure_reason = exec_result.get("response_message") or "execution_failed"
+            elif lookup_status == "failed":
+                outcome = "failed"
+                failure_reason = "verification_failed"
+            elif lookup_status == "name_mismatch":
+                outcome = "rejected"
+                failure_reason = "name_mismatch"
+            elif candidate.get("risk_decision") == "block":
+                outcome = "rejected"
+                failure_reason = "risk_blocked"
+            elif exec_status == "pending":
+                outcome = "pending"
+                failure_reason = None
+            else:
+                outcome = "pending"
+                failure_reason = None
+
+            outcomes.append({
+                "candidate_account_number": candidate.get("account_number", ""),
+                "candidate_bank_code": candidate.get("institution_code", ""),
+                "candidate_name": candidate.get("beneficiary_name"),
+                "amount": candidate.get("amount", 0),
+                "outcome": outcome,
+                "failure_reason": failure_reason,
+                "risk_score": candidate.get("risk_score"),
+                "risk_decision": candidate.get("risk_decision"),
+                "execution_duration_ms": None,
+            })
+
+        if not outcomes:
+            logger.debug(f"Run {run_id}: no candidates to persist")
+            return
+
+        try:
+            await outcome_repo.create_batch(run_id, business_id, outcomes)
+            logger.info(f"Run {run_id}: persisted {len(outcomes)} outcome(s)")
+
+            for outcome_data in outcomes:
+                if outcome_data["outcome"] in ("success", "failed", "rejected"):
+                    await reputation_repo.upsert_reputation(
+                        account_number=outcome_data["candidate_account_number"],
+                        bank_code=outcome_data["candidate_bank_code"],
+                        outcome=outcome_data["outcome"],
+                        amount=outcome_data["amount"],
+                        name=outcome_data["candidate_name"],
+                        failure_reason=outcome_data["failure_reason"],
+                    )
+
+            await pattern_repo.update_profile(business_id)
+            logger.debug(f"Run {run_id}: updated business pattern profile")
+
+        except Exception as e:
+            logger.error(f"Run {run_id}: failed to persist outcomes: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Internal: audit entry persistence with step_id correlation
