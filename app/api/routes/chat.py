@@ -38,6 +38,8 @@ class ChatSendRequest(BaseModel):
 
 
 class ChatMessageResponse(BaseModel):
+    id: str
+    conversation_id: str
     role: str
     content: str
     intent: Optional[str] = None
@@ -293,6 +295,8 @@ async def get_conversation(
         message_count=conv.message_count,
         messages=[
             ChatMessageResponse(
+                id=str(m.id),
+                conversation_id=str(m.conversation_id),
                 role=m.role,
                 content=m.content,
                 intent=m.intent_classification,
@@ -305,6 +309,30 @@ async def get_conversation(
         created_at=conv.created_at.isoformat(),
         updated_at=conv.updated_at.isoformat(),
     )
+
+
+@router.delete("/chat/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Permanently delete a conversation and all its messages."""
+    conv_uuid = _parse_uuid(conversation_id, "conversation_id")
+    conv_repo = ConversationRepository(session)
+    conv = await conv_repo.get_by_id(conv_uuid)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your conversation")
+    if conv.status == "completed" and conv.run_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a completed conversation linked to a run",
+        )
+    await conv_repo.delete(conv_uuid)
+    await session.commit()
+    return {"deleted": True}
 
 
 @router.post(

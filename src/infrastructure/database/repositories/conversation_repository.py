@@ -138,3 +138,22 @@ class ConversationRepository:
         )
         result = await self._s.execute(stmt)
         return list(result.scalars().all())
+
+    async def delete(self, conversation_id: uuid.UUID) -> bool:
+        """Permanently delete a conversation and all its messages."""
+        from sqlalchemy import delete as sa_delete
+
+        # Delete messages first (child rows)
+        await self._s.execute(
+            sa_delete(ConversationMessageModel).where(
+                ConversationMessageModel.conversation_id == conversation_id
+            )
+        )
+        # Delete conversation
+        result = await self._s.execute(
+            sa_delete(ConversationModel).where(
+                ConversationModel.id == conversation_id
+            )
+        )
+        await self._s.flush()
+        return result.rowcount > 0
