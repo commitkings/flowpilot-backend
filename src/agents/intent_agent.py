@@ -570,10 +570,13 @@ Latest user message: "{user_message}"
 
 Classify the intent of the latest user message."""
 
+        FAST_MODEL = "llama-3.1-8b-instant"
+
         raw = await self.llm_json_call(
             system_prompt=CLASSIFY_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.0,
+            model=FAST_MODEL,
         )
 
         try:
@@ -612,6 +615,7 @@ Extract any NEW payout run parameters from the latest message. Do not re-extract
             system_prompt=EXTRACT_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.0,
+            model="llama-3.1-8b-instant",
         )
 
         try:

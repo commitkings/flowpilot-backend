@@ -8,7 +8,6 @@ from src.agents.tools import (
     ToolResult,
 )
 from src.agents.intent_agent import IntentAgent
-from src.agents.graph import build_flowpilot_graph
 
 __all__ = [
     "AgentState",
@@ -19,5 +18,4 @@ __all__ = [
     "ToolCall",
     "ToolResult",
     "IntentAgent",
-    "build_flowpilot_graph",
 ]
