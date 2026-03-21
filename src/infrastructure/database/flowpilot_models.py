@@ -1461,6 +1461,43 @@ class BusinessPatternProfileModel(Base):
     business: Mapped["BusinessModel"] = relationship()
 
 
+# --------------------------------------------------------------------------- #
+# 27. run_memory_digest — long-term textual recall per completed run
+# --------------------------------------------------------------------------- #
+class RunMemoryDigestModel(Base):
+    __tablename__ = "run_memory_digest"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+    )
+    objective: Mapped[str] = mapped_column(Text)
+    digest_summary: Mapped[str] = mapped_column(Text)
+    candidate_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    blocked_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    failed_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("run_memory_digest_business_id_idx", "business_id"),
+    )
+
+    agent_run: Mapped["AgentRunModel"] = relationship()
+    business: Mapped["BusinessModel"] = relationship()
+
+
 # =========================================================================== #
 #  Backward-compatibility aliases (for existing imports)
 # =========================================================================== #

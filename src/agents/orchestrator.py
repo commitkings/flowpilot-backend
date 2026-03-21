@@ -40,6 +40,7 @@ from src.infrastructure.database.repositories import (
     ExecutionDetailRepository,
     PlanStepRepository,
     RunOutcomeRepository,
+    RunMemoryDigestRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -60,6 +61,8 @@ _AGENT_REGISTRY: dict[str, AgentRegistryEntry] = {
     "planner": ("plan", "planning", _planner),
     "reconciliation": ("reconcile", "reconciling", _reconciliation),
     "risk": ("risk", "scoring", _risk),
+    # "forecast" is allowed by DB schema / AgentType enum but has no agent impl yet.
+    # If the planner emits a forecast step, _build_dynamic_pipeline logs a warning and skips it.
     "execution": ("execute", "executing", _execution),
     "audit": ("audit", None, _audit),
 }
@@ -843,6 +846,35 @@ class RunOrchestrator:
 
             await pattern_repo.update_profile(business_id)
             logger.debug(f"Run {run_id}: updated business pattern profile")
+
+            digest_repo = RunMemoryDigestRepository(self._session)
+            objective = str(state.get("objective") or "")
+            blocked_n = sum(
+                1
+                for o in outcomes
+                if (o.get("risk_decision") == "block")
+                or (o.get("outcome") == "rejected")
+            )
+            failed_n = sum(1 for o in outcomes if o.get("outcome") == "failed")
+            summary = (
+                f"{objective[:2000]} | Candidates: {len(outcomes)}. "
+                f"Blocked/rejected: {blocked_n}. Failed payout: {failed_n}."
+            )
+            bid = (
+                uuid.UUID(str(business_id))
+                if not isinstance(business_id, uuid.UUID)
+                else business_id
+            )
+            await digest_repo.upsert_for_run(
+                run_id,
+                bid,
+                objective,
+                summary,
+                len(outcomes),
+                blocked_n,
+                failed_n,
+            )
+            logger.debug(f"Run {run_id}: persisted run memory digest")
 
         except Exception as e:
             logger.error(f"Run {run_id}: failed to persist outcomes: {e}", exc_info=True)

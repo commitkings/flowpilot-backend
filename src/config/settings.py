@@ -202,6 +202,11 @@ class Settings:
         return warnings
 
     # ------------------------------------------------------------------
+    # Redis (short-term working memory mirror for chat)
+    # ------------------------------------------------------------------
+    REDIS_URL: Optional[str] = os.getenv("REDIS_URL", "").strip() or None
+
+    # ------------------------------------------------------------------
     # Groq API (LLM)
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")

@@ -200,18 +200,6 @@ class ToolRegistry:
             )
             return ToolResult(
                 tool_name=call.tool_name,
-                success=True,
-                data=result_data,
-                duration_ms=elapsed_ms,
-            )
-        except Exception as e:
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
-            logger.error(
-                f"Tool '{call.tool_name}' failed after {elapsed_ms}ms: {e}",
-                exc_info=True,
-            )
-            return ToolResult(
-                tool_name=call.tool_name,
                 success=False,
                 error=str(e),
                 duration_ms=elapsed_ms,

@@ -54,14 +54,15 @@ RISK_SYSTEM_PROMPT = """You are a financial risk analyst reviewing pre-computed 
 
 ## Your Workflow:
 1. Call `get_risk_thresholds` to understand this business's risk configuration and weights
-2. Call `compute_risk_features` to get statistical features for ALL candidates at once
-3. For candidates with elevated risk signals (high z-score, duplicate flags, velocity flags):
+2. Optionally call `search_similar_run_memories` with keywords from the run objective (e.g. payroll, December) to see how similar past runs performed
+3. Call `compute_risk_features` to get statistical features for ALL candidates at once
+4. For candidates with elevated risk signals (high z-score, duplicate flags, velocity flags):
    - Call `compute_velocity_features` to get 7-day and 30-day payout history
    - Call `cross_reference_beneficiaries` if name patterns look suspicious
    - Call `detect_round_number_bias` for suspiciously round amounts
-4. Call `compute_weighted_risk_score` for each candidate to get the computed weighted score
-5. Review the computed score and features. You may adjust the score by ±0.1 with written justification.
-6. Call `score_candidate` to finalize each candidate's risk assessment
+5. Call `compute_weighted_risk_score` for each candidate to get the computed weighted score
+6. Review the computed score and features. You may adjust the score by ±0.1 with written justification.
+7. Call `score_candidate` to finalize each candidate's risk assessment
 
 ## Guardrails (you CANNOT override these — they are enforced by the system):
 - If amount > budget_cap: decision MUST be "block"
@@ -1004,6 +1005,26 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "error": str(e),
             }
 
+    async def search_similar_run_memories(search_query: str) -> dict[str, Any]:
+        if db_session is None:
+            return {"error": "No database session", "matches": []}
+        bid = state.get("business_id")
+        if not bid:
+            return {"error": "No business_id in state", "matches": []}
+        try:
+            from uuid import UUID
+
+            from src.infrastructure.database.repositories.run_memory_digest_repository import (
+                RunMemoryDigestRepository,
+            )
+
+            repo = RunMemoryDigestRepository(db_session)
+            rows = await repo.search_similar(UUID(str(bid)), search_query, limit=5)
+            return {"matches": rows}
+        except Exception as e:
+            logger.warning(f"search_similar_run_memories failed: {e}")
+            return {"error": str(e), "matches": []}
+
     # ─── Build and return tools ────────────────────────────────────────────
 
     return [
@@ -1141,6 +1162,22 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 ),
             ],
             execute=get_beneficiary_reputation,
+        ),
+        Tool(
+            name="search_similar_run_memories",
+            description=(
+                "Long-term memory: find past runs whose objective/summary matches a phrase "
+                "(e.g. payroll, December, vendor). Use to spot recurring patterns and failures."
+            ),
+            parameters=[
+                ToolParam(
+                    name="search_query",
+                    param_type=ToolParamType.STRING,
+                    description="Phrase to match against past run objectives and digests",
+                    required=True,
+                ),
+            ],
+            execute=search_similar_run_memories,
         ),
     ]
 

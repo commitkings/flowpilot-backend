@@ -173,6 +173,7 @@ def _build_intent_tools(
     business_id: str,
     user_id: str,
     db_session,
+    conversation_id: Optional[str] = None,
 ) -> list[Tool]:
     async def get_business_info() -> dict:
         try:
@@ -221,7 +222,10 @@ def _build_intent_tools(
             import uuid
 
             repo = RunRepository(db_session)
-            runs, total = await repo.list_all(limit=min(limit, 10), offset=0)
+            bid = uuid.UUID(business_id)
+            runs, total = await repo.list_by_business(
+                bid, limit=min(limit, 10), offset=0
+            )
             return {
                 "total_runs": total,
                 "recent_runs": [
@@ -238,6 +242,36 @@ def _build_intent_tools(
             }
         except Exception as e:
             logger.error(f"get_recent_runs failed: {e}")
+            return {"error": str(e)}
+
+    async def get_working_memory_turns() -> dict:
+        if not conversation_id:
+            return {"note": "No conversation scope", "turns": []}
+        try:
+            from src.infrastructure.memory.redis_working_memory import (
+                get_recent_turns,
+            )
+
+            turns = await get_recent_turns(conversation_id, limit=24)
+            return {"turn_count": len(turns), "turns": turns}
+        except Exception as e:
+            logger.error(f"get_working_memory_turns failed: {e}")
+            return {"error": str(e)}
+
+    async def search_similar_run_memory(search_query: str) -> dict:
+        try:
+            import uuid as uuid_mod
+
+            from src.infrastructure.database.repositories.run_memory_digest_repository import (
+                RunMemoryDigestRepository,
+            )
+
+            repo = RunMemoryDigestRepository(db_session)
+            bid = uuid_mod.UUID(business_id)
+            rows = await repo.search_similar(bid, search_query, limit=5)
+            return {"matches": rows}
+        except Exception as e:
+            logger.error(f"search_similar_run_memory failed: {e}", exc_info=True)
             return {"error": str(e)}
 
     async def validate_institution(code: str) -> dict:
@@ -289,6 +323,53 @@ def _build_intent_tools(
             logger.error(f"list_institutions failed: {e}")
             return {"error": str(e)}
 
+    async def get_last_candidates(limit_runs: int = 15) -> dict:
+        """Candidates from the most recent run that had payout rows (for chat context)."""
+        try:
+            import uuid as uuid_mod
+
+            from src.infrastructure.database.repositories.candidate_repository import (
+                CandidateRepository,
+            )
+            from src.infrastructure.database.repositories.run_repository import (
+                RunRepository,
+            )
+
+            bid = uuid_mod.UUID(business_id)
+            run_repo = RunRepository(db_session)
+            cand_repo = CandidateRepository(db_session)
+            runs, _ = await run_repo.list_by_business(bid, limit=limit_runs, offset=0)
+            for run in runs:
+                rows = await cand_repo.get_by_run(run.id)
+                if not rows:
+                    continue
+                out = []
+                for c in rows[:100]:
+                    out.append(
+                        {
+                            "institution_code": c.institution_code,
+                            "beneficiary_name": c.beneficiary_name,
+                            "account_number": c.account_number,
+                            "amount": float(c.amount) if c.amount is not None else 0.0,
+                            "purpose": c.purpose or "",
+                        }
+                    )
+                return {
+                    "source_run_id": str(run.id),
+                    "objective": run.objective,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                    "candidate_count": len(rows),
+                    "candidates": out,
+                }
+            return {
+                "candidate_count": 0,
+                "candidates": [],
+                "note": "No previous runs with payout candidates for this business.",
+            }
+        except Exception as e:
+            logger.error(f"get_last_candidates failed: {e}", exc_info=True)
+            return {"error": str(e)}
+
     return [
         Tool(
             name="get_business_info",
@@ -311,6 +392,25 @@ def _build_intent_tools(
             execute=lambda **kw: get_recent_runs(limit=kw.get("limit", 5)),
         ),
         Tool(
+            name="get_last_candidates",
+            description=(
+                "Load beneficiary candidates from the most recent run that had payout rows "
+                "(count + list for context or re-use suggestions)"
+            ),
+            parameters=[
+                ToolParam(
+                    name="limit_runs",
+                    param_type=ToolParamType.INTEGER,
+                    description="How many recent runs to scan for candidates (default 15)",
+                    required=False,
+                    default=15,
+                ),
+            ],
+            execute=lambda **kw: get_last_candidates(
+                limit_runs=int(kw.get("limit_runs", 15))
+            ),
+        ),
+        Tool(
             name="validate_institution",
             description="Check if a bank/institution code is valid in the system",
             parameters=[
@@ -329,6 +429,33 @@ def _build_intent_tools(
             parameters=[],
             execute=lambda **_kw: list_institutions(),
         ),
+        Tool(
+            name="get_working_memory_turns",
+            description=(
+                "Short-term memory: recent user/assistant turns for this chat "
+                "(Redis mirror; use for continuity)"
+            ),
+            parameters=[],
+            execute=lambda **_kw: get_working_memory_turns(),
+        ),
+        Tool(
+            name="search_similar_run_memory",
+            description=(
+                "Long-term memory: find past completed runs similar to a phrase "
+                "(objective + digest summary; pg_trgm similarity)"
+            ),
+            parameters=[
+                ToolParam(
+                    name="search_query",
+                    param_type=ToolParamType.STRING,
+                    description="Natural language: e.g. December payroll, vendor batch",
+                    required=True,
+                ),
+            ],
+            execute=lambda **kw: search_similar_run_memory(
+                search_query=str(kw.get("search_query", ""))
+            ),
+        ),
     ]
 
 
@@ -344,21 +471,34 @@ class IntentAgent(BaseAgent):
         business_id: str,
         user_id: str,
         db_session=None,
+        conversation_id: Optional[str] = None,
     ) -> dict:
         self.registry = ToolRegistry()
+        history_for_llm = conversation_history
+        if conversation_id and db_session:
+            from src.infrastructure.memory.redis_working_memory import (
+                get_recent_turns,
+            )
+
+            stm = await get_recent_turns(conversation_id)
+            if stm and len(stm) >= len(conversation_history):
+                history_for_llm = stm
+
         if db_session:
-            tools = _build_intent_tools(business_id, user_id, db_session)
+            tools = _build_intent_tools(
+                business_id, user_id, db_session, conversation_id=conversation_id
+            )
             for tool in tools:
                 self.registry.register(tool)
 
-        classification = await self._classify_intent(user_message, conversation_history)
+        classification = await self._classify_intent(user_message, history_for_llm)
         intent = classification.get("intent", "unclear")
         confidence = classification.get("confidence", 0.0)
 
         extracted = {}
         if intent == "create_payout_run":
             extraction = await self._extract_slots(
-                user_message, conversation_history, current_slots
+                user_message, history_for_llm, current_slots
             )
             extracted = extraction.get("extracted", {})
 
@@ -369,7 +509,7 @@ class IntentAgent(BaseAgent):
 
         response_text = await self._generate_response(
             user_message=user_message,
-            conversation_history=conversation_history,
+            conversation_history=history_for_llm,
             intent=intent,
             slots=merged_slots,
             business_id=business_id,

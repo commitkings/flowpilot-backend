@@ -36,6 +36,9 @@ from src.infrastructure.database.repositories.run_event_repository import (
 from src.infrastructure.database.repositories.run_outcome_repository import (
     RunOutcomeRepository,
 )
+from src.infrastructure.database.repositories.run_memory_digest_repository import (
+    RunMemoryDigestRepository,
+)
 from src.infrastructure.database.repositories.run_repository import RunRepository
 from src.infrastructure.database.repositories.transaction_repository import (
     TransactionRepository,
@@ -57,6 +60,7 @@ __all__ = [
     "RiskFeatureRepository",
     "RunEventRepository",
     "RunOutcomeRepository",
+    "RunMemoryDigestRepository",
     "RunRepository",
     "TransactionRepository",
     "UserRepository",

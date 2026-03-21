@@ -22,6 +22,7 @@ from src.infrastructure.database.repositories import (
     InstitutionRepository,
     RunRepository,
 )
+from src.infrastructure.memory.redis_working_memory import append_turn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -137,6 +138,7 @@ async def chat_send(
         content=request.message,
     )
     await session.commit()
+    await append_turn(str(conv.id), "user", request.message)
 
     messages = await conv_repo.get_messages(conv.id)
     history = [{"role": m.role, "content": m.content} for m in messages[:-1]]
@@ -152,6 +154,7 @@ async def chat_send(
             business_id=request.business_id,
             user_id=str(user_id),
             db_session=session,
+            conversation_id=str(conv.id),
         )
     except Exception as e:
         logger.error(f"IntentAgent failed: {e}", exc_info=True)
@@ -215,6 +218,7 @@ async def chat_send(
         title=title,
     )
     await session.commit()
+    await append_turn(str(conv.id), "assistant", response_text)
 
     return ChatSendResponse(
         conversation_id=str(conv.id),
@@ -509,8 +513,8 @@ async def confirm_and_create_run(
                 async with factory() as update_session:
                     update_conv_repo = ConversationRepository(update_session)
                     conv_status = (
-                        "completed"
-                        if final_status in ("completed", "awaiting_approval")
+                        "awaiting_approval"
+                        if final_status == "awaiting_approval"
                         else "completed"
                     )
                     await update_conv_repo.update_conversation(
