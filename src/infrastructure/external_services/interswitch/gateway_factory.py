@@ -26,6 +26,14 @@ def get_payout_gateway() -> PayoutGateway:
         )
         _cached_gateway = LivePayoutGateway()
         logger.info("PayoutGateway: LIVE mode — real Interswitch calls enabled")
+    elif mode == "lookup_only":
+        from src.infrastructure.external_services.interswitch.hybrid_gateway import (
+            HybridPayoutGateway,
+        )
+        _cached_gateway = HybridPayoutGateway()
+        logger.info(
+            "PayoutGateway: LOOKUP_ONLY mode — real account verification, simulated payouts"
+        )
     else:
         from src.infrastructure.external_services.interswitch.simulated_gateway import (
             SimulatedPayoutGateway,

@@ -139,6 +139,23 @@ class Settings:
     INTERSWITCH_PAYOUTS_BASE_URL: str = os.getenv(
         "INTERSWITCH_PAYOUTS_BASE_URL", "https://api.interswitchng.com"
     )
+    # Transaction Search (Quick / Reference Search) — see docs:
+    # https://docs.interswitchgroup.com/docs/quick-search
+    INTERSWITCH_TRANSACTION_SEARCH_BASE_URL: str = os.getenv(
+        "INTERSWITCH_TRANSACTION_SEARCH_BASE_URL",
+        "https://switch-online-gateway-service.k9.isw.la",
+    )
+    # Transaction Search passport (auth endpoint) — separate from main QA Passport
+    # https://docs.interswitchgroup.com/docs/transactionapi-authentication
+    INTERSWITCH_TRANSACTION_SEARCH_PASSPORT_URL: str = os.getenv(
+        "INTERSWITCH_TRANSACTION_SEARCH_PASSPORT_URL",
+        "https://passport-v2.k8.isw.la",
+    )
+    # Bank Account Verification (Marketplace routing)
+    INTERSWITCH_BAV_BASE_URL: str = os.getenv(
+        "INTERSWITCH_BAV_BASE_URL",
+        "https://api-marketplace-routing.k8.isw.la",
+    )
     INTERSWITCH_CLIENT_ID: Optional[str] = os.getenv("INTERSWITCH_CLIENT_ID")
     INTERSWITCH_CLIENT_SECRET: Optional[str] = os.getenv("INTERSWITCH_CLIENT_SECRET")
     INTERSWITCH_MERCHANT_ID: str = os.getenv("INTERSWITCH_MERCHANT_ID", "")
@@ -148,7 +165,7 @@ class Settings:
     INTERSWITCH_SOURCE_ACCOUNT_ID: str = os.getenv("INTERSWITCH_SOURCE_ACCOUNT_ID", "")
     INTERSWITCH_TERMINAL_ID: str = os.getenv("INTERSWITCH_TERMINAL_ID", "3PBL0001")
 
-    _VALID_PAYOUT_MODES = ("simulated", "live")
+    _VALID_PAYOUT_MODES = ("simulated", "lookup_only", "live")
     PAYOUT_MODE: str = os.getenv("PAYOUT_MODE", "simulated")
 
     @classmethod
@@ -168,7 +185,7 @@ class Settings:
 
     @classmethod
     def is_payout_simulated(cls) -> bool:
-        return cls.PAYOUT_MODE.lower() == "simulated"
+        return cls.PAYOUT_MODE.lower() in ("simulated", "lookup_only")
 
     @classmethod
     def validate_payout_config(cls) -> list[str]:
@@ -197,6 +214,13 @@ class Settings:
                     "Environment mismatch: INTERSWITCH_BASE_URL points to QA "
                     "but INTERSWITCH_PAYOUTS_BASE_URL points to production. "
                     "Auth tokens acquired from QA will be rejected by production."
+                )
+
+        if mode == "lookup_only":
+            if not cls.is_interswitch_configured():
+                warnings.append(
+                    "PAYOUT_MODE=lookup_only but Interswitch auth credentials "
+                    "are missing (INTERSWITCH_CLIENT_ID / INTERSWITCH_CLIENT_SECRET)."
                 )
 
         return warnings

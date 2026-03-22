@@ -26,14 +26,16 @@ class InterswitchAuth:
     # Per-base-URL token cache: {base_url: (token, expires_at)}
     _token_cache: dict[str, tuple[str, float]] = {}
 
-    def __init__(self, base_url: Optional[str] = None) -> None:
+    def __init__(self, base_url: Optional[str] = None, scope: Optional[str] = None) -> None:
         self._base_url = (base_url or Settings.INTERSWITCH_BASE_URL).rstrip("/")
         self._client_id = Settings.INTERSWITCH_CLIENT_ID
         self._client_secret = Settings.INTERSWITCH_CLIENT_SECRET
+        self._scope = scope
 
     async def get_access_token(self) -> str:
         """Return a valid bearer token, refreshing via OAuth2 if needed."""
-        cached = self._token_cache.get(self._base_url)
+        cache_key = f"{self._base_url}|{self._scope or ''}"
+        cached = self._token_cache.get(cache_key)
         if cached and time.time() < cached[1]:
             return cached[0]
 
@@ -60,9 +62,12 @@ class InterswitchAuth:
         logger.info("Acquiring Interswitch OAuth2 token via client_credentials grant")
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            form_data: dict[str, str] = {"grant_type": "client_credentials"}
+            if self._scope:
+                form_data["scope"] = self._scope
             response = await client.post(
                 token_url,
-                data={"grant_type": "client_credentials"},
+                data=form_data,
                 headers={
                     "Authorization": f"Basic {basic_auth}",
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -77,7 +82,8 @@ class InterswitchAuth:
 
         expires_in = int(data.get("expires_in", 3600))
         expires_at = time.time() + expires_in - _TOKEN_REFRESH_MARGIN_SECONDS
-        InterswitchAuth._token_cache[self._base_url] = (access_token, expires_at)
+        cache_key = f"{self._base_url}|{self._scope or ''}"
+        InterswitchAuth._token_cache[cache_key] = (access_token, expires_at)
 
         logger.info(f"OAuth2 token acquired, expires in {expires_in}s")
         return access_token

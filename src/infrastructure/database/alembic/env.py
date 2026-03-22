@@ -26,7 +26,9 @@ if database_url:
         database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif database_url.startswith("postgres://"):
         database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    config.set_main_option("sqlalchemy.url", database_url)
+    # ConfigParser treats % as interpolation; double so URL-encoded passwords work
+    ini_url = database_url.replace("%", "%%")
+    config.set_main_option("sqlalchemy.url", ini_url)
 
 
 def run_migrations_offline() -> None:
