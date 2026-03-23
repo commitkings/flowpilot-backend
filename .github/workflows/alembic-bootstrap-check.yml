@@ -1,0 +1,65 @@
+name: Alembic Bootstrap Check
+
+on:
+  pull_request:
+    paths:
+      - "src/infrastructure/database/alembic/**"
+      - "src/infrastructure/database/migrations/**"
+      - "alembic.ini"
+      - "requirements.txt"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/infrastructure/database/alembic/**"
+      - "src/infrastructure/database/migrations/**"
+      - "alembic.ini"
+      - "requirements.txt"
+
+jobs:
+  fresh-db-upgrade:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: flowpilot_bootstrap
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d flowpilot_bootstrap"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Alembic upgrade on fresh database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowpilot_bootstrap
+        run: alembic upgrade head
+
+      - name: Verify current revision equals head
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowpilot_bootstrap
+        run: |
+          HEAD_REVISION=$(alembic heads | awk '{print $1}')
+          CURRENT_REVISION=$(alembic current | tail -n 1 | awk '{print $1}')
+          if [ "$HEAD_REVISION" != "$CURRENT_REVISION" ]; then
+            echo "Expected current revision to match head."
+            echo "head=$HEAD_REVISION current=$CURRENT_REVISION"
+            exit 1
+          fi

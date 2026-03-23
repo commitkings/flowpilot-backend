@@ -80,7 +80,7 @@ class TransactionSearchClient:
 
         logger.info(
             f"TransactionSearch quick_search: merchant={merchant_code}, "
-            f"{start_date.date()} to {end_date.date()}, url={url}"
+            f"{start_date} to {end_date}, url={url}"
         )
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:

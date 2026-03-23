@@ -498,7 +498,7 @@ def upgrade() -> None:
     ]:
         op.execute(f"""
             CREATE TRIGGER trg_{tbl}_updated_at
-            BEFORE UPDATE ON {tbl}
+            BEFORE UPDATE ON \"{tbl}\"
             FOR EACH ROW EXECUTE FUNCTION set_updated_at();
         """)
 
@@ -509,21 +509,21 @@ def upgrade() -> None:
     )
 
     # 9. Add missing FK-supporting indexes
-    op.create_index('agent_run_approved_by_idx', 'agent_run', ['approved_by'], unique=False)
-    op.create_index('agent_run_cancelled_by_idx', 'agent_run', ['cancelled_by'], unique=False)
-    op.create_index('invitation_invited_by_idx', 'invitation', ['invited_by'], unique=False)
-    op.create_index('run_event_step_id_idx', 'run_event', ['step_id'], unique=False)
-    op.create_index('notification_outbox_run_id_idx', 'notification_outbox', ['run_id'], unique=False)
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS agent_run_approved_by_idx ON agent_run (approved_by)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS agent_run_cancelled_by_idx ON agent_run (cancelled_by)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS invitation_invited_by_idx ON invitation (invited_by)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS run_event_step_id_idx ON run_event (step_id)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS notification_outbox_run_id_idx ON notification_outbox (run_id)'))
 
     # 10. Add missing audit_log indexes (not in baseline)
-    op.create_index('audit_log_run_id_idx', 'audit_log', ['run_id'], unique=False)
-    op.create_index('audit_log_step_id_idx', 'audit_log', ['step_id'], unique=False)
-    op.create_index('audit_log_run_id_created_at_idx', 'audit_log', ['run_id', sa.literal_column('created_at DESC')], unique=False)
-    op.create_index('audit_log_created_at_brin_idx', 'audit_log', ['created_at'], unique=False, postgresql_using='brin')
-    op.create_index('audit_log_detail_gin_idx', 'audit_log', ['detail'], unique=False, postgresql_using='gin')
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS audit_log_run_id_idx ON audit_log (run_id)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS audit_log_step_id_idx ON audit_log (step_id)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS audit_log_run_id_created_at_idx ON audit_log (run_id, created_at DESC)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS audit_log_created_at_brin_idx ON audit_log USING brin (created_at)'))
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS audit_log_detail_gin_idx ON audit_log USING gin (detail)'))
 
     # 11. Add missing payout_candidate GIN index
-    op.create_index('payout_candidate_risk_reasons_idx', 'payout_candidate', ['risk_reasons'], unique=False, postgresql_using='gin')
+    op.execute(sa.text('CREATE INDEX IF NOT EXISTS payout_candidate_risk_reasons_idx ON payout_candidate USING gin (risk_reasons)'))
 
     # 12. Drop redundant run_step index (unique constraint already creates one)
     op.drop_index('run_step_run_id_step_order_idx', table_name='run_step')
