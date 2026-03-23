@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+docs/
+guide/
+archived/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+pytest.ini
+.pytest_cache/
+
+# Data files
+data/
+*.csv
+*.json
+!linear-charmer-474120-j7-305e3c2e6fdc.json
+*.db
+*.sqlite
+dump.rdb
+
+# Logs
+logs/
+*.log
+
+# Environment variables (IMPORTANT: never include in Docker image)
+.env
+.env.*
+
+# Docker
+Dockerfile*
+docker-compose.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Misc
+*.bak
+*.tmp
+*.old
+.cache/
+
+# CDK outputs
+cdk.out/
+.cdk.staging/
+deploy/cdk.out/
+
+# IDE extras
+.cursor/
+.github/
+
+# Legacy and architecture
+architecture/
