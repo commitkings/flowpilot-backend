@@ -1,0 +1,102 @@
+name: CI / Build and Push
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "app/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "Dockerfile"
+
+  workflow_dispatch:
+
+env:
+  HARBOR_REGISTRY: 164.68.119.226:30002
+  HARBOR_PROJECT: flowpilot
+  MANIFESTS_REPO: commitkings/flow-pilot-infra
+
+jobs:
+
+  deploy:
+    name: Build and Deploy
+    runs-on: [self-hosted, flow-pilot]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate app version tag
+        id: version
+        run: |
+          VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Generated version: ${VERSION}"
+
+      - name: Sync files to deployment directory
+        run: |
+          sudo rsync -avzr --delete ./ /home/github/flowpilot-backend
+
+      - name: Docker Login to Harbor
+        run: |
+          echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ env.HARBOR_REGISTRY }} \
+            --username '${{ secrets.HARBOR_USERNAME }}' \
+            --password-stdin
+
+      - name: Build and Push Flow Pilot Backend
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          IMAGE="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/flowpilot-backend"
+          docker pull $IMAGE:latest || true
+          docker build \
+            --cache-from $IMAGE:latest \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t $IMAGE:${{ steps.version.outputs.version }} \
+            -t $IMAGE:latest
+          docker push $IMAGE:${{ steps.version.outputs.version }}
+          docker push $IMAGE:latest
+
+
+      # - name: Update Kubernetes Manifests
+      #   run: |
+      #     CLONE_DIR=$(mktemp -d)
+      #     git clone https://${{ secrets.MANIFESTS_REPO_TOKEN }}@github.com/${{ env.MANIFESTS_REPO }}.git $CLONE_DIR
+
+      #     cd $CLONE_DIR/gamified-application
+
+      #     REGISTRY_PROJECT="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}"
+      #     VERSION="${{ steps.version.outputs.version }}"
+
+      #     # [0-9][0-9.]* matches version numbers (1.0.NNN) only — stops before any
+      #     # closing quote or other character, so quoted ConfigMap values are safe.
+      #     for img in "backend" "frontend"; do
+      #       echo "Updating tag for $img to $VERSION"
+      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/$img:${VERSION}|g" {} +
+      #     done
+
+      #     for img in "worker" "beat" "executor"; do
+      #       echo "Pointing $img at backend:$VERSION"
+      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/backend:${VERSION}|g" {} +
+      #     done
+
+      #     for img in "sandbox-light" "sandbox-heavy" "sandbox-omni-ide" "ide-proxy"; do
+      #       echo "Updating tag for $img to $VERSION"
+      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/$img:${VERSION}|g" {} +
+      #     done
+
+      #     git config user.name "GitHub Actions Bot"
+      #     git config user.email "actions@github.com"
+
+      #     git add .
+      #     if git diff --staged --quiet; then
+      #       echo "No changes to commit"
+      #     else
+      #       git commit -m "Deploy version $VERSION from ${{ github.repository }}@${{ github.sha }}"
+      #       git push
+      #       echo "Manifests updated successfully"
+      #     fi
+
+      # - name: Cleanup unused images
+      #   if: always()
+      #   run: docker image prune -f
