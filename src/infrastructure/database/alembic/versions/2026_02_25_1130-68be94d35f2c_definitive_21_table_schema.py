@@ -686,7 +686,6 @@ def downgrade() -> None:
     op.drop_index('api_call_log_run_id_idx', table_name='api_call_log')
     op.drop_index('api_call_log_called_at_idx', table_name='api_call_log', postgresql_using='brin')
     op.drop_table('api_call_log')
-    op.drop_index('run_step_run_id_step_order_idx', table_name='run_step')
     op.drop_index('run_step_run_id_idx', table_name='run_step')
     op.drop_table('run_step')
     op.drop_index('reconciled_transaction_txn_timestamp_idx', table_name='reconciled_transaction')

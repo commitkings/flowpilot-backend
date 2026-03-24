@@ -478,7 +478,6 @@ class RunStepModel(Base):
             name="run_step_status_check",
         ),
         Index("run_step_run_id_idx", "run_id"),
-        Index("run_step_run_id_step_order_idx", "run_id", "step_order"),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(back_populates="run_steps")
@@ -1157,12 +1156,12 @@ class AuditLogModel(Base):
         Index("audit_log_run_id_created_at_idx", "run_id", "created_at"),
         Index("audit_log_step_id_idx", "step_id"),
         Index(
-            "audit_log_created_at_idx",
+            "audit_log_created_at_brin_idx",
             "created_at",
             postgresql_using="brin",
         ),
         Index(
-            "audit_log_detail_idx",
+            "audit_log_detail_gin_idx",
             "detail",
             postgresql_using="gin",
         ),
