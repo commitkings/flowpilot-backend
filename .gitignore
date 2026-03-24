@@ -1,0 +1,118 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files and folders
+tmp/
+.tmp
+.cache
+.dockbox
+.env
+.env.*
+god.config.*
+docked.env
+docked.env.*
+!docked.env.example
+!.env.vps.example
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Project specific
+extraction.log
+*.db
+*.sqlite
+*.sqlite3
+
+# others
+*.log
+*.tmp
+*.bak
+docs/
+docs/
+.cursor
+.cursorrules
+.cursorignore
+.github/instructions
+.github/prompts
+.github/copilot-instructions.md
+.github/agents
+.github/skills
+guide/
+AGENTS.md
+node_modules/
+dist/
+build/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+lerna-debug.log*
+agent
+*.aux
+*.out
+*.bbl
+*.blg
+*.fls
+*.pdf
+*.rdb
+tests
+.kube/
+
+# Scripts
+scripts/deploy.sh
+scripts/install-skill-to-github.sh
+
+
