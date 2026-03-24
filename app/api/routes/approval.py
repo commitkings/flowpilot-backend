@@ -13,15 +13,26 @@ from app.api.routes.runs import (
     _status_from_node,
 )
 from src.agents.graph import build_flowpilot_graph
+from src.agents.state import AgentState
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
+    PlanStepRepository,
     RunRepository,
+    TransactionRepository,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_NODE_TO_AGENT_TYPE = {
+    "plan": "planner",
+    "reconcile": "reconciliation",
+    "risk": "risk",
+    "execute": "execution",
+    "audit": "audit",
+}
 
 
 class ApprovalRequest(BaseModel):
@@ -62,6 +73,182 @@ def _parse_uuid_list(values: list[str], field_name: str) -> list[uuid.UUID]:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 
 
+def _serialize_plan_step(plan_step) -> dict:
+    return {
+        "step_id": str(plan_step.id),
+        "agent_type": plan_step.agent_type,
+        "order": plan_step.step_order,
+        "description": plan_step.description,
+        "status": plan_step.status,
+    }
+
+
+def _serialize_transaction(transaction) -> dict:
+    return {
+        "transactionReference": transaction.transaction_reference,
+        "amount": float(transaction.amount),
+        "currency": transaction.currency,
+        "status": transaction.status,
+        "channel": transaction.channel,
+        "timestamp": (
+            transaction.transaction_timestamp.isoformat()
+            if transaction.transaction_timestamp
+            else None
+        ),
+        "customerId": transaction.customer_id,
+        "merchantId": transaction.merchant_id,
+        "processorResponseCode": transaction.processor_response_code,
+        "processorResponseMessage": transaction.processor_response_message,
+        "settlementDate": (
+            transaction.settlement_date.isoformat()
+            if transaction.settlement_date
+            else None
+        ),
+        "isAnomaly": transaction.is_anomaly,
+        "anomalyReason": transaction.anomaly_reason,
+    }
+
+
+def _serialize_scored_candidate(candidate) -> dict:
+    return {
+        "candidate_id": str(candidate.id),
+        "institution_code": candidate.institution_code,
+        "beneficiary_name": candidate.beneficiary_name,
+        "account_number": candidate.account_number,
+        "amount": float(candidate.amount),
+        "currency": candidate.currency,
+        "purpose": candidate.purpose,
+        "risk_score": float(candidate.risk_score) if candidate.risk_score is not None else None,
+        "risk_reasons": candidate.risk_reasons or [],
+        "risk_decision": candidate.risk_decision,
+        "approval_status": candidate.approval_status,
+        "execution_status": candidate.execution_status,
+        "client_reference": candidate.client_reference,
+        "provider_reference": candidate.provider_reference,
+    }
+
+
+def _build_reconciled_ledger(transactions: list[dict]) -> dict:
+    ledger = {
+        "total_inflow": 0.0,
+        "total_outflow": 0.0,
+        "pending_amount": 0.0,
+        "failed_amount": 0.0,
+        "success_count": 0,
+        "pending_count": 0,
+        "failed_count": 0,
+        "reversed_count": 0,
+    }
+    for transaction in transactions:
+        amount = transaction.get("amount", 0.0)
+        status = transaction.get("status")
+        if status == "SUCCESS":
+            ledger["total_inflow"] += amount
+            ledger["success_count"] += 1
+        elif status == "PENDING":
+            ledger["pending_amount"] += amount
+            ledger["pending_count"] += 1
+        elif status == "FAILED":
+            ledger["failed_amount"] += amount
+            ledger["failed_count"] += 1
+        elif status == "REVERSED":
+            ledger["reversed_count"] += 1
+    return ledger
+
+
+def _map_transactions_for_persistence(transactions: list[dict]) -> list[dict]:
+    mapped: list[dict] = []
+    for transaction in transactions:
+        reference = transaction.get("transactionReference") or transaction.get(
+            "transaction_reference"
+        )
+        if not reference:
+            continue
+        mapped.append(
+            {
+                "transaction_reference": reference,
+                "amount": transaction.get("amount", 0),
+                "currency": transaction.get("currency", "NGN"),
+                "status": transaction.get("status", "PENDING"),
+                "channel": transaction.get("channel"),
+                "transaction_timestamp": transaction.get("timestamp")
+                or transaction.get("transaction_timestamp"),
+                "customer_id": transaction.get("customerId")
+                or transaction.get("customer_id"),
+                "merchant_id": transaction.get("merchantId")
+                or transaction.get("merchant_id"),
+                "processor_response_code": transaction.get("processorResponseCode")
+                or transaction.get("processor_response_code"),
+                "processor_response_message": transaction.get("processorResponseMessage")
+                or transaction.get("processor_response_message"),
+                "settlement_date": transaction.get("settlementDate")
+                or transaction.get("settlement_date"),
+                "is_anomaly": transaction.get("isAnomaly", False)
+                or transaction.get("is_anomaly", False),
+                "anomaly_reason": transaction.get("anomalyReason")
+                or transaction.get("anomaly_reason"),
+            }
+        )
+    return mapped
+
+
+async def _reconstruct_state_from_db(
+    session: AsyncSession, run_id: uuid.UUID
+) -> Optional[AgentState]:
+    run_repo = RunRepository(session)
+    run = await run_repo.get_by_id(run_id)
+    if run is None:
+        return None
+
+    plan_steps = [_serialize_plan_step(step) for step in run.plan_steps]
+    transactions = [_serialize_transaction(txn) for txn in run.transactions]
+    scored_candidates = [
+        _serialize_scored_candidate(candidate) for candidate in run.payout_candidates
+    ]
+    approved_candidate_ids = [
+        str(candidate.id)
+        for candidate in run.payout_candidates
+        if candidate.approval_status == "approved"
+    ]
+    rejected_candidate_ids = [
+        str(candidate.id)
+        for candidate in run.payout_candidates
+        if candidate.approval_status == "rejected"
+    ]
+    unresolved_references = [
+        transaction["transactionReference"]
+        for transaction in transactions
+        if transaction.get("status") == "PENDING"
+        and transaction.get("transactionReference")
+    ]
+
+    return {
+        "run_id": str(run.id),
+        "objective": run.objective,
+        "constraints": run.constraints,
+        "risk_tolerance": float(run.risk_tolerance),
+        "budget_cap": float(run.budget_cap) if run.budget_cap is not None else None,
+        "merchant_id": run.merchant_id,
+        "plan_steps": plan_steps,
+        "transactions": transactions,
+        "reconciled_ledger": _build_reconciled_ledger(transactions),
+        "unresolved_references": unresolved_references,
+        "scored_candidates": scored_candidates,
+        "forecast": None,
+        "lookup_results": [],
+        "payout_results": [],
+        "payout_status_results": [],
+        "approved_candidate_ids": approved_candidate_ids,
+        "rejected_candidate_ids": rejected_candidate_ids,
+        "audit_report": None,
+        "current_step": (
+            "awaiting_approval" if run.status == "awaiting_approval" else run.status
+        ),
+        "error": run.error_message,
+        "audit_entries": [],
+    }
+
+
 @router.get("/runs/{run_id}/candidates")
 async def get_candidates(
     run_id: str,
@@ -96,6 +283,8 @@ async def approve_candidates(
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
     audit_repo = AuditRepository(session)
+    plan_step_repo = PlanStepRepository(session)
+    transaction_repo = TransactionRepository(session)
 
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
@@ -108,29 +297,81 @@ async def approve_candidates(
 
     state = _running_states.get(run_id)
     if state is None:
-        raise HTTPException(status_code=409, detail="Run state unavailable for resume")
+        state = await _reconstruct_state_from_db(session, run_uuid)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        _running_states[run_id] = state
 
     candidate_ids = _parse_uuid_list(request.candidate_ids, "candidate_ids")
     approved_count = await candidate_repo.approve(candidate_ids, run.operator_id, run_uuid)
     await session.commit()
 
-    state["approved_candidate_ids"] = [str(candidate_id) for candidate_id in candidate_ids]
+    existing_approved = set(state.get("approved_candidate_ids", []))
+    existing_approved.update(str(candidate_id) for candidate_id in candidate_ids)
+    state["approved_candidate_ids"] = list(existing_approved)
     state["current_step"] = "approved"
+
+    transactions = state.get("transactions", [])
+    if transactions:
+        await transaction_repo.create_batch(
+            run_uuid, _map_transactions_for_persistence(transactions)
+        )
 
     logger.info(f"Run {run_id}: approved {approved_count} candidates, resuming execution")
 
     try:
         await run_repo.update_status(run_uuid, "executing")
         graph = build_flowpilot_graph()
-        audit_start_index = len(state.get("audit_entries", []))
+        audit_persist_index = len(state.get("audit_entries", []))
+
+        plan_steps = await plan_step_repo.get_by_run(run_uuid)
+        plan_steps_by_agent: dict[str, list] = {}
+        for plan_step in plan_steps:
+            plan_steps_by_agent.setdefault(plan_step.agent_type, []).append(plan_step)
 
         async for step_output in graph.astream(state):
             node_name = next(iter(step_output.keys()), "unknown") if step_output else "unknown"
+            node_agent_type = _NODE_TO_AGENT_TYPE.get(node_name)
+            active_plan_step = None
+            if node_agent_type:
+                active_plan_step = next(
+                    (
+                        plan_step
+                        for plan_step in plan_steps_by_agent.get(node_agent_type, [])
+                        if plan_step.status in {"pending", "running"}
+                    ),
+                    None,
+                )
+                if active_plan_step is not None and active_plan_step.status == "pending":
+                    await plan_step_repo.mark_started(active_plan_step.id)
+                    active_plan_step.status = "running"
 
             if isinstance(step_output, dict):
                 for node_state in step_output.values():
                     if isinstance(node_state, dict):
                         state.update(node_state)
+
+            node_state = step_output.get(node_name) if isinstance(step_output, dict) else None
+            if active_plan_step is not None:
+                if state.get("error"):
+                    await plan_step_repo.update_status(
+                        active_plan_step.id,
+                        "failed",
+                        output_data=node_state if isinstance(node_state, dict) else None,
+                        error_message=state.get("error"),
+                    )
+                    active_plan_step.status = "failed"
+                else:
+                    await plan_step_repo.mark_completed(
+                        active_plan_step.id,
+                        output_data=node_state if isinstance(node_state, dict) else None,
+                    )
+                    active_plan_step.status = "completed"
+
+            new_entries = state.get("audit_entries", [])[audit_persist_index:]
+            if new_entries:
+                await audit_repo.append_batch(_build_audit_entries(run_uuid, new_entries))
+                audit_persist_index += len(new_entries)
 
             await run_repo.update_status(
                 run_uuid,
@@ -138,10 +379,6 @@ async def approve_candidates(
                 state.get("error"),
             )
             await session.commit()
-
-        new_entries = state.get("audit_entries", [])[audit_start_index:]
-        if new_entries:
-            await audit_repo.append_batch(_build_audit_entries(run_uuid, new_entries))
 
         final_status = "failed" if state.get("error") else "completed"
         await run_repo.update_status(run_uuid, final_status, state.get("error"))

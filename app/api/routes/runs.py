@@ -14,6 +14,7 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
+    PlanStepRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -23,6 +24,13 @@ router = APIRouter()
 
 _running_states: dict[str, AgentState] = {}
 _DEFAULT_OPERATOR_ID = "00000000-0000-0000-0000-000000000001"
+_NODE_TO_AGENT_TYPE = {
+    "plan": "planner",
+    "reconcile": "reconciliation",
+    "risk": "risk",
+    "execute": "execution",
+    "audit": "audit",
+}
 
 
 class CreateRunRequest(BaseModel):
@@ -64,6 +72,22 @@ def _status_from_node(node_name: str, state: AgentState) -> str:
     return status_map.get(node_name, "planning")
 
 
+def _current_step_from_status(status: str) -> str:
+    """Derive a human-readable current_step from the persisted run status."""
+    return {
+        "pending": "created",
+        "planning": "planning",
+        "reconciling": "reconciling",
+        "scoring": "scoring",
+        "forecasting": "forecasting",
+        "awaiting_approval": "awaiting_approval",
+        "executing": "executing",
+        "completed": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(status, status)
+
+
 def _build_audit_entries(run_id: uuid.UUID, entries: list[dict]) -> list[dict]:
     return [
         {
@@ -81,6 +105,46 @@ def _build_audit_entries(run_id: uuid.UUID, entries: list[dict]) -> list[dict]:
     ]
 
 
+def _map_plan_steps(steps: list[dict]) -> list[dict]:
+    """Map planner agent output to PlanStepModel column names."""
+    mapped_steps = [
+        {
+            "agent_type": s.get("agent_type", ""),
+            "step_order": s.get("order", idx + 1),
+            "description": s.get("description"),
+            "status": "pending",
+        }
+        for idx, s in enumerate(steps)
+    ]
+    if not any(step["agent_type"] == "planner" for step in mapped_steps):
+        mapped_steps.insert(
+            0,
+            {
+                "agent_type": "planner",
+                "step_order": 0,
+                "description": "Generate execution plan",
+                "status": "pending",
+            },
+        )
+    return mapped_steps
+
+
+def _map_transactions(txns: list[dict]) -> list[dict]:
+    """Map Interswitch transaction dicts to TransactionModel column names."""
+    return [
+        {
+            "transaction_reference": t["transactionReference"],
+            "amount": t["amount"],
+            "currency": t.get("currency", "NGN"),
+            "status": t["status"],
+            "channel": t.get("channel"),
+            "transaction_timestamp": t.get("timestamp"),
+            "customer_id": t.get("customerId"),
+        }
+        for t in txns
+    ]
+
+
 @router.post("/runs", response_model=RunResponse)
 async def create_run(
     request: CreateRunRequest,
@@ -89,6 +153,8 @@ async def create_run(
     operator_id = _parse_uuid(request.operator_id, "operator_id")
     run_repo = RunRepository(session)
     audit_repo = AuditRepository(session)
+    plan_step_repo = PlanStepRepository(session)
+    transaction_repo = TransactionRepository(session)
 
     run = await run_repo.create(
         operator_id=operator_id,
@@ -138,7 +204,9 @@ async def create_run(
         await run_repo.update_status(run.id, "planning")
 
         graph = build_flowpilot_graph()
-        audit_start_index = len(initial_state.get("audit_entries", []))
+        audit_flush_index = len(initial_state.get("audit_entries", []))
+        plan_step_ids_by_agent_type: dict[str, uuid.UUID] = {}
+        started_plan_step_ids: set[uuid.UUID] = set()
 
         async for step_output in graph.astream(initial_state):
             node_name = next(iter(step_output.keys()), "unknown") if step_output else "unknown"
@@ -149,6 +217,55 @@ async def create_run(
                     if isinstance(node_state, dict):
                         initial_state.update(node_state)
 
+            # Persist plan_steps after the plan node completes
+            if node_name == "plan" and initial_state.get("plan_steps"):
+                mapped_steps = _map_plan_steps(initial_state["plan_steps"])
+                persisted_steps = await plan_step_repo.create_batch(run.id, mapped_steps)
+                plan_step_ids_by_agent_type = {
+                    step.agent_type: step.id for step in persisted_steps
+                }
+                await run_repo.update_plan_graph(
+                    run.id, {"steps": initial_state["plan_steps"]}
+                )
+
+            # Persist transactions after the reconcile node completes
+            if node_name == "reconcile" and initial_state.get("transactions"):
+                mapped_txns = _map_transactions(initial_state["transactions"])
+                await transaction_repo.create_batch(run.id, mapped_txns)
+
+            agent_type = _NODE_TO_AGENT_TYPE.get(node_name)
+            step_id = (
+                plan_step_ids_by_agent_type.get(agent_type) if agent_type else None
+            )
+            if step_id is not None:
+                if step_id not in started_plan_step_ids:
+                    await plan_step_repo.mark_started(step_id)
+                    started_plan_step_ids.add(step_id)
+
+                if initial_state.get("error"):
+                    await plan_step_repo.update_status(
+                        step_id,
+                        "failed",
+                        error_message=initial_state.get("error"),
+                    )
+                else:
+                    node_output = (
+                        step_output.get(node_name)
+                        if isinstance(step_output, dict)
+                        else None
+                    )
+                    await plan_step_repo.mark_completed(
+                        step_id,
+                        node_output if isinstance(node_output, dict) else None,
+                    )
+
+            # Flush new audit entries after each node
+            all_entries = initial_state.get("audit_entries", [])
+            new_entries = all_entries[audit_flush_index:]
+            if new_entries:
+                await audit_repo.append_batch(_build_audit_entries(run.id, new_entries))
+                audit_flush_index = len(all_entries)
+
             await run_repo.update_status(
                 run.id,
                 _status_from_node(node_name, initial_state),
@@ -158,10 +275,6 @@ async def create_run(
 
             if initial_state.get("current_step") == "awaiting_approval":
                 break
-
-        new_entries = initial_state.get("audit_entries", [])[audit_start_index:]
-        if new_entries:
-            await audit_repo.append_batch(_build_audit_entries(run.id, new_entries))
 
         final_status = (
             "awaiting_approval"
@@ -210,7 +323,7 @@ async def list_runs(session: AsyncSession = Depends(get_db_session)):
             "objective": run.objective,
             "status": run.status,
             "created_at": run.created_at.isoformat(),
-            "current_step": _running_states.get(str(run.id), {}).get("current_step"),
+            "current_step": _current_step_from_status(run.status),
         }
         for run in runs
     ]
@@ -228,16 +341,31 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    state = _running_states.get(run_id, {})
+    # Prefer in-memory state for active runs, fall back to DB
+    state = _running_states.get(run_id)
+    if state is not None:
+        plan_steps = state.get("plan_steps")
+        current_step = state.get("current_step")
+    else:
+        plan_steps = [
+            {
+                "agent_type": s.agent_type,
+                "order": s.step_order,
+                "description": s.description,
+                "status": s.status,
+            }
+            for s in (run.plan_steps or [])
+        ]
+        current_step = _current_step_from_status(run.status)
 
     return RunResponse(
         run_id=run_id,
         objective=run.objective,
         status=run.status,
         created_at=run.created_at.isoformat(),
-        plan_steps=state.get("plan_steps"),
-        current_step=state.get("current_step"),
-        error=run.error_message or state.get("error"),
+        plan_steps=plan_steps or None,
+        current_step=current_step,
+        error=run.error_message,
     )
 
 
@@ -259,13 +387,12 @@ async def get_run_status(
     transactions_count = await transaction_repo.count_by_run(run_uuid)
     candidates_count = await candidate_repo.count_by_run(run_uuid)
     has_audit_report = (await audit_repo.count_by_run(run_uuid)) > 0
-    state = _running_states.get(run_id, {})
 
     return {
         "run_id": run_id,
         "status": run.status,
-        "current_step": state.get("current_step"),
-        "error": run.error_message or state.get("error"),
+        "current_step": _current_step_from_status(run.status),
+        "error": run.error_message,
         "transactions_count": transactions_count,
         "candidates_count": candidates_count,
         "has_audit_report": has_audit_report,
