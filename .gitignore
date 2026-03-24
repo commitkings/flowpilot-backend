@@ -75,6 +75,9 @@ extraction.log
 *.sqlite
 *.sqlite3
 
+# architecture
+architecture/
+
 # others
 *.log
 *.tmp
@@ -115,5 +118,4 @@ skills-lock.json
 # Scripts
 scripts/deploy.sh
 scripts/install-skill-to-github.sh
-
-
+whatsapp/

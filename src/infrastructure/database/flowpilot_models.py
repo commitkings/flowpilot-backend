@@ -11,6 +11,7 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     Identity,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
@@ -138,6 +139,13 @@ class AgentRunModel(Base):
             "'completed', 'failed', 'cancelled')",
             name="agent_run_status_check",
         ),
+        Index("agent_run_status_idx", "status"),
+        Index("agent_run_operator_id_idx", "operator_id"),
+        Index(
+            "agent_run_operator_id_created_at_idx",
+            "operator_id",
+            text("created_at DESC"),
+        ),
     )
 
     operator: Mapped["OperatorModel"] = relationship(back_populates="agent_runs")
@@ -200,6 +208,7 @@ class PlanStepModel(Base):
             "status IN ('pending', 'running', 'completed', 'failed', 'skipped')",
             name="plan_step_status_check",
         ),
+        Index("plan_step_run_id_idx", "run_id"),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(back_populates="plan_steps")
@@ -257,6 +266,9 @@ class TransactionModel(Base):
             "channel IN ('CARD', 'TRANSFER', 'USSD', 'QR')",
             name="transaction_channel_check",
         ),
+        Index("transaction_run_id_idx", "run_id"),
+        Index("transaction_run_id_status_idx", "run_id", "status"),
+        Index("transaction_timestamp_idx", "transaction_timestamp"),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(back_populates="transactions")
@@ -307,6 +319,7 @@ class PayoutBatchModel(Base):
             "('pending', 'accepted', 'partial', 'rejected', 'failed')",
             name="payout_batch_submission_status_check",
         ),
+        Index("payout_batch_run_id_idx", "run_id"),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(back_populates="payout_batches")
@@ -400,6 +413,21 @@ class PayoutCandidateModel(Base):
             "'failed', 'requires_followup')",
             name="payout_candidate_execution_status_check",
         ),
+        Index("payout_candidate_run_id_idx", "run_id"),
+        Index("payout_candidate_run_id_risk_decision_idx", "run_id", "risk_decision"),
+        Index(
+            "payout_candidate_run_id_approval_status_idx",
+            "run_id",
+            "approval_status",
+        ),
+        Index("payout_candidate_institution_code_idx", "institution_code"),
+        Index("payout_candidate_batch_id_idx", "batch_id"),
+        Index("payout_candidate_approved_by_idx", "approved_by"),
+        Index(
+            "payout_candidate_risk_reasons_idx",
+            "risk_reasons",
+            postgresql_using="gin",
+        ),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(
@@ -449,6 +477,19 @@ class AuditLogModel(Base):
             "agent_type IN ('planner', 'reconciliation', 'risk', "
             "'forecast', 'execution', 'audit')",
             name="audit_log_agent_type_check",
+        ),
+        Index("audit_log_run_id_idx", "run_id"),
+        Index("audit_log_run_id_created_at_idx", "run_id", "created_at"),
+        Index("audit_log_step_id_idx", "step_id"),
+        Index(
+            "audit_log_created_at_idx",
+            "created_at",
+            postgresql_using="brin",
+        ),
+        Index(
+            "audit_log_detail_idx",
+            "detail",
+            postgresql_using="gin",
         ),
     )
 

@@ -51,6 +51,13 @@ async def close_db() -> None:
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency that yields a DB session.
+
+    Commits on clean exit; rolls back only uncommitted work on error.
+    Routes should call `await session.commit()` at durable checkpoints
+    (e.g., after run creation, after status transitions) so that an
+    exception later in the request does not erase earlier state.
+    """
     factory = get_session_factory()
     async with factory() as session:
         try:
