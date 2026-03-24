@@ -268,6 +268,7 @@ class InvitationModel(Base):
         Index("invitation_business_id_idx", "business_id"),
         Index("invitation_email_idx", "email"),
         Index("invitation_expires_at_idx", "expires_at"),
+        Index("invitation_invited_by_idx", "invited_by"),
     )
 
     business: Mapped["BusinessModel"] = relationship(back_populates="invitations")
@@ -387,6 +388,8 @@ class AgentRunModel(Base):
         Index("agent_run_status_idx", "status"),
         Index("agent_run_business_id_idx", "business_id"),
         Index("agent_run_created_by_idx", "created_by"),
+        Index("agent_run_approved_by_idx", "approved_by"),
+        Index("agent_run_cancelled_by_idx", "cancelled_by"),
         Index(
             "agent_run_business_id_created_at_idx",
             "business_id",
@@ -519,6 +522,7 @@ class RunEventModel(Base):
     __table_args__ = (
         Index("run_event_run_id_idx", "run_id"),
         Index("run_event_run_id_sequence_num_idx", "run_id", "sequence_num"),
+        Index("run_event_step_id_idx", "step_id"),
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship(back_populates="run_events")
@@ -1276,6 +1280,7 @@ class NotificationOutboxModel(Base):
             name="notification_outbox_channel_check",
         ),
         Index("notification_outbox_user_id_idx", "user_id"),
+        Index("notification_outbox_run_id_idx", "run_id"),
         Index("notification_outbox_business_id_idx", "business_id"),
         Index(
             "notification_outbox_unsent_idx",
