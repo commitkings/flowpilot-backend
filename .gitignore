@@ -110,6 +110,7 @@ agent
 *.rdb
 tests
 .kube/
+skills-lock.json
 
 # Scripts
 scripts/deploy.sh
