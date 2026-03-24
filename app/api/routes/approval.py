@@ -295,8 +295,9 @@ async def approve_candidates(
         # Re-persist transactions (safe: ON CONFLICT DO NOTHING)
         transactions = state.get("transactions", [])
         if transactions:
+            business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else run.business_id
             await transaction_repo.create_batch(
-                run_uuid, _map_transactions(transactions)
+                run_uuid, business_id, _map_transactions(transactions)
             )
 
         # Resume from execute→audit ONLY (no re-run of plan/reconcile/risk)
