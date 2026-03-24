@@ -311,18 +311,18 @@ async def approve_candidates(
     state["approved_candidate_ids"] = list(existing_approved)
     state["current_step"] = "approved"
 
-    transactions = state.get("transactions", [])
-    if transactions:
-        await transaction_repo.create_batch(
-            run_uuid, _map_transactions_for_persistence(transactions)
-        )
-
     logger.info(f"Run {run_id}: approved {approved_count} candidates, resuming execution")
 
     try:
+        # Re-persist transactions from state (safe: ON CONFLICT DO NOTHING)
+        transactions = state.get("transactions", [])
+        if transactions:
+            await transaction_repo.create_batch(
+                run_uuid, _map_transactions_for_persistence(transactions)
+            )
+
         await run_repo.update_status(run_uuid, "executing")
         graph = build_flowpilot_graph()
-        audit_persist_index = len(state.get("audit_entries", []))
 
         plan_steps = await plan_step_repo.get_by_run(run_uuid)
         plan_steps_by_agent: dict[str, list] = {}
@@ -346,10 +346,14 @@ async def approve_candidates(
                     await plan_step_repo.mark_started(active_plan_step.id)
                     active_plan_step.status = "running"
 
+            node_audit_entries: list[dict] = []
             if isinstance(step_output, dict):
                 for node_state in step_output.values():
                     if isinstance(node_state, dict):
+                        node_audit_entries = node_state.pop("audit_entries", [])
                         state.update(node_state)
+                        state.setdefault("audit_entries", [])
+                        state["audit_entries"].extend(node_audit_entries)
 
             node_state = step_output.get(node_name) if isinstance(step_output, dict) else None
             if active_plan_step is not None:
@@ -368,10 +372,10 @@ async def approve_candidates(
                     )
                     active_plan_step.status = "completed"
 
-            new_entries = state.get("audit_entries", [])[audit_persist_index:]
-            if new_entries:
-                await audit_repo.append_batch(_build_audit_entries(run_uuid, new_entries))
-                audit_persist_index += len(new_entries)
+            if node_audit_entries:
+                await audit_repo.append_batch(
+                    _build_audit_entries(run_uuid, node_audit_entries)
+                )
 
             await run_repo.update_status(
                 run_uuid,

@@ -131,18 +131,29 @@ def _map_plan_steps(steps: list[dict]) -> list[dict]:
 
 def _map_transactions(txns: list[dict]) -> list[dict]:
     """Map Interswitch transaction dicts to TransactionModel column names."""
-    return [
-        {
-            "transaction_reference": t["transactionReference"],
-            "amount": t["amount"],
+    mapped: list[dict] = []
+    for t in txns:
+        ref = t.get("transactionReference")
+        amount = t.get("amount")
+        status = t.get("status")
+        if not ref or amount is None or status is None:
+            continue
+        mapped.append({
+            "transaction_reference": ref,
+            "amount": amount,
             "currency": t.get("currency", "NGN"),
-            "status": t["status"],
+            "status": status,
             "channel": t.get("channel"),
             "transaction_timestamp": t.get("timestamp"),
             "customer_id": t.get("customerId"),
-        }
-        for t in txns
-    ]
+            "merchant_id": t.get("merchantId"),
+            "processor_response_code": t.get("processorResponseCode"),
+            "processor_response_message": t.get("processorResponseMessage"),
+            "settlement_date": t.get("settlementDate"),
+            "is_anomaly": t.get("isAnomaly", False),
+            "anomaly_reason": t.get("anomalyReason"),
+        })
+    return mapped
 
 
 @router.post("/runs", response_model=RunResponse)
@@ -204,7 +215,6 @@ async def create_run(
         await run_repo.update_status(run.id, "planning")
 
         graph = build_flowpilot_graph()
-        audit_flush_index = len(initial_state.get("audit_entries", []))
         plan_step_ids_by_agent_type: dict[str, uuid.UUID] = {}
         started_plan_step_ids: set[uuid.UUID] = set()
 
@@ -212,10 +222,14 @@ async def create_run(
             node_name = next(iter(step_output.keys()), "unknown") if step_output else "unknown"
             logger.info(f"Run {run_id}: completed step '{node_name}'")
 
+            node_audit_entries: list[dict] = []
             if isinstance(step_output, dict):
                 for node_state in step_output.values():
                     if isinstance(node_state, dict):
+                        node_audit_entries = node_state.pop("audit_entries", [])
                         initial_state.update(node_state)
+                        initial_state.setdefault("audit_entries", [])
+                        initial_state["audit_entries"].extend(node_audit_entries)
 
             # Persist plan_steps after the plan node completes
             if node_name == "plan" and initial_state.get("plan_steps"):
@@ -259,12 +273,11 @@ async def create_run(
                         node_output if isinstance(node_output, dict) else None,
                     )
 
-            # Flush new audit entries after each node
-            all_entries = initial_state.get("audit_entries", [])
-            new_entries = all_entries[audit_flush_index:]
-            if new_entries:
-                await audit_repo.append_batch(_build_audit_entries(run.id, new_entries))
-                audit_flush_index = len(all_entries)
+            # Flush new audit entries from this node
+            if node_audit_entries:
+                await audit_repo.append_batch(
+                    _build_audit_entries(run.id, node_audit_entries)
+                )
 
             await run_repo.update_status(
                 run.id,
