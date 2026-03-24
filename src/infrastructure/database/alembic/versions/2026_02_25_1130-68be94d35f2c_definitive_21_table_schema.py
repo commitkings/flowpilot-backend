@@ -550,7 +550,7 @@ def downgrade() -> None:
 
     op.drop_constraint('payout_candidate_business_id_fkey', 'payout_candidate', type_='foreignkey')
     op.drop_constraint('payout_candidate_approved_by_fkey', 'payout_candidate', type_='foreignkey')
-    op.create_foreign_key(op.f('payout_candidate_approved_by_fkey'), 'payout_candidate', 'operator', ['approved_by'], ['id'], ondelete='SET NULL')
+    # NOTE: payout_candidate→operator FK deferred until after operator table is re-created
     op.drop_index('payout_candidate_business_id_idx', table_name='payout_candidate')
     op.alter_column('payout_candidate', 'lookup_match_score',
                existing_type=sa.Numeric(precision=5, scale=4),
@@ -580,13 +580,13 @@ def downgrade() -> None:
     op.add_column('audit_log', sa.Column('request_hash', sa.CHAR(length=64), autoincrement=False, nullable=True))
     op.add_column('audit_log', sa.Column('response_time_ms', sa.INTEGER(), autoincrement=False, nullable=True))
     op.drop_constraint('audit_log_step_id_fkey', 'audit_log', type_='foreignkey')
-    op.create_foreign_key(op.f('audit_log_step_id_fkey'), 'audit_log', 'plan_step', ['step_id'], ['id'], ondelete='SET NULL')
+    # NOTE: audit_log→plan_step FK deferred until after plan_step table is re-created
     op.add_column('agent_run', sa.Column('operator_id', sa.UUID(), autoincrement=False, nullable=False))
     op.drop_constraint('agent_run_cancelled_by_fkey', 'agent_run', type_='foreignkey')
     op.drop_constraint('agent_run_business_id_fkey', 'agent_run', type_='foreignkey')
     op.drop_constraint('agent_run_created_by_fkey', 'agent_run', type_='foreignkey')
     op.drop_constraint('agent_run_approved_by_fkey', 'agent_run', type_='foreignkey')
-    op.create_foreign_key(op.f('agent_run_operator_id_fkey'), 'agent_run', 'operator', ['operator_id'], ['id'], ondelete='RESTRICT')
+    # NOTE: agent_run→operator FK deferred until after operator table is re-created
     op.drop_index('agent_run_created_by_idx', table_name='agent_run')
     op.drop_index('agent_run_business_id_idx', table_name='agent_run')
     op.drop_index('agent_run_business_id_created_at_idx', table_name='agent_run')
@@ -671,6 +671,10 @@ def downgrade() -> None:
     sa.UniqueConstraint('run_id', 'step_order', name=op.f('plan_step_run_id_step_order_unique'), postgresql_include=[], postgresql_nulls_not_distinct=False)
     )
     op.create_index(op.f('plan_step_run_id_idx'), 'plan_step', ['run_id'], unique=False)
+    # Deferred FK creations — referenced tables (operator, plan_step) now exist
+    op.create_foreign_key(op.f('payout_candidate_approved_by_fkey'), 'payout_candidate', 'operator', ['approved_by'], ['id'], ondelete='SET NULL')
+    op.create_foreign_key(op.f('agent_run_operator_id_fkey'), 'agent_run', 'operator', ['operator_id'], ['id'], ondelete='RESTRICT')
+    op.create_foreign_key(op.f('audit_log_step_id_fkey'), 'audit_log', 'plan_step', ['step_id'], ['id'], ondelete='SET NULL')
     op.drop_index('risk_score_feature_run_id_idx', table_name='risk_score_feature')
     op.drop_table('risk_score_feature')
     op.drop_index('payout_execution_run_id_idx', table_name='payout_execution')
