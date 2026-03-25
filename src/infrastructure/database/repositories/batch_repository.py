@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from typing import Optional
@@ -17,6 +17,12 @@ class BatchRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    @staticmethod
+    def _normalize_submission_status(submission_status: str | None) -> str:
+        status = (submission_status or "pending").strip().lower()
+        allowed_statuses = {"pending", "accepted", "partial", "rejected", "failed"}
+        return status if status in allowed_statuses else "failed"
 
     async def create(
         self,
@@ -44,10 +50,10 @@ class BatchRepository:
             source_account_id=source_account_id,
             total_amount=total_amount,
             item_count=item_count,
-            submission_status=submission_status,
+            submission_status=self._normalize_submission_status(submission_status),
             accepted_count=accepted_count,
             rejected_count=rejected_count,
-            submitted_at=datetime.utcnow(),
+            submitted_at=datetime.now(timezone.utc),
         )
         self._session.add(batch)
         await self._session.flush()
@@ -69,7 +75,9 @@ class BatchRepository:
         accepted_count: int | None = None,
         rejected_count: int | None = None,
     ) -> None:
-        values: dict = {"submission_status": submission_status}
+        values: dict = {
+            "submission_status": self._normalize_submission_status(submission_status)
+        }
         if accepted_count is not None:
             values["accepted_count"] = accepted_count
         if rejected_count is not None:

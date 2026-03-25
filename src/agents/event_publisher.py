@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.exc import InvalidRequestError, InterfaceError, IllegalStateChangeError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +69,33 @@ class EventPublisher:
     def run_id(self) -> UUID:
         return self._run_id
 
+    def _next_sequence(self) -> int:
+        if self._sequence is None:
+            self._sequence = 0
+        self._sequence += 1
+        return self._sequence
+
+    def _broadcast(
+        self,
+        event_type: EventType | str,
+        payload: dict[str, Any],
+        step_id: Optional[UUID] = None,
+        *,
+        seq: Optional[int] = None,
+    ) -> None:
+        message = {
+            "seq": seq,
+            "type": event_type.value if isinstance(event_type, EventType) else event_type,
+            "step_id": str(step_id) if step_id else None,
+            "payload": payload,
+        }
+        run_key = str(self._run_id)
+        for q in list(_subscribers.get(run_key, [])):
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                logger.warning(f"SSE queue full for run {run_key}, dropping event {seq}")
+
     async def emit(
         self,
         event_type: EventType,
@@ -80,8 +106,7 @@ class EventPublisher:
         if self._sequence is None:
             await self._init_sequence()
 
-        self._sequence += 1
-        seq = self._sequence
+        seq = self._next_sequence()
 
         # Build the event record
         from src.infrastructure.database.flowpilot_models import RunEventModel
@@ -95,27 +120,19 @@ class EventPublisher:
         self._session.add(event)
         try:
             await self._session.flush()
-        except InvalidRequestError as exc:
-            if "Session is already flushing" not in str(exc):
-                raise
+        except (InvalidRequestError, InterfaceError, IllegalStateChangeError) as exc:
             logger.debug(
-                "Skipping nested flush while emitting run event",
-                extra={"run_id": str(self._run_id), "sequence_num": seq},
+                "Skipping DB persistence for run event",
+                extra={
+                    "run_id": str(self._run_id),
+                    "sequence_num": seq,
+                    "event_type": event_type.value if isinstance(event_type, EventType) else event_type,
+                    "error": str(exc),
+                },
+                exc_info=True,
             )
-
-        # Broadcast to in-memory subscribers (non-blocking)
-        message = {
-            "seq": seq,
-            "type": event_type.value if isinstance(event_type, EventType) else event_type,
-            "step_id": str(step_id) if step_id else None,
-            "payload": payload,
-        }
-        run_key = str(self._run_id)
-        for q in list(_subscribers.get(run_key, [])):
-            try:
-                q.put_nowait(message)
-            except asyncio.QueueFull:
-                logger.warning(f"SSE queue full for run {run_key}, dropping event {seq}")
+        finally:
+            self._broadcast(event_type, payload, step_id=step_id, seq=seq)
 
     # -- Convenience helpers for common event patterns --
 
@@ -166,7 +183,9 @@ class EventPublisher:
             payload["prompt_summary"] = prompt_summary
         if token_usage:
             payload["token_usage"] = token_usage
-        await self.emit(EventType.REASONING, payload, step_id=step_id)
+        # Reasoning is observability only; don't race the request transaction for DB writes.
+        seq = self._next_sequence()
+        self._broadcast(EventType.REASONING, payload, step_id=step_id, seq=seq)
 
     async def approval_gate(self, candidates_summary: dict) -> None:
         await self.emit(EventType.APPROVAL_GATE, candidates_summary)

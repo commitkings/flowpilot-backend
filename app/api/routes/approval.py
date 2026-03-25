@@ -11,6 +11,7 @@ from app.api.routes.runs import _parse_uuid, _running_states
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.event_publisher import EventPublisher
 from src.agents.state import AgentState
+from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories import (
     AuditRepository,
@@ -252,14 +253,25 @@ async def approve_candidates(
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
     transaction_repo = TransactionRepository(session)
+    batch_repo = BatchRepository(session)
+
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # In simulated payout modes, recover stale failed approvals after a backend fix.
+    if run.status == "failed" and Settings.is_payout_simulated():
+        existing_batches = await batch_repo.get_by_run(run_uuid)
+        if not existing_batches:
+            await run_repo.update_status(run_uuid, "awaiting_approval", run.error_message)
+            await session.commit()
+            run = await run_repo.get_by_id(run_uuid)
 
     # Atomically transition status to prevent race condition (concurrent approvals)
     acquired = await run_repo.transition_status(run_uuid, "awaiting_approval", "executing")
     if not acquired:
         # Either run doesn't exist, wrong status, or already claimed by another request
         run = await run_repo.get_by_id(run_uuid)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
         raise HTTPException(
             status_code=409,
             detail=f"Run is not awaiting approval (status: {run.status})",
@@ -267,7 +279,6 @@ async def approve_candidates(
     await session.commit()
 
     # Idempotency guard: reject if this run already has a payout batch
-    batch_repo = BatchRepository(session)
     existing_batches = await batch_repo.get_by_run(run_uuid)
     if existing_batches:
         raise HTTPException(
@@ -335,7 +346,10 @@ async def approve_candidates(
         logger.error(f"Run {run_id} execution failed after approval: {e}")
         try:
             await session.rollback()
-            await run_repo.update_status(run_uuid, "failed", str(e))
+            recovery_status = (
+                "awaiting_approval" if Settings.is_payout_simulated() else "failed"
+            )
+            await run_repo.update_status(run_uuid, recovery_status, str(e))
             await session.commit()
         except Exception:
             logger.error(f"Run {run_id}: failed to persist error state")

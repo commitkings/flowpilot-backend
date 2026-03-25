@@ -57,6 +57,12 @@ Your job: safely execute approved payouts by verifying beneficiaries and process
 """
 
 
+def _normalize_submission_status(status: str | None) -> str:
+    normalized = (status or "pending").strip().lower()
+    allowed_statuses = {"pending", "accepted", "partial", "rejected", "failed"}
+    return normalized if normalized in allowed_statuses else "failed"
+
+
 def _build_execution_tools(
     state: AgentState, gateway: PayoutGateway
 ) -> tuple[list[Tool], dict[str, Any]]:
@@ -256,7 +262,9 @@ def _build_execution_tools(
             }
             shared_data["execution_results"].append(exec_result)
 
-            submission_status = raw.get("submissionStatus", "pending")
+            submission_status = _normalize_submission_status(
+                raw.get("submissionStatus", "pending")
+            )
             accepted = raw.get("acceptedCount", 0) or 0
             rejected = raw.get("rejectedCount", 0) or 0
 
@@ -267,9 +275,9 @@ def _build_execution_tools(
                     "source_account_id": Settings.INTERSWITCH_WALLET_ID or "",
                     "total_amount": float(candidate["amount"]),
                     "item_count": 1,
-                    "submission_status": submission_status,
-                    "accepted_count": accepted,
-                    "rejected_count": rejected,
+                "submission_status": submission_status,
+                "accepted_count": accepted,
+                "rejected_count": rejected,
                 }
             else:
                 bd = shared_data["batch_details"]
@@ -285,7 +293,7 @@ def _build_execution_tools(
                 "execution_status": exec_status,
                 "provider_reference": provider_ref,
                 "amount": candidate["amount"],
-                "submission_status": raw.get("submissionStatus"),
+                "submission_status": submission_status,
             }
 
         except Exception as e:

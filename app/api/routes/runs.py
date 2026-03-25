@@ -59,6 +59,7 @@ class CandidateResponse(BaseModel):
     risk_score: Optional[float] = None
     risk_reasons: Optional[list] = None
     risk_decision: Optional[str] = None
+    lookup_status: str = "pending"
     lookup_account_name: Optional[str] = None
     lookup_match_score: Optional[float] = None
     approval_status: str = "pending"
@@ -184,6 +185,7 @@ def _candidates_to_response(candidates) -> list[CandidateResponse]:
             risk_score=float(c.risk_score) if c.risk_score is not None else None,
             risk_reasons=c.risk_reasons,
             risk_decision=c.risk_decision,
+            lookup_status=c.lookup_status,
             lookup_account_name=c.lookup_account_name,
             lookup_match_score=float(c.lookup_match_score) if c.lookup_match_score is not None else None,
             approval_status=c.approval_status,
