@@ -2,10 +2,11 @@ name: CI / Build and Push
 
 on:
   push:
-    branches: ["main"]
+    branches: ["feature/staging"]
     paths:
       - "app/**"
       - "scripts/**"
+      - "src/**"
       - "requirements.txt"
       - "Dockerfile"
 
@@ -59,44 +60,31 @@ jobs:
           docker push $IMAGE:latest
 
 
-      # - name: Update Kubernetes Manifests
-      #   run: |
-      #     CLONE_DIR=$(mktemp -d)
-      #     git clone https://${{ secrets.MANIFESTS_REPO_TOKEN }}@github.com/${{ env.MANIFESTS_REPO }}.git $CLONE_DIR
+      - name: Update Kubernetes Manifests
+        run: |
+          CLONE_DIR=$(mktemp -d)
+          git clone https://${{ secrets.MANIFESTS_REPO_TOKEN }}@github.com/${{ env.MANIFESTS_REPO }}.git $CLONE_DIR
 
-      #     cd $CLONE_DIR/gamified-application
+          cd $CLONE_DIR/flowpilot
 
-      #     REGISTRY_PROJECT="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}"
-      #     VERSION="${{ steps.version.outputs.version }}"
+          REGISTRY_PROJECT="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}"
+          VERSION="${{ steps.version.outputs.version }}"
 
-      #     # [0-9][0-9.]* matches version numbers (1.0.NNN) only — stops before any
-      #     # closing quote or other character, so quoted ConfigMap values are safe.
-      #     for img in "backend" "frontend"; do
-      #       echo "Updating tag for $img to $VERSION"
-      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/$img:${VERSION}|g" {} +
-      #     done
+          echo "Updating tag for backend to $VERSION"
+          # Update the image tag in deployment/frontend.yaml
+          sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" deployment/backend.yaml
 
-      #     for img in "worker" "beat" "executor"; do
-      #       echo "Pointing $img at backend:$VERSION"
-      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/backend:${VERSION}|g" {} +
-      #     done
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
 
-      #     for img in "sandbox-light" "sandbox-heavy" "sandbox-omni-ide" "ide-proxy"; do
-      #       echo "Updating tag for $img to $VERSION"
-      #       find . -name "*.yaml" -type f -exec sed -i "s|${REGISTRY_PROJECT}/$img:[0-9][0-9.]*|${REGISTRY_PROJECT}/$img:${VERSION}|g" {} +
-      #     done
-
-      #     git config user.name "GitHub Actions Bot"
-      #     git config user.email "actions@github.com"
-
-      #     git add .
-      #     if git diff --staged --quiet; then
-      #       echo "No changes to commit"
-      #     else
-      #       git commit -m "Deploy version $VERSION from ${{ github.repository }}@${{ github.sha }}"
-      #       git push
-      #       echo "Manifests updated successfully"
-      #     fi
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Deploy version $VERSION from ${{ github.repository }}@${{ github.sha }}"
+            git push
+            echo "Manifests updated successfully"
+          fi
 
       # - name: Cleanup unused images
       #   if: always()
