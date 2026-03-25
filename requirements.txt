@@ -24,3 +24,4 @@ boto3==1.41.3
 
 # Utils
 python-dotenv==1.2.1
+python-multipart
