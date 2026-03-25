@@ -14,6 +14,10 @@ from src.infrastructure.database.flowpilot_models import (
 )
 
 
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 class CandidateRepository:
     """Manages PayoutCandidate persistence and retrieval."""
 
@@ -259,7 +263,7 @@ class CandidateRepository:
             List of historical payout candidates to this account
         """
         C = PayoutCandidateModel
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        cutoff = _utc_now() - datetime.timedelta(days=days)
 
         filters = [
             C.business_id == business_id,
@@ -416,7 +420,7 @@ class CandidateRepository:
             C.account_number == account_number,
         ]
         if days is not None:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            cutoff = _utc_now() - datetime.timedelta(days=days)
             filters.append(C.created_at >= cutoff)
         if exclude_run_id is not None:
             filters.append(C.run_id != exclude_run_id)

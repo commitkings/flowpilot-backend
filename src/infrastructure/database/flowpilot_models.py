@@ -1236,13 +1236,15 @@ class ConversationModel(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('gathering', 'confirming', 'executing', 'completed', 'abandoned')",
+            "status IN ('gathering', 'confirming', 'awaiting_approval', 'executing', 'completed', 'abandoned')",
             name="conversation_status_check",
         ),
         CheckConstraint(
             "current_intent IS NULL OR current_intent IN ("
-            "'create_payout_run', 'check_run_status', 'explain_system', "
-            "'modify_config', 'greeting', 'farewell', 'unclear')",
+            "'create_payout_run', 'check_run_status', 'review_candidates', "
+            "'approve_reject', 'explain_system', 'view_audit', "
+            "'modify_config', 'greeting', 'farewell', 'acknowledgement', "
+            "'unclear')",
             name="conversation_intent_check",
         ),
         Index("conversation_business_id_idx", "business_id"),

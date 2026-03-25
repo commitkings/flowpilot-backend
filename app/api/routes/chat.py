@@ -58,6 +58,8 @@ class ChatSendResponse(BaseModel):
     should_confirm: bool
     conversation_status: str
     run_config: Optional[dict] = None
+    run_created: bool = False
+    run_id: Optional[str] = None
 
 
 class ConversationSummary(BaseModel):
@@ -105,6 +107,313 @@ def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 
 
+def _is_affirmative_confirmation(message: str) -> bool:
+    normalized = " ".join("".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in message).split())
+    if not normalized:
+        return False
+    affirmatives = {
+        "yes",
+        "y",
+        "yeah",
+        "yea",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "alright",
+        "go ahead",
+        "proceed",
+        "confirmed",
+        "confirm",
+        "do it",
+    }
+    return normalized in affirmatives
+
+
+def _validate_chat_candidates(raw_candidates: object) -> list[str]:
+    if not raw_candidates:
+        return []
+    if not isinstance(raw_candidates, list):
+        return ["Candidates must be a list."]
+
+    errors: list[str] = []
+    for idx, candidate in enumerate(raw_candidates, start=1):
+        label = f"Candidate {idx}"
+        if not isinstance(candidate, dict):
+            errors.append(f"{label} is not a valid beneficiary object.")
+            continue
+
+        name = str(candidate.get("beneficiary_name", "")).strip()
+        institution_code = str(candidate.get("institution_code", "")).strip()
+        account_number = str(candidate.get("account_number", "")).strip()
+        raw_amount = candidate.get("amount")
+
+        if name:
+            label = name
+
+        if not institution_code:
+            errors.append(f"{label} is missing a bank or institution code.")
+        if not account_number:
+            errors.append(f"{label} is missing an account number.")
+        try:
+            amount = Decimal(str(raw_amount))
+        except Exception:
+            amount = Decimal("0")
+        if amount <= 0:
+            errors.append(f"{label} is missing a valid payout amount.")
+
+    return errors
+
+
+async def _create_run_from_conversation(
+    conv,
+    current_user,
+    session: AsyncSession,
+    overrides: Optional[dict] = None,
+) -> ConfirmRunResponse:
+    conv_repo = ConversationRepository(session)
+
+    if conv.status not in ("confirming", "gathering"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Conversation is in '{conv.status}' state — cannot confirm",
+        )
+
+    run_config = conv.resolved_run_config
+    if not run_config:
+        slots = conv.extracted_slots or {}
+        if not slots.get("objective"):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create run: no objective has been extracted. Continue chatting to provide details.",
+            )
+        agent = IntentAgent()
+        run_config = agent.build_run_config(slots, str(conv.business_id))
+
+    if overrides:
+        for key, value in overrides.items():
+            if key in (
+                "objective",
+                "date_from",
+                "date_to",
+                "risk_tolerance",
+                "budget_cap",
+                "constraints",
+                "candidates",
+            ):
+                run_config[key] = value
+
+    if not run_config.get("objective"):
+        raise HTTPException(status_code=400, detail="Run objective is required")
+
+    candidate_validation_errors = _validate_chat_candidates(run_config.get("candidates"))
+    if candidate_validation_errors:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create run from chat yet: "
+            + "; ".join(candidate_validation_errors),
+        )
+
+    run_repo = RunRepository(session)
+    candidate_repo = CandidateRepository(session)
+    institution_repo = InstitutionRepository(session)
+
+    business_uuid = conv.business_id
+    operator_id = current_user.id
+
+    risk_tolerance = run_config.get("risk_tolerance", 0.35)
+    budget_cap = run_config.get("budget_cap")
+    merchant_id = run_config.get("merchant_id") or Settings.INTERSWITCH_MERCHANT_ID
+
+    date_from = None
+    if run_config.get("date_from"):
+        try:
+            date_from = date.fromisoformat(run_config["date_from"])
+        except (ValueError, TypeError):
+            pass
+
+    date_to = None
+    if run_config.get("date_to"):
+        try:
+            date_to = date.fromisoformat(run_config["date_to"])
+        except (ValueError, TypeError):
+            pass
+
+    run = await run_repo.create(
+        business_id=business_uuid,
+        created_by=operator_id,
+        objective=run_config["objective"],
+        merchant_id=merchant_id,
+        constraints=run_config.get("constraints"),
+        date_from=date_from,
+        date_to=date_to,
+        risk_tolerance=Decimal(str(risk_tolerance)),
+        budget_cap=Decimal(str(budget_cap)) if budget_cap is not None else None,
+    )
+    await session.commit()
+    await session.refresh(run)
+    run_id = str(run.id)
+
+    candidate_dicts: list[dict] = []
+    raw_candidates = run_config.get("candidates", [])
+    if raw_candidates and isinstance(raw_candidates, list):
+        candidate_rows = []
+        for idx, c in enumerate(raw_candidates):
+            if not isinstance(c, dict):
+                continue
+            candidate_rows.append(
+                {
+                    "source_label": f"Chat candidate {idx + 1}",
+                    "institution_code": str(c.get("institution_code", "")),
+                    "beneficiary_name": str(c.get("beneficiary_name", "")),
+                    "account_number": str(c.get("account_number", "")),
+                    "amount": Decimal(str(c.get("amount", 0))),
+                    "currency": str(c.get("currency", "NGN")),
+                    "purpose": c.get("purpose"),
+                    "approval_status": "pending",
+                    "execution_status": "not_started",
+                }
+            )
+
+        if candidate_rows:
+            from app.api.routes.runs import _normalize_candidate_institutions
+
+            validation_errors = await _normalize_candidate_institutions(
+                candidate_rows, institution_repo
+            )
+            if validation_errors:
+                logger.warning(f"Candidate validation errors: {validation_errors[:5]}")
+
+            valid_rows = [
+                {k: v for k, v in row.items() if k != "source_label"}
+                for row in candidate_rows
+                if row.get("institution_code")
+            ]
+            if valid_rows:
+                persisted = await candidate_repo.create_batch(
+                    run.id, valid_rows, business_id=business_uuid
+                )
+                await session.commit()
+                candidate_dicts = [
+                    {
+                        "candidate_id": str(p.id),
+                        "institution_code": p.institution_code,
+                        "beneficiary_name": p.beneficiary_name,
+                        "account_number": p.account_number,
+                        "amount": float(p.amount),
+                        "currency": p.currency,
+                        "purpose": p.purpose,
+                    }
+                    for p in persisted
+                ]
+
+    await conv_repo.update_conversation(
+        conv.id,
+        status="executing",
+        run_id=run.id,
+    )
+    await session.commit()
+
+    state: AgentState = {
+        "run_id": run_id,
+        "business_id": str(business_uuid),
+        "objective": run_config["objective"],
+        "constraints": run_config.get("constraints"),
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "risk_tolerance": float(risk_tolerance),
+        "budget_cap": float(budget_cap) if budget_cap is not None else None,
+        "merchant_id": merchant_id,
+        "plan_steps": [],
+        "transactions": [],
+        "reconciled_ledger": {},
+        "unresolved_references": [],
+        "resolved_references": [],
+        "scored_candidates": candidate_dicts,
+        "forecast": None,
+        "candidate_lookup_results": [],
+        "candidate_execution_results": [],
+        "batch_details": None,
+        "approved_candidate_ids": [],
+        "rejected_candidate_ids": [],
+        "audit_report": None,
+        "current_step": "created",
+        "error": None,
+        "audit_entries": [],
+        "reasoning_log": [],
+        "tool_call_log": [],
+    }
+
+    async def _run_pipeline():
+        from src.infrastructure.database.connection import get_session_factory
+
+        factory = get_session_factory()
+        async with factory() as pipeline_session:
+            try:
+                publisher = EventPublisher(run.id, pipeline_session)
+                orchestrator = RunOrchestrator(pipeline_session, publisher=publisher)
+                final_state = await orchestrator.execute_run(run.id, state)
+
+                final_status = "completed"
+                if final_state.get("current_step") == "awaiting_approval":
+                    final_status = "awaiting_approval"
+                elif final_state.get("error"):
+                    final_status = "failed"
+
+                async with factory() as update_session:
+                    update_conv_repo = ConversationRepository(update_session)
+                    conv_status = (
+                        "awaiting_approval"
+                        if final_status == "awaiting_approval"
+                        else "completed"
+                    )
+                    await update_conv_repo.update_conversation(
+                        conv.id,
+                        status=conv_status,
+                    )
+                    summary = {
+                        "awaiting_approval": "Your payout run is ready for review and approval.",
+                        "completed": "Your payout run completed successfully.",
+                        "failed": "Your payout run failed.",
+                    }.get(final_status, f"Run {final_status}.")
+                    if final_state.get("error"):
+                        summary += f" Error: {final_state['error']}"
+                    await update_conv_repo.add_message(
+                        conv.id,
+                        role="system",
+                        content=summary,
+                    )
+                    await update_session.commit()
+
+            except Exception as e:
+                logger.error(
+                    f"Pipeline execution failed for run {run_id}: {e}", exc_info=True
+                )
+                try:
+                    async with factory() as err_session:
+                        err_conv_repo = ConversationRepository(err_session)
+                        await err_conv_repo.update_conversation(
+                            conv.id, status="completed"
+                        )
+                        await err_conv_repo.add_message(
+                            conv.id,
+                            role="system",
+                            content=f"Run failed with error: {str(e)}",
+                        )
+                        await err_session.commit()
+                except Exception:
+                    logger.error("Failed to update conversation after pipeline error")
+
+    asyncio.create_task(_run_pipeline())
+
+    return ConfirmRunResponse(
+        conversation_id=str(conv.id),
+        run_id=run_id,
+        objective=run_config["objective"],
+        status="executing",
+    )
+
+
 @router.post("/chat/send", response_model=ChatSendResponse)
 async def chat_send(
     request: ChatSendRequest,
@@ -134,6 +443,49 @@ async def chat_send(
         )
         await session.commit()
 
+    if conv.status == "confirming" and _is_affirmative_confirmation(request.message):
+        await conv_repo.add_message(
+            conv.id,
+            role="user",
+            content=request.message,
+        )
+        await session.commit()
+        await append_turn(str(conv.id), "user", request.message)
+
+        confirm_result = await _create_run_from_conversation(
+            conv,
+            current_user=current_user,
+            session=session,
+        )
+        response_text = (
+            f"I've created your payout run for {confirm_result.objective}. "
+            "I'm moving it into execution now."
+        )
+        await conv_repo.add_message(
+            conv.id,
+            role="assistant",
+            content=response_text,
+            intent_classification="create_payout_run",
+            extracted_slots=conv.extracted_slots or None,
+            confidence=1.0,
+        )
+        await session.commit()
+        await append_turn(str(conv.id), "assistant", response_text)
+
+        return ChatSendResponse(
+            conversation_id=str(conv.id),
+            response=response_text,
+            intent="create_payout_run",
+            confidence=1.0,
+            extracted_slots={},
+            merged_slots=conv.extracted_slots or {},
+            should_confirm=False,
+            conversation_status="executing",
+            run_config=conv.resolved_run_config,
+            run_created=True,
+            run_id=confirm_result.run_id,
+        )
+
     await conv_repo.add_message(
         conv.id,
         role="user",
@@ -157,6 +509,7 @@ async def chat_send(
             user_id=str(user_id),
             db_session=session,
             conversation_id=str(conv.id),
+            current_intent=conv.current_intent,
         )
     except Exception as e:
         logger.error(f"IntentAgent failed: {e}", exc_info=True)
@@ -353,238 +706,11 @@ async def confirm_and_create_run(
         raise HTTPException(status_code=404, detail="Conversation not found")
     if conv.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
-    if conv.status not in ("confirming", "gathering"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Conversation is in '{conv.status}' state — cannot confirm",
-        )
-
-    run_config = conv.resolved_run_config
-    if not run_config:
-        slots = conv.extracted_slots or {}
-        if not slots.get("objective"):
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot create run: no objective has been extracted. Continue chatting to provide details.",
-            )
-        agent = IntentAgent()
-        run_config = agent.build_run_config(slots, str(conv.business_id))
-
-    if request.overrides:
-        for key, value in request.overrides.items():
-            if key in (
-                "objective",
-                "date_from",
-                "date_to",
-                "risk_tolerance",
-                "budget_cap",
-                "constraints",
-                "candidates",
-            ):
-                run_config[key] = value
-
-    if not run_config.get("objective"):
-        raise HTTPException(status_code=400, detail="Run objective is required")
-
-    run_repo = RunRepository(session)
-    candidate_repo = CandidateRepository(session)
-    institution_repo = InstitutionRepository(session)
-
-    business_uuid = conv.business_id
-    operator_id = current_user.id
-
-    risk_tolerance = run_config.get("risk_tolerance", 0.35)
-    budget_cap = run_config.get("budget_cap")
-    merchant_id = run_config.get("merchant_id") or Settings.INTERSWITCH_MERCHANT_ID
-
-    date_from = None
-    if run_config.get("date_from"):
-        try:
-            date_from = date.fromisoformat(run_config["date_from"])
-        except (ValueError, TypeError):
-            pass
-
-    date_to = None
-    if run_config.get("date_to"):
-        try:
-            date_to = date.fromisoformat(run_config["date_to"])
-        except (ValueError, TypeError):
-            pass
-
-    run = await run_repo.create(
-        business_id=business_uuid,
-        created_by=operator_id,
-        objective=run_config["objective"],
-        merchant_id=merchant_id,
-        constraints=run_config.get("constraints"),
-        date_from=date_from,
-        date_to=date_to,
-        risk_tolerance=Decimal(str(risk_tolerance)),
-        budget_cap=Decimal(str(budget_cap)) if budget_cap is not None else None,
-    )
-    await session.commit()
-    await session.refresh(run)
-    run_id = str(run.id)
-
-    candidate_dicts: list[dict] = []
-    raw_candidates = run_config.get("candidates", [])
-    if raw_candidates and isinstance(raw_candidates, list):
-        candidate_rows = []
-        for idx, c in enumerate(raw_candidates):
-            if not isinstance(c, dict):
-                continue
-            candidate_rows.append(
-                {
-                    "source_label": f"Chat candidate {idx + 1}",
-                    "institution_code": str(c.get("institution_code", "")),
-                    "beneficiary_name": str(c.get("beneficiary_name", "")),
-                    "account_number": str(c.get("account_number", "")),
-                    "amount": Decimal(str(c.get("amount", 0))),
-                    "currency": str(c.get("currency", "NGN")),
-                    "purpose": c.get("purpose"),
-                    "approval_status": "pending",
-                    "execution_status": "not_started",
-                }
-            )
-
-        if candidate_rows:
-            from app.api.routes.runs import _normalize_candidate_institutions
-
-            validation_errors = await _normalize_candidate_institutions(
-                candidate_rows, institution_repo
-            )
-            if validation_errors:
-                logger.warning(f"Candidate validation errors: {validation_errors[:5]}")
-
-            valid_rows = [
-                {k: v for k, v in row.items() if k != "source_label"}
-                for row in candidate_rows
-                if row.get("institution_code")
-            ]
-            if valid_rows:
-                persisted = await candidate_repo.create_batch(
-                    run.id, valid_rows, business_id=business_uuid
-                )
-                await session.commit()
-                candidate_dicts = [
-                    {
-                        "candidate_id": str(p.id),
-                        "institution_code": p.institution_code,
-                        "beneficiary_name": p.beneficiary_name,
-                        "account_number": p.account_number,
-                        "amount": float(p.amount),
-                        "currency": p.currency,
-                        "purpose": p.purpose,
-                    }
-                    for p in persisted
-                ]
-
-    await conv_repo.update_conversation(
-        conv.id,
-        status="executing",
-        run_id=run.id,
-    )
-
-    await conv_repo.add_message(
-        conv.id,
-        role="system",
-        content=f"Run created: {run_id}. Objective: {run_config['objective']}. Pipeline is now executing.",
-    )
-    await session.commit()
-
-    state: AgentState = {
-        "run_id": run_id,
-        "business_id": str(business_uuid),
-        "objective": run_config["objective"],
-        "constraints": run_config.get("constraints"),
-        "date_from": date_from.isoformat() if date_from else None,
-        "date_to": date_to.isoformat() if date_to else None,
-        "risk_tolerance": float(risk_tolerance),
-        "budget_cap": float(budget_cap) if budget_cap is not None else None,
-        "merchant_id": merchant_id,
-        "plan_steps": [],
-        "transactions": [],
-        "reconciled_ledger": {},
-        "unresolved_references": [],
-        "resolved_references": [],
-        "scored_candidates": candidate_dicts,
-        "forecast": None,
-        "candidate_lookup_results": [],
-        "candidate_execution_results": [],
-        "batch_details": None,
-        "approved_candidate_ids": [],
-        "rejected_candidate_ids": [],
-        "audit_report": None,
-        "current_step": "created",
-        "error": None,
-        "audit_entries": [],
-        "reasoning_log": [],
-        "tool_call_log": [],
-    }
-
-    async def _run_pipeline():
-        from src.infrastructure.database.connection import get_session_factory
-
-        factory = get_session_factory()
-        async with factory() as pipeline_session:
-            try:
-                publisher = EventPublisher(run.id, pipeline_session)
-                orchestrator = RunOrchestrator(pipeline_session, publisher=publisher)
-                final_state = await orchestrator.execute_run(run.id, state)
-
-                final_status = "completed"
-                if final_state.get("current_step") == "awaiting_approval":
-                    final_status = "awaiting_approval"
-                elif final_state.get("error"):
-                    final_status = "failed"
-
-                async with factory() as update_session:
-                    update_conv_repo = ConversationRepository(update_session)
-                    conv_status = (
-                        "awaiting_approval"
-                        if final_status == "awaiting_approval"
-                        else "completed"
-                    )
-                    await update_conv_repo.update_conversation(
-                        conv.id,
-                        status=conv_status,
-                    )
-                    summary = f"Run {final_status}."
-                    if final_state.get("error"):
-                        summary += f" Error: {final_state['error']}"
-                    await update_conv_repo.add_message(
-                        conv.id,
-                        role="system",
-                        content=summary,
-                    )
-                    await update_session.commit()
-
-            except Exception as e:
-                logger.error(
-                    f"Pipeline execution failed for run {run_id}: {e}", exc_info=True
-                )
-                try:
-                    async with factory() as err_session:
-                        err_conv_repo = ConversationRepository(err_session)
-                        await err_conv_repo.update_conversation(
-                            conv.id, status="completed"
-                        )
-                        await err_conv_repo.add_message(
-                            conv.id,
-                            role="system",
-                            content=f"Run failed with error: {str(e)}",
-                        )
-                        await err_session.commit()
-                except Exception:
-                    logger.error("Failed to update conversation after pipeline error")
-
-    asyncio.create_task(_run_pipeline())
-
-    return ConfirmRunResponse(
-        conversation_id=str(conv.id),
-        run_id=run_id,
-        objective=run_config["objective"],
-        status="executing",
+    return await _create_run_from_conversation(
+        conv,
+        current_user=current_user,
+        session=session,
+        overrides=request.overrides,
     )
 
 

@@ -77,6 +77,8 @@ class TransactionSearchClient:
 
         url = f"{self._base_url}{_QUICK_SEARCH_PATH}"
         headers = await self._auth.get_headers()
+        if Settings.INTERSWITCH_CLIENT_ID:
+            headers["ClientId"] = Settings.INTERSWITCH_CLIENT_ID
 
         logger.info(
             f"TransactionSearch quick_search: merchant={merchant_code}, "
@@ -112,6 +114,8 @@ class TransactionSearchClient:
 
         url = f"{self._base_url}{_QUICK_SEARCH_PATH}"
         headers = await self._auth.get_headers()
+        if Settings.INTERSWITCH_CLIENT_ID:
+            headers["ClientId"] = Settings.INTERSWITCH_CLIENT_ID
 
         logger.info(f"TransactionSearch reference_search: ref={unique_reference}")
 

@@ -12,7 +12,7 @@ This agent performs genuine risk analysis using:
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -22,6 +22,10 @@ from src.agents.state import AgentState
 from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 # ============================================================================
 # Default Risk Weights (can be overridden via business_config.preferences)
@@ -520,7 +524,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             )
             days_since = None
             if last_payout:
-                days_since = (datetime.utcnow() - last_payout).days
+                days_since = (_utc_now() - last_payout).days
 
             # Account age
             first_payout = await repo.get_first_payout_date_for_account(
@@ -529,7 +533,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             )
             account_age = None
             if first_payout:
-                account_age = (datetime.utcnow() - first_payout).days
+                account_age = (_utc_now() - first_payout).days
 
             is_new = velocity_30d == 0 and account_age is None
 

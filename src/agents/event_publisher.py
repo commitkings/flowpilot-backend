@@ -11,6 +11,7 @@ from uuid import UUID
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import InvalidRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,15 @@ class EventPublisher:
             sequence_num=seq,
         )
         self._session.add(event)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except InvalidRequestError as exc:
+            if "Session is already flushing" not in str(exc):
+                raise
+            logger.debug(
+                "Skipping nested flush while emitting run event",
+                extra={"run_id": str(self._run_id), "sequence_num": seq},
+            )
 
         # Broadcast to in-memory subscribers (non-blocking)
         message = {

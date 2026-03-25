@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -147,6 +148,8 @@ For create_payout_run:
 - If objective is missing: "What's this payout for? For example, 'March salaries' or 'vendor settlements'."
 - If objective exists, ask naturally for the next missing piece.
 - When ready: give a brief summary and ask "Should I go ahead?"
+- Never claim a payout run has been created, executed, or validated inside normal chat unless the system has explicitly confirmed that action.
+- Never claim bank or beneficiary validation happened unless a tool actually performed it.
 
 For check_run_status:
 - Use get_recent_runs tool, then summarize in 1-2 sentences.
@@ -472,6 +475,7 @@ class IntentAgent(BaseAgent):
         user_id: str,
         db_session=None,
         conversation_id: Optional[str] = None,
+        current_intent: Optional[str] = None,
     ) -> dict:
         self.registry = ToolRegistry()
         history_for_llm = conversation_history
@@ -495,12 +499,26 @@ class IntentAgent(BaseAgent):
         intent = classification.get("intent", "unclear")
         confidence = classification.get("confidence", 0.0)
 
+        if self._should_continue_payout_flow(
+            user_message=user_message,
+            current_slots=current_slots,
+            current_intent=current_intent,
+            classified_intent=intent,
+        ):
+            intent = "create_payout_run"
+            confidence = max(confidence, 0.85)
+
         extracted = {}
         if intent == "create_payout_run":
             extraction = await self._extract_slots(
                 user_message, history_for_llm, current_slots
             )
             extracted = extraction.get("extracted", {})
+            contextual_updates = self._extract_contextual_slot_updates(
+                user_message, current_slots, extracted
+            )
+            for key, value in contextual_updates.items():
+                extracted[key] = value
 
         merged_slots = {**current_slots}
         for key, value in extracted.items():
@@ -670,6 +688,8 @@ Generate your response to the user. Use tools if you need to look up business in
     def _has_sufficient_slots(self, slots: dict) -> bool:
         if not slots.get("objective"):
             return False
+        if self._candidate_details_missing(slots):
+            return False
         filled_optional = sum(
             1
             for key in [
@@ -689,11 +709,142 @@ Generate your response to the user. Use tools if you need to look up business in
             missing.append("objective (what is this payout for?)")
         if slots.get("budget_cap") is None:
             missing.append("budget_cap (optional: maximum total payout)")
+        candidate_missing = self._candidate_details_missing(slots)
+        if candidate_missing:
+            missing.extend(candidate_missing)
         if slots.get("candidates") is None:
             missing.append(
                 "candidates (optional: beneficiary list, can also upload CSV later)"
             )
         return missing
+
+    def _candidate_details_missing(self, slots: dict) -> list[str]:
+        candidates = slots.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return []
+
+        missing: list[str] = []
+        for idx, candidate in enumerate(candidates, start=1):
+            if not isinstance(candidate, dict):
+                missing.append(
+                    f"candidate {idx} details (beneficiary name, bank, account number, amount)"
+                )
+                continue
+
+            label = candidate.get("beneficiary_name") or f"candidate {idx}"
+            if not candidate.get("institution_code"):
+                missing.append(f"institution code for {label}")
+            if not candidate.get("account_number"):
+                missing.append(f"account number for {label}")
+            amount = candidate.get("amount")
+            try:
+                amount_value = float(amount)
+            except (TypeError, ValueError):
+                amount_value = 0.0
+            if amount_value <= 0:
+                missing.append(f"amount for {label}")
+        return missing
+
+    def _should_continue_payout_flow(
+        self,
+        user_message: str,
+        current_slots: dict,
+        current_intent: Optional[str],
+        classified_intent: str,
+    ) -> bool:
+        if classified_intent == "create_payout_run":
+            return False
+
+        in_payout_flow = current_intent == "create_payout_run" or bool(
+            current_slots.get("objective")
+        )
+        if not in_payout_flow:
+            return False
+
+        if classified_intent in ("check_run_status", "explain_system", "modify_config"):
+            return False
+
+        normalized = user_message.strip().lower()
+        if not normalized:
+            return False
+
+        if self._extract_candidate_amount_from_message(user_message) is not None:
+            return True
+
+        payout_followup_markers = (
+            "amount",
+            "bank",
+            "account",
+            "beneficiary",
+            "candidate",
+            "budget",
+            "risk",
+            "salary",
+            "salaries",
+            "vendor",
+            "payment",
+            "payout",
+        )
+        if any(marker in normalized for marker in payout_followup_markers):
+            return True
+
+        return bool(self._candidate_details_missing(current_slots))
+
+    def _extract_contextual_slot_updates(
+        self,
+        user_message: str,
+        current_slots: dict,
+        extracted: dict,
+    ) -> dict:
+        updates: dict[str, Any] = {}
+        if extracted.get("candidates"):
+            return updates
+
+        candidates = current_slots.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            return updates
+        if not isinstance(candidates[0], dict):
+            return updates
+
+        candidate = dict(candidates[0])
+        amount = candidate.get("amount")
+        try:
+            current_amount = float(amount)
+        except (TypeError, ValueError):
+            current_amount = 0.0
+
+        if current_amount > 0:
+            return updates
+
+        parsed_amount = self._extract_candidate_amount_from_message(user_message)
+        if parsed_amount is None:
+            return updates
+
+        candidate["amount"] = parsed_amount
+        updates["candidates"] = [candidate]
+        return updates
+
+    def _extract_candidate_amount_from_message(
+        self, user_message: str
+    ) -> Optional[float]:
+        normalized = user_message.lower()
+        if not any(
+            marker in normalized
+            for marker in ("amount", "naira", "ngn", "₦", "k", "000")
+        ):
+            return None
+
+        matches = re.findall(r"\d[\d,]*(?:\.\d+)?", user_message)
+        if not matches:
+            return None
+
+        raw = matches[-1].replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+
+        return value if value > 0 else None
 
     def _format_history(self, history: list[dict], max_turns: int = 6) -> str:
         if not history:
