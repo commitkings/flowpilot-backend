@@ -53,7 +53,8 @@ jobs:
             --cache-from $IMAGE:latest \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
             -t $IMAGE:${{ steps.version.outputs.version }} \
-            -t $IMAGE:latest
+            -t $IMAGE:latest \
+            .
           docker push $IMAGE:${{ steps.version.outputs.version }}
           docker push $IMAGE:latest
 
