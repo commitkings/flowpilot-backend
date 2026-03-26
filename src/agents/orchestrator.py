@@ -586,6 +586,7 @@ class RunOrchestrator:
             try:
                 match_score = lr.get("lookup_match_score")
                 txn_ref = lr.get("transaction_reference")
+                account_number = lr.get("account_number") or ""
                 await self._candidate_repo.update_lookup(
                     candidate_id=uuid.UUID(candidate_id),
                     lookup_status=lr.get("lookup_status", "failed"),
@@ -599,7 +600,7 @@ class RunOrchestrator:
                 await self._exec_detail_repo.create_lookup_result(
                     candidate_id=uuid.UUID(candidate_id),
                     run_id=run_id,
-                    account_number=lr.get("lookup_account_name", ""),  # from raw data
+                    account_number=account_number,
                     institution_code=lr.get("institution_code", ""),
                     can_credit=lr.get("lookup_status") == "success"
                     or lr.get("lookup_status") == "mismatch",

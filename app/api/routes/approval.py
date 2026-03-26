@@ -263,7 +263,7 @@ async def approve_candidates(
     if run.status == "failed" and Settings.is_payout_simulated():
         existing_batches = await batch_repo.get_by_run(run_uuid)
         if not existing_batches:
-            await run_repo.update_status(run_uuid, "awaiting_approval", run.error_message)
+            await run_repo.update_status(run_uuid, "awaiting_approval", None)
             await session.commit()
             run = await run_repo.get_by_id(run_uuid)
 
@@ -276,6 +276,7 @@ async def approve_candidates(
             status_code=409,
             detail=f"Run is not awaiting approval (status: {run.status})",
         )
+    await run_repo.update_status(run_uuid, "executing", None)
     await session.commit()
 
     # Idempotency guard: reject if this run already has a payout batch
@@ -294,6 +295,7 @@ async def approve_candidates(
         state = await _reconstruct_state_from_db(session, run_uuid)
         if state is None:
             raise HTTPException(status_code=404, detail="Run not found")
+    state["error"] = None
 
     # Approve candidates in DB (candidate_ids already validated above)
     approved_count = await candidate_repo.approve(candidate_ids, current_user.id, run_uuid)
