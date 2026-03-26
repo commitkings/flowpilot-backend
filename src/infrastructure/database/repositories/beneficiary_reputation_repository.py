@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_, text, NUMERIC
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -146,8 +146,8 @@ class BeneficiaryReputationRepository:
             M.successful_payouts + 1 if is_success else M.successful_payouts
         )
         new_total = M.total_attempts + 1
-        update_dict["success_rate"] = func.cast(new_successes, Decimal) / func.cast(
-            new_total, Decimal
+        update_dict["success_rate"] = func.cast(new_successes, NUMERIC(10, 4)) / func.cast(
+            new_total, NUMERIC(10, 4)
         )
 
         # Update beneficiary name if provided and currently null
@@ -194,8 +194,8 @@ class BeneficiaryReputationRepository:
         This Bayesian-inspired approach prevents extreme scores with
         limited data while converging to actual success rate over time.
         """
-        confidence = func.least(func.cast(total, Decimal) / 10, Decimal("1.0"))
-        base_rate = func.cast(successes, Decimal) / func.cast(total, Decimal)
+        confidence = func.least(func.cast(total, NUMERIC(10, 4)) / 10, 1.0)
+        base_rate = func.cast(successes, NUMERIC(10, 4)) / func.cast(total, NUMERIC(10, 4))
         prior = Decimal("0.5")
         return base_rate * confidence + prior * (1 - confidence)
 
