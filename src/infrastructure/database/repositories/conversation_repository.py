@@ -128,6 +128,19 @@ class ConversationRepository:
         await self._s.flush()
         return conv
 
+    async def get_by_run_id(
+        self, run_id: uuid.UUID
+    ) -> Optional[ConversationModel]:
+        """Find the conversation linked to a specific run."""
+        stmt = (
+            select(ConversationModel)
+            .where(ConversationModel.run_id == run_id)
+            .order_by(ConversationModel.updated_at.desc())
+            .limit(1)
+        )
+        result = await self._s.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_messages(
         self, conversation_id: uuid.UUID
     ) -> list[ConversationMessageModel]:

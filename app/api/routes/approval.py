@@ -17,6 +17,7 @@ from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
     CandidateRepository,
+    ConversationRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -208,6 +209,39 @@ async def _reconstruct_state_from_db(
 
 
 # ------------------------------------------------------------------
+# Conversation sync after approval-driven run completion
+# ------------------------------------------------------------------
+
+
+async def _sync_conversation_after_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    final_status: str,
+    error: str | None,
+) -> None:
+    """Update the conversation linked to this run with a terminal status and message."""
+    try:
+        conv_repo = ConversationRepository(session)
+        conv = await conv_repo.get_by_run_id(run_id)
+        if conv is None:
+            return
+
+        summary = {
+            "completed": "Your payout run completed successfully.",
+            "failed": "Your payout run failed.",
+        }.get(final_status, f"Run finished with status: {final_status}.")
+
+        if error:
+            summary += f" Error: {error}"
+
+        await conv_repo.update_conversation(conv.id, status="completed")
+        await conv_repo.add_message(conv.id, role="system", content=summary)
+        await session.commit()
+    except Exception as exc:
+        logger.warning(f"Run {run_id}: failed to sync conversation after approval: {exc}")
+
+
+# ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
 
@@ -338,6 +372,12 @@ async def approve_candidates(
         _running_states.pop(run_id, None)
 
         final_status = "failed" if state.get("error") else "completed"
+
+        # Sync linked conversation so chat UI reflects run completion
+        await _sync_conversation_after_run(
+            session, run_uuid, final_status, state.get("error")
+        )
+
         return {
             "run_id": run_id,
             "status": final_status,
@@ -353,6 +393,11 @@ async def approve_candidates(
             )
             await run_repo.update_status(run_uuid, recovery_status, str(e))
             await session.commit()
+
+            # Mark conversation as completed even on failure so it's not stuck
+            await _sync_conversation_after_run(
+                session, run_uuid, "failed", str(e)
+            )
         except Exception:
             logger.error(f"Run {run_id}: failed to persist error state")
         _running_states.pop(run_id, None)
