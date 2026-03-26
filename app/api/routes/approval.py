@@ -224,21 +224,32 @@ async def _sync_conversation_after_run(
         conv_repo = ConversationRepository(session)
         conv = await conv_repo.get_by_run_id(run_id)
         if conv is None:
+            logger.warning(f"Run {run_id}: no conversation found to sync")
             return
 
-        summary = {
-            "completed": "Your payout run completed successfully.",
-            "failed": "Your payout run failed.",
-        }.get(final_status, f"Run finished with status: {final_status}.")
+        # Craft a user-friendly completion message
+        if final_status == "completed":
+            summary = (
+                "Your payout run completed successfully!\n\n"
+                "All approved transactions have been processed. "
+                "You can view the detailed results in the run dashboard."
+            )
+        elif final_status == "failed":
+            summary = "Your payout run failed."
+            if error:
+                summary += f"\n\nError: {error}"
+        else:
+            summary = f"Run finished with status: {final_status}."
+            if error:
+                summary += f"\n\nError: {error}"
 
-        if error:
-            summary += f" Error: {error}"
-
+        # Use "assistant" role so it displays as an AI message in the chat UI
         await conv_repo.update_conversation(conv.id, status="completed")
-        await conv_repo.add_message(conv.id, role="system", content=summary)
+        await conv_repo.add_message(conv.id, role="assistant", content=summary)
         await session.commit()
+        logger.info(f"Run {run_id}: conversation {conv.id} synced to status=completed")
     except Exception as exc:
-        logger.warning(f"Run {run_id}: failed to sync conversation after approval: {exc}")
+        logger.warning(f"Run {run_id}: failed to sync conversation after approval: {exc}", exc_info=True)
 
 
 # ------------------------------------------------------------------
