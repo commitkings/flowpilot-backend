@@ -192,6 +192,11 @@ class Settings:
         return cls.PAYOUT_MODE.lower() in ("simulated", "lookup_only")
 
     @classmethod
+    def is_reconciliation_simulated(cls) -> bool:
+        """Only fully simulated mode should disable transaction reconciliation."""
+        return cls.PAYOUT_MODE.lower() == "simulated"
+
+    @classmethod
     def validate_payout_config(cls) -> list[str]:
         """Return a list of configuration warnings/errors for payout setup."""
         warnings: list[str] = []

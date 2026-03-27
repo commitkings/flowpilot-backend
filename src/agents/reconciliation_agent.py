@@ -104,7 +104,7 @@ def _build_reconciliation_tools(state: AgentState) -> tuple[list[Tool], dict[str
         start_date, end_date = _resolve_window()
         status_list = [s.strip() for s in statuses.split(",")]
 
-        if Settings.is_payout_simulated():
+        if Settings.is_reconciliation_simulated():
             shared_data["transactions"] = []
             return {
                 "mode": "simulated",
@@ -138,7 +138,7 @@ def _build_reconciliation_tools(state: AgentState) -> tuple[list[Tool], dict[str
     async def search_by_reference(transaction_reference: str) -> dict[str, Any]:
         merchant_id = state.get("merchant_id", Settings.INTERSWITCH_MERCHANT_ID)
 
-        if Settings.is_payout_simulated():
+        if Settings.is_reconciliation_simulated():
             return {
                 "mode": "simulated",
                 "reference": transaction_reference,
