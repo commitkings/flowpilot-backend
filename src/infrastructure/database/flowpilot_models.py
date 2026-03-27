@@ -810,7 +810,7 @@ class RiskScoreFeatureModel(Base):
     account_anomaly_count: Mapped[Optional[int]] = mapped_column(SmallInteger)
     account_age_days: Mapped[Optional[int]] = mapped_column(Integer)
     days_since_last_payout: Mapped[Optional[int]] = mapped_column(Integer)
-    amount_vs_budget_cap_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(7, 4))
+    amount_vs_budget_cap_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
     model_version: Mapped[str] = mapped_column(String(32))
     computed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

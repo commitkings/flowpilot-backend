@@ -95,7 +95,31 @@ _GREETING_PATTERNS: set[str] = {
     "hi there", "hey there", "hello there", "morning", "afternoon",
     "how are you", "how you dey", "how far", "e kaaro", "e kaasan",
     "sannu", "nnoo", "kedu", "whats up", "hiya",
+    "hey dude", "hey man", "hey bro", "hey fam", "hey boss",
+    "hi dude", "hi man", "hi bro", "hi fam", "hi boss",
+    "hello there friend", "hello fam",
+    "how are you doing", "how you doing", "hows it going", "how is it going",
+    "how goes it", "how do you do",
 }
+
+_GREETING_PREFIXES: tuple[str, ...] = (
+    "hey ",
+    "hi ",
+    "hello ",
+    "howdy ",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how are you",
+    "how you doing",
+    "how you dey",
+    "hows it going",
+    "how is it going",
+    "whats up",
+    "yo ",
+    "sup ",
+    "hiya ",
+)
 
 _FAREWELL_PATTERNS: set[str] = {
     "bye", "goodbye", "good bye", "see you", "later", "gotta go",
@@ -149,6 +173,15 @@ def _tier1_classify(message: str) -> Optional[IntentResult]:
             intent=FlowPilotIntent.GREETING,
             confidence=0.95,
             reasoning=f"Matched greeting pattern: '{clean}'",
+            tier=1,
+        )
+
+    # Prefix-based greeting detection (catches "hey dude", "how you doing, it's weekend...", etc.)
+    if any(clean.startswith(prefix) for prefix in _GREETING_PREFIXES):
+        return IntentResult(
+            intent=FlowPilotIntent.GREETING,
+            confidence=0.90,
+            reasoning=f"Greeting prefix detected in: '{clean[:40]}'",
             tier=1,
         )
 

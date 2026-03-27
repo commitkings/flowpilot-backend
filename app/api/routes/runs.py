@@ -85,6 +85,7 @@ class RunResponse(BaseModel):
     objective: str
     status: str
     created_at: str
+    risk_tolerance: Optional[float] = None
     plan_steps: Optional[list] = None
     candidates: Optional[list[CandidateResponse]] = None
     candidate_count: int = 0
@@ -340,6 +341,7 @@ async def create_run(
             objective=run.objective,
             status=final_status,
             created_at=run.created_at.isoformat(),
+            risk_tolerance=float(run.risk_tolerance),
             plan_steps=state.get("plan_steps"),
             candidates=candidate_responses or None,
             candidate_count=len(candidate_responses),
@@ -439,6 +441,7 @@ async def get_run(
         objective=run.objective,
         status=run.status,
         created_at=run.created_at.isoformat(),
+        risk_tolerance=float(run.risk_tolerance),
         plan_steps=plan_steps or None,
         candidates=candidate_responses or None,
         candidate_count=len(candidate_responses),

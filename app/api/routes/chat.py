@@ -155,6 +155,8 @@ def _validate_chat_candidates(raw_candidates: object) -> list[str]:
         if name:
             label = name
 
+        if not name:
+            errors.append(f"{label} is missing a beneficiary name.")
         if not institution_code:
             errors.append(f"{label} is missing a bank or institution code.")
         if not account_number:
@@ -179,6 +181,9 @@ def _get_missing_required_run_fields(run_config: dict) -> list[str]:
         missing.append("end date")
     if run_config.get("risk_tolerance") is None:
         missing.append("risk tolerance")
+    candidates = run_config.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        missing.append("at least one beneficiary")
     return missing
 
 

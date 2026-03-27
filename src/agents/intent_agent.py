@@ -14,6 +14,36 @@ from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+_INSTITUTION_NAME_STOPWORDS = {"bank", "plc", "limited", "ltd", "nigeria", "nigerian"}
+_NON_NAME_TOKENS = {
+    # Financial / domain terms
+    "salary", "salaries", "vendor", "vendors", "settlement", "settlements",
+    "payroll", "payment", "payments", "payout", "payouts", "budget", "risk",
+    "threshold", "reconcile", "reconciliation", "bank", "account", "amount",
+    "institution", "beneficiary", "candidate", "transaction", "naira",
+    # Months
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    # Common verbs and request words (critical: prevents "give me some suggestions" etc.)
+    "give", "get", "show", "list", "make", "run", "set", "use", "try",
+    "find", "check", "send", "create", "start", "help", "want", "need",
+    "tell", "update", "change", "pick", "select", "choose",
+    # Pronouns, determiners, and filler words
+    "me", "my", "i", "we", "our", "you", "your", "the", "a", "an",
+    "some", "any", "this", "that", "these", "those", "it", "its",
+    # Common adjectives/adverbs that aren't names
+    "new", "old", "good", "bad", "please", "just", "also", "more",
+    "other", "first", "last", "next", "all", "each", "every",
+    # Misc conversational words that could form multi-word phrases
+    "suggestions", "suggestion", "options", "option", "example", "examples",
+    "like", "about", "from", "with", "for", "what", "how", "which",
+    "said", "keep", "asking", "already", "gave", "told", "again",
+    "lol", "mean", "ok", "okay", "yes", "no", "not", "can", "could",
+    "would", "should", "will", "shall", "do", "does", "did", "done",
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "here", "there",
+}
+
 VALID_INTENTS = [
     "create_payout_run",
     "check_run_status",
@@ -61,9 +91,9 @@ PAYOUT_RUN_SLOTS = {
     },
 }
 
-INTENT_SYSTEM_PROMPT = """You are FlowPilot AI, an intelligent payout operations assistant that helps businesses automate payout runs via Interswitch.
+INTENT_SYSTEM_PROMPT = """You are FlowPilot AI, a friendly and knowledgeable payout operations assistant that helps businesses automate payout runs via Interswitch.
 
-Speak in first person. You ARE FlowPilot AI. Be warm, helpful, and professional like a friendly senior fintech colleague.
+Speak in first person. You ARE FlowPilot AI. You're like a helpful colleague who genuinely cares about getting the job done right. Be warm, approachable, and human. Match the user's energy and tone.
 
 Keep responses to 2-3 sentences. Be concise and natural.
 
@@ -76,7 +106,7 @@ What you do:
 
 Key facts:
 - Payouts go through Interswitch APIs
-- A payout run is only ready for confirmation after you have the objective, start date, end date, and risk tolerance
+- A payout run is only ready for confirmation after you have the objective, start date, end date, risk tolerance, and at least one beneficiary
 - Risk tolerance: 0.0 to 1.0 (default 0.35), lower means stricter
 - Budget cap is optional
 - Candidates can be added inline or uploaded via CSV
@@ -87,7 +117,10 @@ Rules:
 3. Ask for missing required info one at a time.
 4. When ready, summarize briefly and ask for confirmation.
 5. Use tools to look up real business info, never guess.
-6. Sound warm and conversational, not corporate or robotic."""
+6. Sound warm and conversational, not corporate or robotic.
+7. If the user asks for suggestions or examples, actually give them helpful suggestions! Don't just repeat the question.
+8. If the user makes small talk or is casual, respond warmly and naturally before steering back to work.
+9. When the user provides info you already asked for, acknowledge it and move on. Never ask the same question twice."""
 
 
 CLASSIFY_SYSTEM_PROMPT = """You are an intent classification engine for FlowPilot, a fintech payout automation platform.
@@ -133,21 +166,23 @@ Respond with ONLY a valid JSON object:
 If nothing can be extracted, respond with: {"extracted": {}, "reasoning": "No payout parameters found in this message"}"""
 
 
-RESPONSE_SYSTEM_PROMPT = """You are FlowPilot AI, a warm and intelligent payout operations assistant.
+RESPONSE_SYSTEM_PROMPT = """You are FlowPilot AI, a warm, sharp, and genuinely helpful payout operations assistant.
 
-You speak in first person. You ARE FlowPilot AI. Sound like a friendly, knowledgeable colleague who genuinely wants to help.
+You speak in first person. You ARE FlowPilot AI. Think of yourself as that one colleague everyone loves, you're approachable, you remember context, and you never make people repeat themselves. Match the user's vibe: if they're casual, be casual back. If they're in a hurry, get straight to the point.
 
 STYLE RULES (CRITICAL):
 - NEVER use em dashes (the long dash character). Use commas, periods, or semicolons instead.
-- Keep responses to 2-3 sentences max.
-- Be warm and conversational, not corporate or robotic.
+- Keep responses to 2-3 sentences max. Only go longer if you're listing suggestions the user asked for.
+- Be warm, natural, and human. Contractions are good ("I'll", "let's", "you've").
 - Use everyday language, not formal business-speak.
-- Reference what the user already told you to show you're listening.
+- Reference what the user already told you to show you're paying attention.
+- If the user seems frustrated or repeats themselves, acknowledge it kindly and fix the issue. Never ignore their frustration.
 
 For create_payout_run:
-- If objective is missing: "What's this payout for? For example, 'March salaries' or 'vendor settlements'."
-- Before confirming a payout run, make sure you have the objective, start date, end date, and risk tolerance.
-- If objective exists, ask naturally for the next missing piece.
+- If objective is missing: "What's this payout for? Something like 'March salaries' or 'vendor settlements'?"
+- If the user asks for SUGGESTIONS or HELP deciding, give 2-3 concrete examples relevant to their business (use get_business_info if needed). E.g. "Here are a few common ones: salary payroll, vendor settlements, commission payouts, or contractor payments. Which fits?"
+- Before confirming a payout run, make sure you have the objective, start date, end date, risk tolerance, and at least one beneficiary.
+- If objective exists, ask naturally for the next missing piece. Always acknowledge what you've already captured.
 - When ready: give a brief summary and ask "Should I go ahead?"
 - Never claim a payout run has been created, executed, or validated inside normal chat unless the system has explicitly confirmed that action.
 - Never claim bank or beneficiary validation happened unless a tool actually performed it.
@@ -156,21 +191,86 @@ For check_run_status:
 - Use get_recent_runs tool, then summarize in 1-2 sentences.
 
 For explain_system:
-- Keep it simple: "I process payouts in 6 steps: Plan, Reconcile, Risk Score, Approve, Execute, and Audit."
+- Keep it simple and friendly: "I process payouts in 6 steps: Plan, Reconcile, Risk Score, Approve, Execute, and Audit."
 
 For greeting:
-- "Hey! I'm FlowPilot AI. I help you run payouts end-to-end. What are we working on today?"
+- Be warm and match the user's energy. If they're casual ("hey dude"), be casual back ("Hey! Good to see you.").
+- Always end with a gentle nudge: "What can I help you with today?" or "Ready to get something done?"
 
 For farewell:
-- "Catch you later! I'll be here when you need me."
+- "Catch you later! I'll be here whenever you need me."
 
 For acknowledgement:
 - Respond naturally in 1 sentence, building on what was just discussed.
 
 For unclear:
-- Ask one friendly clarifying question.
+- Ask one friendly clarifying question. If they seem to be providing info for an active payout flow, try to map it to the next missing parameter.
 
 Your response goes DIRECTLY to the user. No JSON, no metadata. Just the message."""
+
+
+def _normalize_institution_alias(value: str) -> str:
+    return "".join(char for char in value.strip().lower() if char.isalnum())
+
+
+def _institution_alias_variants(value: str) -> set[str]:
+    normalized = _normalize_institution_alias(value)
+    if not normalized:
+        return set()
+
+    variants = {normalized}
+    variants.add(normalized.replace("guarantee", "guaranty"))
+    variants.add(normalized.replace("guaranty", "guarantee"))
+
+    nickname_map = {
+        "gtbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
+        "gtb": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
+        "guarantytrustbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
+        "guaranteetrustbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
+    }
+    variants.update(nickname_map.get(normalized, set()))
+    return {variant for variant in variants if variant}
+
+
+def _build_institution_alias_map(institutions: list[Any]) -> dict[str, str]:
+    alias_map: dict[str, str] = {}
+
+    for institution in institutions:
+        raw_aliases = [
+            getattr(institution, "institution_code", None),
+            getattr(institution, "institution_name", None),
+            getattr(institution, "short_name", None),
+            getattr(institution, "nip_code", None),
+            getattr(institution, "cbn_code", None),
+        ]
+
+        for raw_alias in raw_aliases:
+            if not raw_alias:
+                continue
+            for variant in _institution_alias_variants(str(raw_alias)):
+                alias_map.setdefault(variant, institution.institution_code)
+
+        institution_name = str(getattr(institution, "institution_name", "") or "")
+        tokens = [token for token in re.split(r"[^a-z0-9]+", institution_name.lower()) if token]
+        acronym = "".join(token[0] for token in tokens if token not in _INSTITUTION_NAME_STOPWORDS)
+        if len(acronym) >= 2:
+            alias_map.setdefault(acronym, institution.institution_code)
+            if "bank" in tokens:
+                alias_map.setdefault(f"{acronym}bank", institution.institution_code)
+
+    return alias_map
+
+
+def _resolve_institution_code(raw_value: str, institutions: list[Any]) -> Optional[str]:
+    if not raw_value:
+        return None
+
+    alias_map = _build_institution_alias_map(institutions)
+    for variant in _institution_alias_variants(raw_value):
+        resolved = alias_map.get(variant)
+        if resolved:
+            return resolved
+    return None
 
 
 def _build_intent_tools(
@@ -286,15 +386,15 @@ def _build_intent_tools(
 
             repo = InstitutionRepository(db_session)
             institutions = await repo.get_all_active()
-            for inst in institutions:
-                if inst.institution_code == code or (
-                    inst.short_name and inst.short_name.lower() == code.lower()
-                ):
-                    return {
-                        "valid": True,
-                        "institution_code": inst.institution_code,
-                        "institution_name": inst.institution_name,
-                    }
+            resolved_code = _resolve_institution_code(code, institutions)
+            if resolved_code:
+                for inst in institutions:
+                    if inst.institution_code == resolved_code:
+                        return {
+                            "valid": True,
+                            "institution_code": inst.institution_code,
+                            "institution_name": inst.institution_name,
+                        }
             return {
                 "valid": False,
                 "message": f"Institution code '{code}' not found",
@@ -515,8 +615,11 @@ class IntentAgent(BaseAgent):
                 user_message, history_for_llm, current_slots
             )
             extracted = extraction.get("extracted", {})
-            contextual_updates = self._extract_contextual_slot_updates(
-                user_message, current_slots, extracted
+            contextual_updates = await self._extract_contextual_slot_updates(
+                user_message,
+                current_slots,
+                extracted,
+                db_session=db_session,
             )
             for key, value in contextual_updates.items():
                 extracted[key] = value
@@ -527,7 +630,7 @@ class IntentAgent(BaseAgent):
                 merged_slots[key] = value
 
         response_text = None
-        if intent == "create_payout_run":
+        if intent == "create_payout_run" and not self._is_help_or_suggestion_request(user_message):
             response_text = self._build_required_slot_prompt(merged_slots)
 
         if response_text is None:
@@ -710,9 +813,9 @@ Generate your response to the user. Use tools if you need to look up business in
             )
         if slots.get("budget_cap") is None:
             missing.append("budget_cap (optional: maximum total payout)")
-        if slots.get("candidates") is None:
+        if not isinstance(slots.get("candidates"), list) or not slots.get("candidates"):
             missing.append(
-                "candidates (optional: beneficiary list, can also upload CSV later)"
+                "candidates (required: at least one beneficiary with name, bank, account number, and amount)"
             )
         return missing
 
@@ -729,6 +832,9 @@ Generate your response to the user. Use tools if you need to look up business in
             missing.append("date_to")
         if slots.get("risk_tolerance") is None:
             missing.append("risk_tolerance")
+        candidates = slots.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            missing.append("candidates")
         return missing
 
     def _build_required_slot_prompt(self, slots: dict) -> Optional[str]:
@@ -758,6 +864,11 @@ Generate your response to the user. Use tools if you need to look up business in
                 "What risk tolerance should I use, between 0.0 and 1.0? "
                 "If you want a balanced setting, 0.35 is a good default."
             )
+        if not isinstance(slots.get("candidates"), list) or not slots.get("candidates"):
+            return (
+                "Who should I pay first? Share the beneficiary's full name, bank, "
+                "account number, and amount. You can start with just the name if that is all you have."
+            )
         return None
 
     def _candidate_details_missing(self, slots: dict) -> list[str]:
@@ -774,6 +885,8 @@ Generate your response to the user. Use tools if you need to look up business in
                 continue
 
             label = candidate.get("beneficiary_name") or f"candidate {idx}"
+            if not candidate.get("beneficiary_name"):
+                missing.append(f"beneficiary name for candidate {idx}")
             if not candidate.get("institution_code"):
                 missing.append(f"institution code for {label}")
             if not candidate.get("account_number"):
@@ -786,6 +899,14 @@ Generate your response to the user. Use tools if you need to look up business in
             if amount_value <= 0:
                 missing.append(f"amount for {label}")
         return missing
+
+    _HELP_REQUEST_PATTERNS = re.compile(
+        r"\b(give me|show me|suggest|suggestions?|options?|examples?|help me|what (?:can|should)|recommend)\b",
+        re.IGNORECASE,
+    )
+
+    def _is_help_or_suggestion_request(self, message: str) -> bool:
+        return bool(self._HELP_REQUEST_PATTERNS.search(message))
 
     def _should_continue_payout_flow(
         self,
@@ -832,43 +953,88 @@ Generate your response to the user. Use tools if you need to look up business in
 
         return bool(self._get_required_missing_slots(current_slots))
 
-    def _extract_contextual_slot_updates(
+    async def _extract_contextual_slot_updates(
         self,
         user_message: str,
         current_slots: dict,
         extracted: dict,
+        db_session=None,
     ) -> dict:
         updates: dict[str, Any] = {}
         if extracted.get("candidates"):
             return updates
 
-        candidates = current_slots.get("candidates")
-        if not isinstance(candidates, list) or len(candidates) != 1:
-            return updates
-        if not isinstance(candidates[0], dict):
+        if self._is_help_or_suggestion_request(user_message):
             return updates
 
-        candidate = dict(candidates[0])
+        candidates = current_slots.get("candidates")
+        if candidates is not None and (not isinstance(candidates, list) or len(candidates) != 1):
+            return updates
+        if isinstance(candidates, list) and candidates and not isinstance(candidates[0], dict):
+            return updates
+
+        candidate = dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
+        changed = False
+
+        if not candidate.get("beneficiary_name"):
+            parsed_name = self._extract_candidate_name_from_message(user_message)
+            if parsed_name:
+                candidate["beneficiary_name"] = parsed_name
+                changed = True
+
+        if not candidate.get("institution_code"):
+            parsed_institution = await self._extract_candidate_institution_from_message(
+                user_message,
+                db_session=db_session,
+            )
+            if parsed_institution:
+                candidate["institution_code"] = parsed_institution
+                changed = True
+
+        if not candidate.get("account_number"):
+            parsed_account_number = self._extract_candidate_account_number_from_message(
+                user_message
+            )
+            if parsed_account_number:
+                candidate["account_number"] = parsed_account_number
+                changed = True
+
         amount = candidate.get("amount")
         try:
             current_amount = float(amount)
         except (TypeError, ValueError):
             current_amount = 0.0
 
-        if current_amount > 0:
+        if current_amount <= 0:
+            parsed_amount = self._extract_candidate_amount_from_message(user_message)
+            if parsed_amount is not None:
+                candidate["amount"] = parsed_amount
+                changed = True
+
+        if not changed:
             return updates
 
-        parsed_amount = self._extract_candidate_amount_from_message(user_message)
-        if parsed_amount is None:
-            return updates
-
-        candidate["amount"] = parsed_amount
         updates["candidates"] = [candidate]
         return updates
 
     def _extract_candidate_amount_from_message(
         self, user_message: str
     ) -> Optional[float]:
+        stripped = user_message.strip()
+        pure_amount = re.fullmatch(
+            r"(?:₦|ngn|naira)?\s*(\d[\d,]*(?:\.\d+)?)([kK])?\s*",
+            stripped,
+            re.IGNORECASE,
+        )
+        if pure_amount:
+            try:
+                value = float(pure_amount.group(1).replace(",", ""))
+            except ValueError:
+                return None
+            if pure_amount.group(2):
+                value *= 1000
+            return value if value > 0 else None
+
         normalized = user_message.lower()
         if not any(
             marker in normalized
@@ -887,6 +1053,101 @@ Generate your response to the user. Use tools if you need to look up business in
             return None
 
         return value if value > 0 else None
+
+    def _extract_candidate_name_from_message(
+        self, user_message: str
+    ) -> Optional[str]:
+        patterns = [
+            r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)(?:'s)?\s+name\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
+            r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
+            r"\bname\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, user_message, re.IGNORECASE)
+            if match:
+                return self._clean_candidate_name(match.group(1))
+
+        fallback = self._clean_candidate_name(user_message)
+        if self._looks_like_candidate_name(fallback):
+            return fallback
+        return None
+
+    def _clean_candidate_name(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip(" \t\n\r.,;:!?")
+
+    def _looks_like_candidate_name(self, value: str) -> bool:
+        if not value or any(char.isdigit() for char in value):
+            return False
+        tokens = [token for token in re.split(r"\s+", value) if token]
+        if not 2 <= len(tokens) <= 6:
+            return False
+        if any(token.lower() in _NON_NAME_TOKENS for token in tokens):
+            return False
+        return all(re.fullmatch(r"[A-Za-z][A-Za-z.'\-]*", token) for token in tokens)
+
+    def _extract_candidate_account_number_from_message(
+        self, user_message: str
+    ) -> Optional[str]:
+        exact_match = re.search(r"\b(\d{10})\b", user_message)
+        if exact_match:
+            return exact_match.group(1)
+
+        digits_only = re.sub(r"\D", "", user_message)
+        if len(digits_only) == 10:
+            return digits_only
+        return None
+
+    _INSTITUTION_MSG_PREFIXES = re.compile(
+        r"^(?:i\s+said\s+|just\s+|please\s+|i\s+want(?:\s+to)?\s+|i\s+mean\s+|"
+        r"use\s+|try\s+|select\s+|pick\s+|choose\s+|i\s+said\s+use\s+|"
+        r"just\s+use\s+|please\s+use\s+)",
+        re.IGNORECASE,
+    )
+
+    async def _extract_candidate_institution_from_message(
+        self, user_message: str, db_session=None
+    ) -> Optional[str]:
+        if db_session is None:
+            return None
+
+        try:
+            from src.infrastructure.database.repositories.institution_repository import (
+                InstitutionRepository,
+            )
+
+            repo = InstitutionRepository(db_session)
+            institutions = await repo.get_all_active()
+
+            phrases: list[str] = []
+
+            msg = user_message.strip()
+            cleaned = msg
+            for _ in range(3):
+                prev = cleaned
+                cleaned = self._INSTITUTION_MSG_PREFIXES.sub("", cleaned).strip()
+                if cleaned == prev:
+                    break
+            if cleaned and cleaned != msg:
+                phrases.append(cleaned)
+
+            for pattern in (
+                r"(?:bank|institution)(?:\s+is)?\s+([A-Za-z][A-Za-z .&'\-]{1,80})",
+                r"(?:at|with|from)\s+([A-Za-z][A-Za-z .&'\-]{1,80})",
+            ):
+                match = re.search(pattern, msg, re.IGNORECASE)
+                if match:
+                    phrases.append(match.group(1).strip())
+
+            phrases.append(msg)
+
+            for phrase in phrases:
+                resolved = _resolve_institution_code(phrase, institutions)
+                if resolved:
+                    return resolved
+        except Exception as exc:
+            logger.debug(f"Failed to resolve institution from chat message: {exc}")
+
+        return None
 
     def _format_history(self, history: list[dict], max_turns: int = 6) -> str:
         if not history:
