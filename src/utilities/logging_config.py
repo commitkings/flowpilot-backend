@@ -283,6 +283,7 @@ def log_chat_message(
     message: str = None,  # Alias for content
     intent: Optional[str] = None,
     confidence: Optional[float] = None,
+    slots_extracted: Optional[int] = None,
 ) -> None:
     """Log a chat message (user or assistant)."""
     logger = get_logger("chat")
@@ -299,6 +300,8 @@ def log_chat_message(
         extra = f" intent={intent}"
         if confidence is not None:
             extra += f" conf={confidence:.2f}"
+    if slots_extracted is not None:
+        extra += f" slots={slots_extracted}"
     
     conv_label = f"[conv:{conversation_id[:8]}] " if conversation_id else ""
     logger.info(f"{conv_label}[{role.upper()}] {preview}{extra}")
