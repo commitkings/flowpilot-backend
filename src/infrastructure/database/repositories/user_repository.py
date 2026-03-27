@@ -140,3 +140,6 @@ class UserRepository:
         user.updated_at = now
         await self._s.flush()
         return user
+
+
+
