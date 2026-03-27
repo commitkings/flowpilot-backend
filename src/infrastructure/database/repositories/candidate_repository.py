@@ -170,6 +170,17 @@ class CandidateRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one()
 
+    async def list_all_approved(self) -> list[PayoutCandidateModel]:
+        """Return all approved payout candidates across all runs (for All Activity view)."""
+        C = PayoutCandidateModel
+        stmt = (
+            select(C)
+            .where(C.approval_status == "approved")
+            .order_by(C.created_at.desc())
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     # ── Global query helpers (cross-run approvals queue) ──────
 
     def _apply_filters(

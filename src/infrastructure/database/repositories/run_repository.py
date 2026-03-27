@@ -156,11 +156,11 @@ class RunRepository:
         await self._session.execute(stmt)
         await self._session.flush()
 
-    async def mark_completed(self, run_id: UUID) -> None:
+    async def mark_completed(self, run_id: UUID, status: str = "completed") -> None:
         stmt = (
             update(AgentRunModel)
             .where(AgentRunModel.id == run_id)
-            .values(completed_at=func.now(), status="completed")
+            .values(completed_at=func.now(), status=status)
         )
         await self._session.execute(stmt)
         await self._session.flush()

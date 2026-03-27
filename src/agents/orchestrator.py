@@ -168,10 +168,10 @@ class RunOrchestrator:
             defer_commit=True,
         )
 
-        final_status = "failed" if state.get("error") else "completed"
+        final_status = self._derive_final_status(state)
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
-        if final_status == "completed":
-            await self._run_repo.mark_completed(run_id)
+        if final_status != "failed":
+            await self._run_repo.mark_completed(run_id, status=final_status)
             await self._persist_run_outcomes(run_id, state)
 
         log_run_event(str(run_id), f"run_{final_status}", {
@@ -182,6 +182,10 @@ class RunOrchestrator:
         if self._publisher:
             if final_status == "completed":
                 await self._publisher.run_completed("Pipeline finished successfully")
+            elif final_status == "completed_with_errors":
+                await self._publisher.run_completed(
+                    "Pipeline finished with review items. Some recipients were held back or need follow-up."
+                )
             else:
                 await self._publisher.run_failed(state.get("error", "Unknown error"))
 
@@ -227,10 +231,10 @@ class RunOrchestrator:
                 return state
 
         # Pipeline complete — atomic commit with final step data
-        final_status = "failed" if state.get("error") else "completed"
+        final_status = self._derive_final_status(state)
         await self._run_repo.update_status(run_id, final_status, state.get("error"))
-        if final_status == "completed":
-            await self._run_repo.mark_completed(run_id)
+        if final_status != "failed":
+            await self._run_repo.mark_completed(run_id, status=final_status)
             await self._persist_run_outcomes(run_id, state)
 
         log_run_event(str(run_id), f"run_{final_status}", {
@@ -241,6 +245,10 @@ class RunOrchestrator:
         if self._publisher:
             if final_status == "completed":
                 await self._publisher.run_completed("Pipeline finished successfully")
+            elif final_status == "completed_with_errors":
+                await self._publisher.run_completed(
+                    "Pipeline finished with review items. Some recipients were held back or need follow-up."
+                )
             else:
                 await self._publisher.run_failed(state.get("error", "Unknown error"))
 
@@ -919,6 +927,56 @@ class RunOrchestrator:
 
         except Exception as e:
             logger.error(f"Run {run_id}: failed to persist outcomes: {e}", exc_info=True)
+
+    def _derive_final_status(self, state: AgentState) -> str:
+        """Classify finished runs more honestly than a blanket 'completed'."""
+        if state.get("error"):
+            return "failed"
+
+        scored_candidates = state.get("scored_candidates", [])
+        execution_results = state.get("candidate_execution_results", [])
+        lookup_results = state.get("candidate_lookup_results", [])
+        approved_ids = {str(candidate_id) for candidate_id in state.get("approved_candidate_ids", [])}
+        rejected_ids = {str(candidate_id) for candidate_id in state.get("rejected_candidate_ids", [])}
+
+        if not (
+            scored_candidates
+            or execution_results
+            or lookup_results
+            or approved_ids
+            or rejected_ids
+        ):
+            return "completed"
+
+        if rejected_ids:
+            return "completed_with_errors"
+
+        if any(candidate.get("risk_decision") == "block" for candidate in scored_candidates):
+            return "completed_with_errors"
+
+        problematic_lookup_statuses = {"failed", "mismatch", "name_mismatch"}
+        if any(
+            str(result.get("lookup_status", "")).lower() in problematic_lookup_statuses
+            for result in lookup_results
+        ):
+            return "completed_with_errors"
+
+        problematic_execution_statuses = {"failed", "pending", "requires_followup"}
+        if any(
+            str(result.get("execution_status", "")).lower() in problematic_execution_statuses
+            for result in execution_results
+        ):
+            return "completed_with_errors"
+
+        if approved_ids:
+            execution_by_candidate = {
+                str(result.get("candidate_id")): str(result.get("execution_status", "")).lower()
+                for result in execution_results
+            }
+            if any(execution_by_candidate.get(candidate_id) != "success" for candidate_id in approved_ids):
+                return "completed_with_errors"
+
+        return "completed"
 
     # ------------------------------------------------------------------
     # Internal: audit entry persistence with step_id correlation

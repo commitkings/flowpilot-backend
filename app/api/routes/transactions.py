@@ -89,6 +89,7 @@ async def list_transactions(
     search: Optional[str] = Query(None, description="Substring match on interswitch_ref"),
     from_date: Optional[str] = Query(None, description="ISO date YYYY-MM-DD"),
     to_date: Optional[str] = Query(None, description="ISO date YYYY-MM-DD"),
+    include_payouts: bool = Query(False, description="Include all executed payouts (All Activity view)"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db_session),
@@ -96,9 +97,9 @@ async def list_transactions(
 ):
     """Return paginated transactions with summary metrics.
 
-    When a run_id is provided: returns reconciled transactions merged with
-    payout execution records from approved candidates, giving a complete
-    picture of all financial activity for the run.
+    When include_payouts=True: returns bank reconciliation data merged with
+    all approved/executed payout candidates across all runs.
+    When a run_id is provided: always includes payouts for that run.
     """
     repo = TransactionRepository(session)
     run_uuid = UUID(run_id) if run_id else None
@@ -117,12 +118,18 @@ async def list_transactions(
 
     serialized = [_serialize_transaction(t) for t in transactions]
 
-    # When scoped to a run, also include approved/executed payout candidates
-    # so successful runs always show their payment activity.
+    # Include payout candidates when:
+    # 1. A specific run_id is provided (show that run's activity)
+    # 2. include_payouts=True (All Activity view from dashboard toggle)
     payout_rows: list[dict] = []
-    if run_uuid is not None:
+    if run_uuid is not None or include_payouts:
         candidate_repo = CandidateRepository(session)
-        approved = await candidate_repo.get_by_run(run_uuid, approval_status="approved")
+        if run_uuid is not None:
+            # Scoped to specific run
+            approved = await candidate_repo.get_by_run(run_uuid, approval_status="approved")
+        else:
+            # All Activity view: get all approved/executed payouts
+            approved = await candidate_repo.list_all_approved()
         for c in approved:
             payout_rows.append(_serialize_candidate_as_transaction(c))
 
