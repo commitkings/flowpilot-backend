@@ -16,7 +16,6 @@ Design principles:
 
 from __future__ import annotations
 
-import logging
 import time
 import uuid
 from decimal import Decimal
@@ -44,8 +43,13 @@ from src.infrastructure.database.repositories import (
     RunRepository,
     TransactionRepository,
 )
+from src.utilities.logging_config import (
+    get_logger,
+    log_run_event,
+    set_run_id,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Singleton agent instances (stateless, safe to share)
 _planner = PlannerAgent()
@@ -91,6 +95,13 @@ class RunOrchestrator:
         Returns the state after halting at the approval gate (or after audit
         if an error occurs or no candidates need approval).
         """
+        # Set run context for logging
+        set_run_id(str(run_id))
+        log_run_event(str(run_id), "run_started", {
+            "objective": state.get("objective", ""),
+            "business_id": state.get("business_id", ""),
+        })
+
         await self._run_repo.mark_started(run_id)
 
         if self._publisher:
@@ -107,6 +118,7 @@ class RunOrchestrator:
         )
 
         if state.get("error"):
+            log_run_event(str(run_id), "run_error", {"step": "planner", "error": state.get("error")})
             state = await self._route_to_audit(run_id, state)
             return state
 
@@ -134,10 +146,14 @@ class RunOrchestrator:
             )
 
             if state.get("error"):
+                log_run_event(str(run_id), "run_error", {"step": agent_type, "error": state.get("error")})
                 state = await self._route_to_audit(run_id, state)
                 return state
 
         if has_execution:
+            log_run_event(str(run_id), "approval_gate_entered", {
+                "candidate_count": len(state.get("candidates", [])),
+            })
             await self._enter_approval_gate(run_id, state)
             return state
 
@@ -158,6 +174,11 @@ class RunOrchestrator:
             await self._run_repo.mark_completed(run_id)
             await self._persist_run_outcomes(run_id, state)
 
+        log_run_event(str(run_id), f"run_{final_status}", {
+            "status": final_status,
+            "error": state.get("error") if final_status == "failed" else None,
+        })
+
         if self._publisher:
             if final_status == "completed":
                 await self._publisher.run_completed("Pipeline finished successfully")
@@ -175,6 +196,9 @@ class RunOrchestrator:
         This is the critical difference from LangGraph — we skip plan/reconcile/risk
         entirely, avoiding double Interswitch API calls and double LLM costs.
         """
+        set_run_id(str(run_id))
+        log_run_event(str(run_id), "run_resumed", {"after": "approval"})
+
         # Load existing plan_step IDs so we can correlate audit entries
         await self._load_step_ids(run_id)
 
@@ -198,6 +222,7 @@ class RunOrchestrator:
             )
 
             if state.get("error") and step_name != "audit":
+                log_run_event(str(run_id), "run_error", {"step": agent_type, "error": state.get("error")})
                 state = await self._route_to_audit(run_id, state)
                 return state
 
@@ -207,6 +232,11 @@ class RunOrchestrator:
         if final_status == "completed":
             await self._run_repo.mark_completed(run_id)
             await self._persist_run_outcomes(run_id, state)
+
+        log_run_event(str(run_id), f"run_{final_status}", {
+            "status": final_status,
+            "error": state.get("error") if final_status == "failed" else None,
+        })
 
         if self._publisher:
             if final_status == "completed":
@@ -338,7 +368,11 @@ class RunOrchestrator:
         defer_commit: bool = False,
     ) -> AgentState:
         """Run one agent, persist results, and update step/run status."""
-        logger.info(f"Run {run_id}: starting step '{step_name}'")
+        log_run_event(str(run_id), "step_started", {
+            "step": step_name,
+            "agent_type": agent_type,
+            "agent_name": agent.name if hasattr(agent, "name") else str(agent),
+        })
 
         # 1. Update run status (skip if None — caller controls)
         if run_status is not None:
@@ -482,7 +516,13 @@ class RunOrchestrator:
         # 14. Commit this step's changes (unless deferred for atomic finalization)
         if not defer_commit:
             await self._session.commit()
-        logger.info(f"Run {run_id}: completed step '{step_name}' in {elapsed_ms}ms")
+        
+        log_run_event(str(run_id), "step_completed", {
+            "step": step_name,
+            "agent_type": agent_type,
+            "duration_ms": elapsed_ms,
+            "error": error_after if step_failed else None,
+        })
 
         return state
 

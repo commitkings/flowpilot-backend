@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -23,8 +22,13 @@ from src.infrastructure.database.repositories import (
     RunRepository,
 )
 from src.infrastructure.memory.redis_working_memory import append_turn
+from src.utilities.logging_config import (
+    get_logger,
+    log_chat_message,
+    set_conversation_id,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter()
 
 
@@ -165,6 +169,19 @@ def _validate_chat_candidates(raw_candidates: object) -> list[str]:
     return errors
 
 
+def _get_missing_required_run_fields(run_config: dict) -> list[str]:
+    missing: list[str] = []
+    if not run_config.get("objective"):
+        missing.append("objective")
+    if not run_config.get("date_from"):
+        missing.append("start date")
+    if not run_config.get("date_to"):
+        missing.append("end date")
+    if run_config.get("risk_tolerance") is None:
+        missing.append("risk tolerance")
+    return missing
+
+
 async def _create_run_from_conversation(
     conv,
     current_user,
@@ -203,8 +220,13 @@ async def _create_run_from_conversation(
             ):
                 run_config[key] = value
 
-    if not run_config.get("objective"):
-        raise HTTPException(status_code=400, detail="Run objective is required")
+    missing_required_fields = _get_missing_required_run_fields(run_config)
+    if missing_required_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create run from chat yet, missing: "
+            + ", ".join(missing_required_fields),
+        )
 
     candidate_validation_errors = _validate_chat_candidates(run_config.get("candidates"))
     if candidate_validation_errors:
@@ -221,7 +243,7 @@ async def _create_run_from_conversation(
     business_uuid = conv.business_id
     operator_id = current_user.id
 
-    risk_tolerance = run_config.get("risk_tolerance", 0.35)
+    risk_tolerance = run_config["risk_tolerance"]
     budget_cap = run_config.get("budget_cap")
     merchant_id = run_config.get("merchant_id") or Settings.INTERSWITCH_MERCHANT_ID
 
@@ -230,14 +252,39 @@ async def _create_run_from_conversation(
         try:
             date_from = date.fromisoformat(run_config["date_from"])
         except (ValueError, TypeError):
-            pass
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create run from chat yet: start date must use YYYY-MM-DD format",
+            )
 
     date_to = None
     if run_config.get("date_to"):
         try:
             date_to = date.fromisoformat(run_config["date_to"])
         except (ValueError, TypeError):
-            pass
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create run from chat yet: end date must use YYYY-MM-DD format",
+            )
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create run from chat yet: start date must be on or before end date",
+        )
+
+    try:
+        risk_tolerance_value = float(risk_tolerance)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create run from chat yet: risk tolerance must be a number between 0.0 and 1.0",
+        )
+    if not 0.0 <= risk_tolerance_value <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create run from chat yet: risk tolerance must be between 0.0 and 1.0",
+        )
 
     run = await run_repo.create(
         business_id=business_uuid,
@@ -247,7 +294,7 @@ async def _create_run_from_conversation(
         constraints=run_config.get("constraints"),
         date_from=date_from,
         date_to=date_to,
-        risk_tolerance=Decimal(str(risk_tolerance)),
+        risk_tolerance=Decimal(str(risk_tolerance_value)),
         budget_cap=Decimal(str(budget_cap)) if budget_cap is not None else None,
     )
     await session.commit()
@@ -321,7 +368,7 @@ async def _create_run_from_conversation(
         "constraints": run_config.get("constraints"),
         "date_from": date_from.isoformat() if date_from else None,
         "date_to": date_to.isoformat() if date_to else None,
-        "risk_tolerance": float(risk_tolerance),
+        "risk_tolerance": risk_tolerance_value,
         "budget_cap": float(budget_cap) if budget_cap is not None else None,
         "merchant_id": merchant_id,
         "plan_steps": [],
@@ -442,6 +489,17 @@ async def chat_send(
             user_id=user_id,
         )
         await session.commit()
+        logger.info(f"[CHAT] New conversation created: {conv.id}")
+
+    # Set conversation context for logging
+    set_conversation_id(str(conv.id))
+
+    # Log incoming user message
+    log_chat_message(
+        role="user",
+        content=request.message,
+        conversation_id=str(conv.id),
+    )
 
     if conv.status == "confirming" and _is_affirmative_confirmation(request.message):
         await conv_repo.add_message(
@@ -472,6 +530,14 @@ async def chat_send(
         await session.commit()
         await append_turn(str(conv.id), "assistant", response_text)
 
+        log_chat_message(
+            role="assistant",
+            content=response_text,
+            conversation_id=str(conv.id),
+            intent="create_payout_run",
+            confidence=1.0,
+        )
+
         return ChatSendResponse(
             conversation_id=str(conv.id),
             response=response_text,
@@ -501,6 +567,7 @@ async def chat_send(
 
     agent = IntentAgent()
     try:
+        logger.debug(f"[CHAT] Processing message with IntentAgent, history_len={len(history)}")
         result = await agent.process_message(
             user_message=request.message,
             conversation_history=history,
@@ -524,6 +591,16 @@ async def chat_send(
     response_text = result["response"]
     should_confirm = result["should_confirm"]
 
+    # Log AI response
+    log_chat_message(
+        role="assistant",
+        content=response_text,
+        conversation_id=str(conv.id),
+        intent=intent,
+        confidence=confidence,
+        slots_extracted=len(extracted) if extracted else 0,
+    )
+
     token_usage = result.get("token_usage")
     token_usage_dict = None
     if token_usage and token_usage.get("entries"):
@@ -540,6 +617,7 @@ async def chat_send(
             "completion_tokens": total_completion,
             "llm_calls": len(token_usage["entries"]),
         }
+        logger.debug(f"[CHAT] Token usage: prompt={total_prompt}, completion={total_completion}, calls={len(token_usage['entries'])}")
 
     await conv_repo.add_message(
         conv.id,

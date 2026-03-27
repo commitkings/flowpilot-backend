@@ -85,9 +85,13 @@ class Settings:
     @classmethod
     def _init_api_secrets(cls) -> None:
         if not cls._api_secrets:
-            logger.info("Initializing API secrets from Secrets Manager...")
-            cls._api_secrets = _get_api_secrets()
-            logger.info(f"Loaded {len(cls._api_secrets)} API secrets")
+            secret_arn = os.getenv("API_SECRETS_ARN")
+            if secret_arn:
+                logger.info("Initializing API secrets from Secrets Manager...")
+                cls._api_secrets = _get_api_secrets()
+                logger.info(f"Loaded {len(cls._api_secrets)} API secrets from Secrets Manager")
+            else:
+                logger.debug("API_SECRETS_ARN not set - using environment variables for secrets")
 
     @classmethod
     def _get_secret(cls, env_key: str, secret_key: str) -> Optional[str]:

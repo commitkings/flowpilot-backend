@@ -9,7 +9,7 @@ Wraps httpx.AsyncClient with:
 
 from __future__ import annotations
 
-import logging
+import time
 from typing import Any
 
 import httpx
@@ -22,7 +22,9 @@ from tenacity import (
     RetryCallState,
 )
 
-logger = logging.getLogger(__name__)
+from src.utilities.logging_config import get_logger, log_interswitch_call
+
+logger = get_logger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 
@@ -78,7 +80,19 @@ class ResilientClient:
         reraise=True,
     )
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        t0 = time.monotonic()
         response = await self._client.get(url, **kwargs)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        
+        log_interswitch_call(
+            method="GET",
+            endpoint=str(url),
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+            request_body=kwargs.get("params"),
+            response_preview=response.text[:500] if response.text else None,
+        )
+        
         _raise_if_retryable(response)
         return response
 
@@ -90,7 +104,19 @@ class ResilientClient:
         reraise=True,
     )
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        t0 = time.monotonic()
         response = await self._client.post(url, **kwargs)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        
+        log_interswitch_call(
+            method="POST",
+            endpoint=str(url),
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+            request_body=kwargs.get("json") or kwargs.get("data"),
+            response_preview=response.text[:500] if response.text else None,
+        )
+        
         _raise_if_retryable(response)
         return response
 

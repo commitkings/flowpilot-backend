@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 import time
 from dataclasses import dataclass
@@ -11,8 +10,14 @@ from groq import AsyncGroq
 
 from src.agents.tools import ToolRegistry, ToolCall, ToolResult, parse_tool_calls_from_response
 from src.config.settings import Settings
+from src.utilities.logging_config import (
+    get_logger,
+    log_agent_event,
+    log_llm_call,
+    log_tool_call,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -96,6 +101,13 @@ class BaseAgent:
         tools_schema = self.registry.to_llm_tools() if self.registry.tools else None
         iteration = 0
 
+        log_agent_event(self.name, "react_start", {
+            "model": model,
+            "max_iterations": max_iterations,
+            "tools_count": len(self.registry.tools) if self.registry.tools else 0,
+            "prompt_preview": user_prompt[:200],
+        })
+
         while iteration < max_iterations:
             iteration += 1
             logger.info(f"[{self.name}] ReAct iteration {iteration}/{max_iterations}")
@@ -119,6 +131,15 @@ class BaseAgent:
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
 
+            log_llm_call(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_ms=elapsed_ms,
+                agent=self.name,
+                iteration=iteration,
+            )
+
             self._record_reasoning(
                 thinking=msg.content[:500] if msg.content else f"[tool_calls: {len(msg.tool_calls or [])}]",
                 model=model,
@@ -131,6 +152,10 @@ class BaseAgent:
             tool_calls = parse_tool_calls_from_response(msg)
             if not tool_calls:
                 final_content = msg.content or ""
+                log_agent_event(self.name, "react_complete", {
+                    "iterations": iteration,
+                    "result_length": len(final_content),
+                })
                 logger.info(f"[{self.name}] ReAct concluded after {iteration} iteration(s)")
                 return final_content
 
@@ -138,7 +163,19 @@ class BaseAgent:
 
             for tc in tool_calls:
                 await self._emit_tool_call_event(tc)
+                t_start = time.monotonic()
                 result = await self.registry.execute(tc)
+                tool_duration = int((time.monotonic() - t_start) * 1000)
+                
+                log_tool_call(
+                    tool_name=tc.tool_name,
+                    arguments=tc.arguments,
+                    success=result.success,
+                    duration_ms=tool_duration,
+                    result_preview=str(result.data)[:200] if result.data else result.error,
+                    agent=self.name,
+                )
+                
                 await self._emit_tool_result_event(tc, result)
 
                 messages.append({
@@ -147,6 +184,9 @@ class BaseAgent:
                     "content": result.to_message_content(),
                 })
 
+        log_agent_event(self.name, "react_max_iterations", {
+            "iterations": max_iterations,
+        })
         logger.warning(f"[{self.name}] ReAct hit max iterations ({max_iterations})")
         last_content = ""
         for m in reversed(messages):

@@ -1,11 +1,11 @@
 import datetime
-import logging
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.routes.runs import router as runs_router
@@ -21,14 +21,18 @@ from app.api.routes.org import router as org_router
 from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
 from app.api.auth import auth_router
+from app.api.middleware import LoggingMiddleware
 from src.config.settings import Settings
 from src.infrastructure.database.connection import (
     close_db,
     get_session_factory,
     init_db,
 )
+from src.utilities.logging_config import get_logger, setup_logging
 
-logger = logging.getLogger(__name__)
+# Initialize logging system before anything else
+setup_logging()
+logger = get_logger(__name__)
 
 
 def _validate_payout_config() -> None:
@@ -74,6 +78,9 @@ _cors_origins = [
     ).split(",")
 ]
 
+# Add logging middleware first (outermost - processes requests first)
+app.add_middleware(LoggingMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -81,6 +88,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Global exception handler for unhandled errors
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all exception handler that logs unhandled errors."""
+    logger.exception(
+        f"Unhandled exception on {request.method} {request.url.path}: "
+        f"{type(exc).__name__}: {exc}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error_type": type(exc).__name__,
+        },
+    )
 
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])

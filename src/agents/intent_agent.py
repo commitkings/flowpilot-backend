@@ -37,17 +37,17 @@ PAYOUT_RUN_SLOTS = {
     "date_from": {
         "type": "string",
         "description": "Transaction search start date in ISO format (YYYY-MM-DD)",
-        "required": False,
+        "required": True,
     },
     "date_to": {
         "type": "string",
         "description": "Transaction search end date in ISO format (YYYY-MM-DD)",
-        "required": False,
+        "required": True,
     },
     "risk_tolerance": {
         "type": "number",
         "description": "Risk tolerance threshold from 0.0 (strictest) to 1.0 (most permissive). Default is 0.35",
-        "required": False,
+        "required": True,
     },
     "budget_cap": {
         "type": "number",
@@ -76,7 +76,7 @@ What you do:
 
 Key facts:
 - Payouts go through Interswitch APIs
-- Users need at minimum an objective (what the payout is for)
+- A payout run is only ready for confirmation after you have the objective, start date, end date, and risk tolerance
 - Risk tolerance: 0.0 to 1.0 (default 0.35), lower means stricter
 - Budget cap is optional
 - Candidates can be added inline or uploaded via CSV
@@ -146,6 +146,7 @@ STYLE RULES (CRITICAL):
 
 For create_payout_run:
 - If objective is missing: "What's this payout for? For example, 'March salaries' or 'vendor settlements'."
+- Before confirming a payout run, make sure you have the objective, start date, end date, and risk tolerance.
 - If objective exists, ask naturally for the next missing piece.
 - When ready: give a brief summary and ask "Should I go ahead?"
 - Never claim a payout run has been created, executed, or validated inside normal chat unless the system has explicitly confirmed that action.
@@ -525,17 +526,21 @@ class IntentAgent(BaseAgent):
             if value is not None and value != "" and value != []:
                 merged_slots[key] = value
 
-        response_text = await self._generate_response(
-            user_message=user_message,
-            conversation_history=history_for_llm,
-            intent=intent,
-            slots=merged_slots,
-            business_id=business_id,
-        )
+        response_text = None
+        if intent == "create_payout_run":
+            response_text = self._build_required_slot_prompt(merged_slots)
+
+        if response_text is None:
+            response_text = await self._generate_response(
+                user_message=user_message,
+                conversation_history=history_for_llm,
+                intent=intent,
+                slots=merged_slots,
+                business_id=business_id,
+            )
 
         should_confirm = (
             intent == "create_payout_run"
-            and merged_slots.get("objective")
             and self._has_sufficient_slots(merged_slots)
         )
 
@@ -686,37 +691,74 @@ Generate your response to the user. Use tools if you need to look up business in
         return response.strip()
 
     def _has_sufficient_slots(self, slots: dict) -> bool:
-        if not slots.get("objective"):
-            return False
-        if self._candidate_details_missing(slots):
-            return False
-        filled_optional = sum(
-            1
-            for key in [
-                "budget_cap",
-                "risk_tolerance",
-                "date_from",
-                "date_to",
-                "candidates",
-            ]
-            if slots.get(key) is not None
-        )
-        return filled_optional >= 1
+        return len(self._get_required_missing_slots(slots)) == 0
 
     def _get_missing_slots(self, slots: dict) -> list[str]:
         missing = []
         if not slots.get("objective"):
             missing.append("objective (what is this payout for?)")
-        if slots.get("budget_cap") is None:
-            missing.append("budget_cap (optional: maximum total payout)")
         candidate_missing = self._candidate_details_missing(slots)
         if candidate_missing:
             missing.extend(candidate_missing)
+        if not slots.get("date_from"):
+            missing.append("date_from (required: start date in YYYY-MM-DD format)")
+        if not slots.get("date_to"):
+            missing.append("date_to (required: end date in YYYY-MM-DD format)")
+        if slots.get("risk_tolerance") is None:
+            missing.append(
+                "risk_tolerance (required: number from 0.0 to 1.0, for example 0.35)"
+            )
+        if slots.get("budget_cap") is None:
+            missing.append("budget_cap (optional: maximum total payout)")
         if slots.get("candidates") is None:
             missing.append(
                 "candidates (optional: beneficiary list, can also upload CSV later)"
             )
         return missing
+
+    def _get_required_missing_slots(self, slots: dict) -> list[str]:
+        missing = []
+        if not slots.get("objective"):
+            missing.append("objective")
+        candidate_missing = self._candidate_details_missing(slots)
+        if candidate_missing:
+            missing.extend(candidate_missing)
+        if not slots.get("date_from"):
+            missing.append("date_from")
+        if not slots.get("date_to"):
+            missing.append("date_to")
+        if slots.get("risk_tolerance") is None:
+            missing.append("risk_tolerance")
+        return missing
+
+    def _build_required_slot_prompt(self, slots: dict) -> Optional[str]:
+        if not slots.get("objective"):
+            return "What is this payout for? For example, March salaries or vendor settlements."
+
+        candidate_missing = self._candidate_details_missing(slots)
+        if candidate_missing:
+            detail = candidate_missing[0]
+            if detail.startswith("amount for "):
+                label = detail.removeprefix("amount for ")
+                return f"What payout amount should I use for {label}?"
+            if detail.startswith("institution code for "):
+                label = detail.removeprefix("institution code for ")
+                return f"Which bank or institution should I use for {label}?"
+            if detail.startswith("account number for "):
+                label = detail.removeprefix("account number for ")
+                return f"What account number should I use for {label}?"
+            return f"I still need the {detail}. Can you share that?"
+
+        if not slots.get("date_from"):
+            return "What start date should I use for this payout run? Please send it as YYYY-MM-DD."
+        if not slots.get("date_to"):
+            return "What end date should I use for this payout run? Please send it as YYYY-MM-DD."
+        if slots.get("risk_tolerance") is None:
+            return (
+                "What risk tolerance should I use, between 0.0 and 1.0? "
+                "If you want a balanced setting, 0.35 is a good default."
+            )
+        return None
 
     def _candidate_details_missing(self, slots: dict) -> list[str]:
         candidates = slots.get("candidates")
@@ -788,7 +830,7 @@ Generate your response to the user. Use tools if you need to look up business in
         if any(marker in normalized for marker in payout_followup_markers):
             return True
 
-        return bool(self._candidate_details_missing(current_slots))
+        return bool(self._get_required_missing_slots(current_slots))
 
     def _extract_contextual_slot_updates(
         self,
@@ -906,8 +948,6 @@ Generate your response to the user. Use tools if you need to look up business in
             config["date_to"] = slots["date_to"]
         if slots.get("risk_tolerance") is not None:
             config["risk_tolerance"] = float(slots["risk_tolerance"])
-        else:
-            config["risk_tolerance"] = 0.35
         if slots.get("budget_cap") is not None:
             config["budget_cap"] = float(slots["budget_cap"])
         if slots.get("constraints"):
