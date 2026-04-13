@@ -71,8 +71,8 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
 
           echo "Updating tag for backend to $VERSION"
-          # Update the image tag in deployment/frontend.yaml
           sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" deployment/backend.yaml
+          sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" jobs/db-migrate.yaml
 
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"

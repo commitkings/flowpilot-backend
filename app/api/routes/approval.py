@@ -10,6 +10,7 @@ from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.routes.runs import _parse_uuid, _running_states
 from src.services.email_service import send_run_completed_email
+from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.event_publisher import EventPublisher
 from src.agents.state import AgentState
@@ -394,7 +395,7 @@ async def approve_candidates(
             session, run_uuid, final_status, state.get("error")
         )
 
-        # Email run creator about the outcome
+        # Notify and email run creator about the outcome
         try:
             from sqlalchemy import select as _select
             if run.created_by:
@@ -411,6 +412,29 @@ async def approve_candidates(
                         approved_count=approved_count,
                         frontend_url=Settings.FRONTEND_URL,
                     )
+                    notif_repo = NotificationRepository(session)
+                    if final_status == "completed":
+                        await notif_repo.create(
+                            user_id=run.created_by,
+                            business_id=run.business_id,
+                            title="Run completed",
+                            message=f'{approved_count} transaction{"s" if approved_count != 1 else ""} processed on run "{run.objective[:50]}".',
+                            type="success",
+                            resource_type="run",
+                            resource_id=run_id,
+                        )
+                    else:
+                        await notif_repo.create(
+                            user_id=run.created_by,
+                            business_id=run.business_id,
+                            title="Run failed",
+                            message=f'Run "{run.objective[:50]}" could not complete. Please review and retry.',
+                            type="error",
+                            resource_type="run",
+                            resource_id=run_id,
+                        )
+                    await session.flush()
+                    await session.commit()
         except Exception as _email_exc:
             logger.warning(f"Run {run_id}: failed to notify creator: {_email_exc}")
 
@@ -496,6 +520,23 @@ async def reject_candidates(
         remaining_approved = len(state["approved_candidate_ids"])
 
     logger.info(f"Run {run_id}: rejected {rejected_count} candidates")
+
+    # Notify run creator about rejection
+    if run.created_by:
+        try:
+            notif_repo = NotificationRepository(session)
+            await notif_repo.create(
+                user_id=run.created_by,
+                business_id=run.business_id,
+                title="Candidates rejected",
+                message=f'{rejected_count} candidate{"s" if rejected_count != 1 else ""} were rejected on run "{run.objective[:50]}".',
+                type="warning",
+                resource_type="run",
+                resource_id=run_id,
+            )
+            await session.commit()
+        except Exception as _notif_exc:
+            logger.warning(f"Run {run_id}: failed to notify creator of rejection: {_notif_exc}")
 
     return {
         "run_id": run_id,

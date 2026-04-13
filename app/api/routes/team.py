@@ -32,6 +32,7 @@ from src.infrastructure.database.repositories.invitation_repository import (
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_team_added_email, send_team_invite_email
+from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -69,6 +70,7 @@ def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) ->
         "id": str(member.id),
         "user_id": str(member.user_id),
         "role": member.role,
+        "is_active": getattr(member, "is_active", True),
         "joined_at": member.joined_at.isoformat() if member.joined_at else None,
         "created_at": member.created_at.isoformat(),
         "user": {
@@ -91,6 +93,10 @@ class InviteMemberRequest(BaseModel):
 
 class UpdateMemberRoleRequest(BaseModel):
     role: str
+
+
+class UpdateMemberStatusRequest(BaseModel):
+    is_active: bool
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -160,6 +166,13 @@ async def invite_member(
         )
 
     normalized = normalize_email(str(body.email))
+
+    # Owner cannot invite themselves
+    if normalized == normalize_email(current_user.email):
+        raise HTTPException(
+            status_code=400, detail="You cannot invite yourself to your own team"
+        )
+
     user_repo = UserRepository(session)
     invite_repo = InvitationRepository(session)
 
@@ -204,6 +217,22 @@ async def invite_member(
             dashboard_url=dashboard_url,
             frontend_url=Settings.FRONTEND_URL,
         )
+
+        # In-app notification for the added user
+        try:
+            notif_repo = NotificationRepository(session)
+            await notif_repo.create(
+                user_id=target_user.id,
+                business_id=caller.business_id,
+                title="Added to team",
+                message=f"{inviter_name} added you to {business_name} as {role.capitalize()}.",
+                type="info",
+                resource_type="team",
+                resource_id=str(caller.business_id),
+            )
+            await session.flush()
+        except Exception as _notif_exc:
+            logger.warning("Failed to create team notification: %s", _notif_exc)
 
         return {
             "status": "added",
@@ -386,6 +415,48 @@ async def update_member_role(
         raise HTTPException(status_code=400, detail="Cannot change your own role")
 
     target.role = body.role
+    await session.flush()
+
+    return {"status": "updated", "member": _serialize_member(target, target.user)}
+
+
+@router.patch("/team/members/{member_id}/status")
+async def toggle_member_status(
+    member_id: str,
+    body: UpdateMemberStatusRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Enable or disable a team member's access without removing them."""
+    caller = await _get_caller_membership(session, current_user.id)
+    _require_owner(caller)
+
+    try:
+        mid = uuid.UUID(member_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid member ID")
+
+    target = (
+        await session.execute(
+            select(BusinessMemberModel)
+            .options(selectinload(BusinessMemberModel.user))
+            .where(
+                BusinessMemberModel.id == mid,
+                BusinessMemberModel.business_id == caller.business_id,
+            )
+        )
+    ).scalars().first()
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Team member not found")
+
+    if target.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot disable your own account")
+
+    if target.role == "owner":
+        raise HTTPException(status_code=400, detail="Cannot disable another owner")
+
+    target.is_active = body.is_active
     await session.flush()
 
     return {"status": "updated", "member": _serialize_member(target, target.user)}

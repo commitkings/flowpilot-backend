@@ -6,7 +6,8 @@ import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
@@ -18,6 +19,13 @@ from src.infrastructure.database.repositories import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class ExportEmailRequest(BaseModel):
+    email: EmailStr
+    rows: list[dict]
+    format: str = "csv"                  # "csv" | "pdf"
+    pdf_base64: Optional[str] = None     # required when format == "pdf"
 
 _EXEC_STATUS_MAP = {
     "success": "SUCCESS",
@@ -155,3 +163,34 @@ async def list_transactions(
         "offset": offset,
         "summary": summary,
     }
+
+
+@router.post("/transactions/export-email")
+async def export_transactions_email(
+    body: ExportEmailRequest,
+    current_user=Depends(get_current_user),
+):
+    """Send the given transaction rows to an email address as a formatted report."""
+    from src.services.email_service import send_transaction_export_email
+
+    if not body.rows:
+        raise HTTPException(status_code=400, detail="No transactions to export.")
+
+    if body.format == "pdf" and not body.pdf_base64:
+        raise HTTPException(status_code=400, detail="pdf_base64 is required when format is 'pdf'.")
+
+    exported_by = (
+        current_user.display_name
+        or current_user.email
+        or "FlowPilot User"
+    )
+    sent = await send_transaction_export_email(
+        to=body.email,
+        exported_by=exported_by,
+        rows=body.rows,
+        fmt=body.format,
+        pdf_base64=body.pdf_base64,
+    )
+    if not sent:
+        raise HTTPException(status_code=502, detail="Failed to send export email. Please try again.")
+    return {"message": f"Export sent to {body.email}"}

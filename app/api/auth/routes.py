@@ -26,6 +26,9 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.invitation_repository import (
     InvitationRepository,
 )
+from src.infrastructure.database.repositories.notification_repository import (
+    NotificationRepository,
+)
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_password_reset_email, send_verification_email
 from src.infrastructure.cache import otp_store
@@ -52,6 +55,7 @@ class UpdateProfileRequest(BaseModel):
     phone: Optional[str] = None
     timezone: Optional[str] = None
     department: Optional[str] = None
+    has_taken_tour: Optional[bool] = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -91,6 +95,10 @@ _INVALID_CREDENTIALS = "Invalid email or password"
 
 def _user_response(user, memberships) -> dict:
     """Build the standard user profile dict."""
+    # Only expose active memberships — disabled members lose dashboard access
+    active_memberships = [
+        m for m in memberships if getattr(m, "is_active", True)
+    ]
     return {
         "id": str(user.id),
         "email": user.email,
@@ -103,15 +111,16 @@ def _user_response(user, memberships) -> dict:
         "timezone": user.timezone,
         "department": user.department,
         "is_active": user.is_active,
+        "has_taken_tour": getattr(user, "has_taken_tour", False),
         "email_verified": user.email_verified_at is not None,
         "last_login_at": (
             user.last_login_at.isoformat() if user.last_login_at else None
         ),
         "memberships": [
             {"business_id": str(m.business_id), "role": m.role}
-            for m in memberships
+            for m in active_memberships
         ],
-        "has_completed_onboarding": len(memberships) > 0,
+        "has_completed_onboarding": len(active_memberships) > 0,
     }
 
 
@@ -314,6 +323,25 @@ async def register_via_invite(
     )
     session.add(member)
     await invite_repo.mark_accepted(invite)
+
+    # Welcome notification for the new team member
+    from src.infrastructure.database.flowpilot_models import BusinessModel
+    from sqlalchemy import select as sa_select
+    biz_result = await session.execute(
+        sa_select(BusinessModel).where(BusinessModel.id == invite.business_id)
+    )
+    biz = biz_result.scalar_one_or_none()
+    biz_name = biz.business_name if biz else "your team"
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=new_user.id,
+        business_id=invite.business_id,
+        title="You've joined a workspace!",
+        message=f"Welcome to {biz_name}. You can now access the dashboard and collaborate with your team.",
+        type="info",
+        resource_type="business",
+        resource_id=str(invite.business_id),
+    )
 
     token = create_access_token(new_user.id, new_user.email)
     await session.commit()

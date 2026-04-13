@@ -17,6 +17,7 @@ from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from src.agents.orchestrator import RunOrchestrator
 from src.services.email_service import send_run_awaiting_approval_email
+from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 from src.agents.event_publisher import EventPublisher, subscribe, unsubscribe
 from src.agents.state import AgentState
 from src.config.settings import Settings
@@ -199,6 +200,25 @@ def _candidates_to_response(candidates) -> list[CandidateResponse]:
     ]
 
 
+async def _notify(session, user_id, business_id, title: str, message: str,
+                  type: str = "info", resource_type: str | None = None, resource_id: str | None = None):
+    """Create an in-app notification — best-effort, never raises."""
+    try:
+        repo = NotificationRepository(session)
+        await repo.create(
+            user_id=user_id,
+            title=title,
+            message=message,
+            type=type,
+            business_id=business_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
+        await session.flush()
+    except Exception as exc:
+        logger.warning("Failed to create notification: %s", exc)
+
+
 @router.post("/runs", response_model=RunResponse)
 async def create_run(
     request: CreateRunRequest,
@@ -333,6 +353,13 @@ async def create_run(
         "reasoning_log": [],
     }
 
+    # Notify creator that the run has started
+    await _notify(session, current_user.id, business_uuid,
+                  title="Run started",
+                  message=f'Your run "{request.objective[:60]}" is now processing.',
+                  type="info", resource_type="run", resource_id=run_id)
+    await session.commit()
+
     logger.info(f"Created run {run_id}: {request.objective[:80]}")
 
     try:
@@ -366,15 +393,30 @@ async def create_run(
                         approver_name=approver_user.display_name or approver_user.email,
                         frontend_url=Settings.FRONTEND_URL,
                     )
+                    await _notify(session, approver_user.id, business_uuid,
+                                  title="Approval needed",
+                                  message=f'{candidate_count} candidate{"s" if candidate_count != 1 else ""} need your review on run "{request.objective[:50]}".',
+                                  type="warning", resource_type="run", resource_id=run_id)
+                await session.commit()
             except Exception as _email_exc:
                 logger.warning(f"Run {run_id}: failed to notify approvers: {_email_exc}")
 
         elif state.get("error"):
             final_status = "failed"
             _running_states.pop(run_id, None)
+            await _notify(session, current_user.id, business_uuid,
+                          title="Run failed",
+                          message=f'Your run "{request.objective[:50]}" encountered an error.',
+                          type="error", resource_type="run", resource_id=run_id)
+            await session.commit()
         else:
             final_status = "completed"
             _running_states.pop(run_id, None)
+            await _notify(session, current_user.id, business_uuid,
+                          title="Run completed",
+                          message=f'Your run "{request.objective[:50]}" completed successfully.',
+                          type="success", resource_type="run", resource_id=run_id)
+            await session.commit()
 
         # Load candidates from DB for response (may now have risk scores)
         db_candidates = await candidate_repo.get_by_run(run.id)

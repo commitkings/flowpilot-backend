@@ -165,3 +165,44 @@ async def update_org_config(
         "default_risk_tolerance": config.default_risk_tolerance,
         "default_budget_cap": float(config.default_budget_cap) if config.default_budget_cap else None,
     }
+
+
+@router.get("/sessions")
+async def get_active_sessions(
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Return active session count and which team members are currently online."""
+    from sqlalchemy import select
+    from src.infrastructure.database.flowpilot_models import BusinessMemberModel, UserModel
+    from src.infrastructure.cache.session_store import active_user_ids
+
+    business_id = await _get_user_business_id(current_user, session)
+
+    rows = (
+        await session.execute(
+            select(BusinessMemberModel, UserModel)
+            .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+            .where(BusinessMemberModel.business_id == business_id)
+        )
+    ).all()
+
+    all_user_ids = [str(member.user_id) for member, _ in rows]
+    online_ids = set(await active_user_ids(all_user_ids))
+
+    members = [
+        {
+            "user_id": str(member.user_id),
+            "display_name": user.display_name or user.email,
+            "email": user.email,
+            "role": member.role,
+            "is_online": str(member.user_id) in online_ids,
+        }
+        for member, user in rows
+    ]
+
+    return {
+        "active_count": len(online_ids),
+        "total_members": len(members),
+        "members": members,
+    }
