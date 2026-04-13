@@ -4,6 +4,7 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,13 @@ from src.infrastructure.database.repositories import AuditRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class AuditExportEmailRequest(BaseModel):
+    email: EmailStr
+    entries: list[dict]
+    format: str = "csv"
+    pdf_base64: Optional[str] = None
 
 
 def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
@@ -163,3 +171,30 @@ async def list_audit_entries(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.post("/audit/export-email")
+async def export_audit_email(
+    body: AuditExportEmailRequest,
+    current_user=Depends(get_current_user),
+):
+    """Send audit log entries to an email address as a CSV or PDF attachment."""
+    from src.services.email_service import send_audit_export_email
+
+    if not body.entries:
+        raise HTTPException(status_code=400, detail="No audit entries to export.")
+
+    if body.format == "pdf" and not body.pdf_base64:
+        raise HTTPException(status_code=400, detail="pdf_base64 is required when format is 'pdf'.")
+
+    exported_by = current_user.display_name or current_user.email or "FlowPilot User"
+    sent = await send_audit_export_email(
+        to=body.email,
+        exported_by=exported_by,
+        entries=body.entries,
+        fmt=body.format,
+        pdf_base64=body.pdf_base64,
+    )
+    if not sent:
+        raise HTTPException(status_code=502, detail="Failed to send export email. Please try again.")
+    return {"message": f"Audit log export sent to {body.email}"}

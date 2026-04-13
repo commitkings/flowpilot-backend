@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Your audit log export</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f2ef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+  <div style="display:none;max-height:0;overflow:hidden;color:#f4f2ef;font-size:1px;">
+    Your FlowPilot audit log export ({{ entry_count }} entr{{ 'ies' if entry_count != 1 else 'y' }}) is attached. &nbsp;&zwnj;&nbsp;
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f2ef;">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;">
+
+          <!-- Logo -->
+          <tr>
+            <td style="background-color:#ffffff;border-radius:14px 14px 0 0;padding:28px 40px 22px;border-top:3px solid #1e2d40;">
+              <img src="{{ logo_url }}" alt="FlowPilot" height="26" style="display:block;border:0;" />
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="background-color:#ffffff;padding:0 40px 28px;">
+              <h1 style="margin:0 0 12px;font-size:22px;font-weight:700;color:#16213a;line-height:1.35;">
+                Your audit log export is attached
+              </h1>
+              <p style="margin:0 0 24px;font-size:15px;color:#4a4540;line-height:1.65;">
+                Hi {{ exported_by.split()[0] if ' ' in exported_by else exported_by }}, your audit log export of
+                <strong style="color:#16213a;">{{ entry_count }} entr{{ 'ies' if entry_count != 1 else 'y' }}</strong>
+                is ready. Open the attached file <strong style="color:#16213a;">{{ filename }}</strong> to review the full trail.
+              </p>
+
+              <!-- Summary card -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+                <tr>
+                  <td style="background-color:#faf9f7;border-radius:10px;border:1px solid #ede9e3;padding:18px 20px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="width:50%;padding-right:16px;border-right:1px solid #ede9e3;">
+                          <p style="margin:0 0 4px;font-size:11px;font-weight:600;color:#7a7067;letter-spacing:0.06em;text-transform:uppercase;">Entries</p>
+                          <p style="margin:0;font-size:20px;font-weight:700;color:#16213a;">{{ entry_count }}</p>
+                        </td>
+                        <td style="width:50%;padding-left:16px;">
+                          <p style="margin:0 0 4px;font-size:11px;font-weight:600;color:#7a7067;letter-spacing:0.06em;text-transform:uppercase;">Date Range</p>
+                          <p style="margin:0;font-size:14px;font-weight:600;color:#16213a;">{{ date_range }}</p>
+                        </td>
+                      </tr>
+                    </table>
+                    <p style="margin:14px 0 0;font-size:12px;color:#9a9389;">Exported by {{ exported_by }} &middot; {{ exported_at }}</p>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- CTA -->
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="border-radius:50px;background-color:#1e2d40;">
+                    <a href="{{ dashboard_url }}" style="display:inline-block;padding:14px 34px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:50px;">
+                      View Audit Trail
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Divider -->
+          <tr>
+            <td style="background-color:#ffffff;padding:0 40px;">
+              <div style="height:1px;background-color:#ede9e3;">&nbsp;</div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color:#ffffff;border-radius:0 0 14px 14px;padding:20px 40px 28px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td align="center">
+                    <p style="margin:0 0 6px;font-size:12px;color:#9a9389;line-height:1.6;">
+                      Need help? <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;font-weight:600;">support@flowpilot.club</a>
+                    </p>
+                    <p style="margin:0;font-size:11px;color:#b8b0a6;">&copy; 2026 FlowPilot &middot; Automate your payouts.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

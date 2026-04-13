@@ -14,6 +14,9 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.business_repository import (
     BusinessRepository,
 )
+from src.infrastructure.database.repositories.notification_repository import (
+    NotificationRepository,
+)
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_welcome_email
 
@@ -71,6 +74,18 @@ async def complete_onboarding(
     )
 
     logger.info("Onboarding complete for user=%s business=%s", current_user.id, business.id)
+
+    # Create welcome notification
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=current_user.id,
+        business_id=business.id,
+        title="Welcome to FlowPilot!",
+        message=f"Your workspace '{business.business_name}' is ready. Start by creating your first payout run.",
+        type="info",
+        resource_type="business",
+        resource_id=str(business.id),
+    )
 
     # Send welcome email — best-effort, never blocks the response
     await send_welcome_email(

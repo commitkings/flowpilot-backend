@@ -111,6 +111,7 @@ class UserRepository:
         phone: Optional[str] = None,
         timezone: Optional[str] = None,
         department: Optional[str] = None,
+        has_taken_tour: Optional[bool] = None,
     ) -> Optional[UserModel]:
         """Update mutable profile fields. Only non-None values are applied."""
         user = await self.get_by_id(user_id)
@@ -125,6 +126,7 @@ class UserRepository:
             ("phone", phone),
             ("timezone", timezone),
             ("department", department),
+            ("has_taken_tour", has_taken_tour),
         ]:
             if value is not None:
                 setattr(user, field, value)

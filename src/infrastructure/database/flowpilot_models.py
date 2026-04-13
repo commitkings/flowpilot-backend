@@ -58,6 +58,7 @@ class UserModel(Base):
     department: Mapped[Optional[str]] = mapped_column(String(100))
     external_provider: Mapped[Optional[str]] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    has_taken_tour: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -155,6 +156,7 @@ class BusinessMemberModel(Base):
         ForeignKey("user.id", ondelete="CASCADE"),
     )
     role: Mapped[str] = mapped_column(Text, server_default=text("'analyst'"))
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     joined_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
@@ -173,6 +175,7 @@ class BusinessMemberModel(Base):
         ),
         Index("business_member_business_id_idx", "business_id"),
         Index("business_member_user_id_idx", "user_id"),
+        Index("business_member_is_active_idx", "is_active"),
     )
 
     business: Mapped["BusinessModel"] = relationship(back_populates="members")

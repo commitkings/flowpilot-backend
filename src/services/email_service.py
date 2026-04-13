@@ -4,6 +4,9 @@ Templates live in src/templates/emails/ and are rendered with Jinja2.
 All public send_* functions are fire-and-log — they return True/False but never raise.
 """
 
+import base64
+import csv
+import io
 import logging
 from pathlib import Path
 from typing import Optional
@@ -36,13 +39,30 @@ def _render(template_name: str, **context: object) -> str:
 # ── Low-level HTTP sender ─────────────────────────────────────────────────────
 
 
-async def _send(to: str, subject: str, html: str) -> bool:
-    """POST to Resend API.  Returns True on success, False on any failure."""
+async def _send(
+    to: str,
+    subject: str,
+    html: str,
+    attachments: Optional[list[dict]] = None,
+) -> bool:
+    """POST to Resend API.  Returns True on success, False on any failure.
+
+    attachments format: [{"filename": "name.csv", "content": "<base64>"}]
+    """
     api_key = Settings.get_resend_api_key()
     if not api_key:
         logger.warning("RESEND_API_KEY not configured — skipping email to %s", to)
         logger.info("Would send | subject=%r to=%s", subject, to)
         return False
+
+    payload: dict = {
+        "from": Settings.DEFAULT_FROM_EMAIL,
+        "to": [to],
+        "subject": subject,
+        "html": html,
+    }
+    if attachments:
+        payload["attachments"] = attachments
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -52,12 +72,7 @@ async def _send(to: str, subject: str, html: str) -> bool:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "from": Settings.DEFAULT_FROM_EMAIL,
-                    "to": [to],
-                    "subject": subject,
-                    "html": html,
-                },
+                json=payload,
             )
 
         if resp.status_code in (200, 201):
@@ -245,6 +260,135 @@ async def send_verification_email(
         to=to,
         subject="Your FlowPilot verification code",
         html=html,
+    )
+
+
+def _build_csv_attachment(rows: list[dict], filename: str) -> dict:
+    """Serialise transaction rows to a base64-encoded CSV attachment dict."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Reference", "Status", "Amount", "Currency", "Channel", "Direction", "Counterparty", "Bank", "Date"])
+    for r in rows:
+        writer.writerow([
+            r.get("reference", ""),
+            r.get("status", ""),
+            r.get("amount", ""),
+            r.get("currency", "NGN"),
+            r.get("channel", ""),
+            r.get("direction", ""),
+            r.get("counterparty_name", ""),
+            r.get("counterparty_bank", ""),
+            (r.get("date") or "")[:10],
+        ])
+    encoded = base64.b64encode(buf.getvalue().encode()).decode()
+    return {"filename": filename, "content": encoded}
+
+
+async def send_transaction_export_email(
+    to: str,
+    exported_by: str,
+    rows: list[dict],
+    fmt: str = "csv",
+    pdf_base64: Optional[str] = None,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Send a transaction export as an email attachment (CSV or PDF).
+
+    Template: src/templates/emails/transaction_export.html
+    For PDF, the caller must supply the pre-rendered pdf_base64 string.
+    """
+    import datetime as _dt
+
+    base = frontend_url or Settings.FRONTEND_URL
+    total_volume = sum(r.get("amount", 0) for r in rows)
+    date_str = _dt.date.today().isoformat()
+
+    if fmt == "pdf" and pdf_base64:
+        filename = f"transactions-{date_str}.pdf"
+        attachment = {"filename": filename, "content": pdf_base64}
+    else:
+        filename = f"transactions-{date_str}.csv"
+        attachment = _build_csv_attachment(rows, filename)
+
+    html = _render(
+        "transaction_export.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        row_count=len(rows),
+        total_volume=f"{total_volume:,.2f}",
+        exported_by=exported_by,
+        exported_at=_dt.datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        filename=filename,
+        dashboard_url=f"{base}/dashboard/transactions",
+    )
+    return await _send(
+        to=to,
+        subject=f"Your FlowPilot transaction export — {len(rows)} record{'s' if len(rows) != 1 else ''}",
+        html=html,
+        attachments=[attachment],
+    )
+
+
+async def send_audit_export_email(
+    to: str,
+    exported_by: str,
+    entries: list[dict],
+    fmt: str = "csv",
+    pdf_base64: Optional[str] = None,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Send an audit log export as an email attachment (CSV or PDF).
+
+    Template: src/templates/emails/audit_export.html
+    """
+    import datetime as _dt
+
+    base = frontend_url or Settings.FRONTEND_URL
+    date_str = _dt.date.today().isoformat()
+
+    # Compute date range from entries
+    dates = [e.get("created_at", "")[:10] for e in entries if e.get("created_at")]
+    if dates:
+        date_range = f"{min(dates)} – {max(dates)}" if min(dates) != max(dates) else min(dates)
+    else:
+        date_range = date_str
+
+    if fmt == "pdf" and pdf_base64:
+        filename = f"audit-log-{date_str}.pdf"
+        attachment = {"filename": filename, "content": pdf_base64}
+    else:
+        # Build CSV
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["ID", "Agent", "Action", "Run ID", "Timestamp"])
+        for e in entries:
+            writer.writerow([
+                e.get("id", ""),
+                e.get("agent_type", ""),
+                e.get("action", ""),
+                e.get("run_id", ""),
+                (e.get("created_at") or "")[:19],
+            ])
+        filename = f"audit-log-{date_str}.csv"
+        attachment = {
+            "filename": filename,
+            "content": base64.b64encode(buf.getvalue().encode()).decode(),
+        }
+
+    html = _render(
+        "audit_export.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        entry_count=len(entries),
+        date_range=date_range,
+        exported_by=exported_by,
+        exported_at=_dt.datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        filename=filename,
+        dashboard_url=f"{base}/dashboard/audit",
+    )
+    return await _send(
+        to=to,
+        subject=f"Your FlowPilot audit log export — {len(entries)} entr{'ies' if len(entries) != 1 else 'y'}",
+        html=html,
+        attachments=[attachment],
     )
 
 

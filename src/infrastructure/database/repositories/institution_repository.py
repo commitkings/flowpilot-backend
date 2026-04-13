@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from typing import Optional
+
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,12 +36,40 @@ class InstitutionRepository:
         await self._session.flush()
         return result.rowcount
 
-    async def get_all_active(self) -> list[InstitutionModel]:
-        stmt = select(InstitutionModel).where(
-            InstitutionModel.is_active.is_(True)
+    async def get_all_active(
+        self,
+        search: Optional[str] = None,
+        institution_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[InstitutionModel], int]:
+        filters = [InstitutionModel.is_active.is_(True)]
+
+        if search:
+            term = f"%{search.lower()}%"
+            filters.append(
+                or_(
+                    func.lower(InstitutionModel.institution_name).like(term),
+                    func.lower(InstitutionModel.short_name).like(term),
+                    InstitutionModel.institution_code.like(term),
+                )
+            )
+
+        if institution_type:
+            filters.append(InstitutionModel.institution_type == institution_type)
+
+        base = select(InstitutionModel).where(*filters)
+
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self._session.execute(count_stmt)).scalar() or 0
+
+        rows_stmt = (
+            base.order_by(InstitutionModel.institution_name)
+            .limit(limit)
+            .offset(offset)
         )
-        result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+        rows = list((await self._session.execute(rows_stmt)).scalars().all())
+        return rows, total
 
     async def get_by_code(self, code: str) -> InstitutionModel | None:
         stmt = select(InstitutionModel).where(
