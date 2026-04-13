@@ -58,4 +58,12 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
+
+    # Fire-and-forget session heartbeat (never fails the request)
+    try:
+        from src.infrastructure.cache.session_store import touch
+        await touch(str(user_id))
+    except Exception:
+        pass
+
     return user
