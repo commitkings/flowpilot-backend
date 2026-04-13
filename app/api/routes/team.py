@@ -1,4 +1,4 @@
-"""Team member management routes (Gap 5).
+"""Team member management routes.
 
 CRUD for BusinessMemberModel — list, invite, update role, remove.
 Only the business *owner* can invite, modify, or remove members.
@@ -6,37 +6,50 @@ Only the business *owner* can invite, modify, or remove members.
 
 import logging
 import uuid
+from datetime import datetime, timezone as tz
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import csv
+import io
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.passwords import normalize_email
+from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
     UserModel,
 )
+from src.infrastructure.database.repositories.invitation_repository import (
+    InvitationRepository,
+)
 from src.infrastructure.database.repositories.user_repository import UserRepository
+from src.services.email_service import send_team_added_email, send_team_invite_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 VALID_ROLES = {"owner", "approver", "analyst"}
+INVITE_ROLES = {"approver", "analyst"}  # owners cannot be invited
 
 
-# ---- helpers ----------------------------------------------------------------
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 
 async def _get_caller_membership(
     session: AsyncSession, user_id: uuid.UUID
 ) -> BusinessMemberModel:
-    """Return the caller's first business membership or 403."""
     result = await session.execute(
-        select(BusinessMemberModel).where(BusinessMemberModel.user_id == user_id)
+        select(BusinessMemberModel)
+        .options(selectinload(BusinessMemberModel.business))
+        .where(BusinessMemberModel.user_id == user_id)
     )
     membership = result.scalars().first()
     if not membership:
@@ -68,7 +81,7 @@ def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) ->
     }
 
 
-# ---- request bodies ---------------------------------------------------------
+# ── request bodies ────────────────────────────────────────────────────────────
 
 
 class InviteMemberRequest(BaseModel):
@@ -80,7 +93,7 @@ class UpdateMemberRoleRequest(BaseModel):
     role: str
 
 
-# ---- routes -----------------------------------------------------------------
+# ── routes ────────────────────────────────────────────────────────────────────
 
 
 @router.get("/team/members")
@@ -91,12 +104,6 @@ async def list_team_members(
     current_user=Depends(get_current_user),
 ):
     caller = await _get_caller_membership(session, current_user.id)
-
-    base = (
-        select(BusinessMemberModel)
-        .options(selectinload(BusinessMemberModel.user))
-        .where(BusinessMemberModel.business_id == caller.business_id)
-    )
 
     from sqlalchemy import func
 
@@ -111,7 +118,10 @@ async def list_team_members(
     rows = list(
         (
             await session.execute(
-                base.order_by(BusinessMemberModel.created_at)
+                select(BusinessMemberModel)
+                .options(selectinload(BusinessMemberModel.user))
+                .where(BusinessMemberModel.business_id == caller.business_id)
+                .order_by(BusinessMemberModel.created_at)
                 .limit(limit)
                 .offset(offset)
             )
@@ -134,45 +144,207 @@ async def invite_member(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
+    """Invite a team member by email.
+
+    - Existing user → creates BusinessMember immediately, sends notification email.
+    - New user      → creates pending Invitation with a magic link, sends invite email.
+    """
     caller = await _get_caller_membership(session, current_user.id)
     _require_owner(caller)
 
-    if body.role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {VALID_ROLES}")
+    role = body.role.lower()
+    if role not in INVITE_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role. Must be one of: {sorted(INVITE_ROLES)}",
+        )
 
+    normalized = normalize_email(str(body.email))
     user_repo = UserRepository(session)
-    target_user = await user_repo.get_by_email(body.email)
-    if not target_user:
-        raise HTTPException(status_code=404, detail="User not found. They must register first.")
+    invite_repo = InvitationRepository(session)
+
+    target_user = await user_repo.get_by_email(normalized)
+    business_name = caller.business.business_name if caller.business else "your organisation"
+    inviter_name = current_user.display_name or current_user.email
+
+    # ── Scenario A: user already registered ──────────────────────────────────
+    if target_user:
+        existing = (
+            await session.execute(
+                select(BusinessMemberModel).where(
+                    and_(
+                        BusinessMemberModel.business_id == caller.business_id,
+                        BusinessMemberModel.user_id == target_user.id,
+                    )
+                )
+            )
+        ).scalars().first()
+
+        if existing:
+            raise HTTPException(
+                status_code=409, detail="User is already a member of this team"
+            )
+
+        member = BusinessMemberModel(
+            business_id=caller.business_id,
+            user_id=target_user.id,
+            role=role,
+            joined_at=datetime.now(tz.utc),
+        )
+        session.add(member)
+        await session.flush()
+
+        # Send notification email (best-effort)
+        dashboard_url = f"{Settings.FRONTEND_URL}/dashboard"
+        await send_team_added_email(
+            to=target_user.email,
+            business_name=business_name,
+            inviter_name=inviter_name,
+            role=role,
+            dashboard_url=dashboard_url,
+            frontend_url=Settings.FRONTEND_URL,
+        )
+
+        return {
+            "status": "added",
+            "member": _serialize_member(member, target_user),
+        }
+
+    # ── Scenario B: new user — create pending invitation ─────────────────────
+    existing_invite = await invite_repo.get_pending_for_business(
+        caller.business_id, normalized
+    )
+    if existing_invite:
+        raise HTTPException(
+            status_code=409,
+            detail="An invite has already been sent to this email address",
+        )
+
+    invite = await invite_repo.create(
+        business_id=caller.business_id,
+        invited_email=normalized,
+        role=role,
+        invited_by_user_id=current_user.id,
+    )
+
+    accept_url = (
+        f"{Settings.FRONTEND_URL}{Settings.ACCEPT_INVITE_PATH}?token={invite.token}"
+    )
+    await send_team_invite_email(
+        to=normalized,
+        business_name=business_name,
+        inviter_name=inviter_name,
+        role=role,
+        accept_url=accept_url,
+        frontend_url=Settings.FRONTEND_URL,
+    )
+
+    return {
+        "status": "invited",
+        "invite_id": str(invite.id),
+        "invited_email": normalized,
+    }
+
+
+@router.get("/team/invite/{token}")
+async def get_invite_details(
+    token: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Public endpoint — returns invite metadata for the accept-invite page."""
+    invite_repo = InvitationRepository(session)
+    invite = await invite_repo.get_by_token(token)
+
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+
+    if invite.status == "accepted":
+        return {
+            "status": "accepted",
+            "business_name": invite.business.business_name if invite.business else None,
+            "invited_email": invite.invited_email,
+            "role": invite.role,
+            "inviter_name": None,
+        }
+
+    if invite.status == "expired" or invite.expires_at < datetime.now(tz.utc):
+        if invite.status != "expired":
+            await invite_repo.mark_expired(invite)
+        return {
+            "status": "expired",
+            "business_name": invite.business.business_name if invite.business else None,
+            "invited_email": invite.invited_email,
+            "role": invite.role,
+            "inviter_name": None,
+        }
+
+    inviter_name: Optional[str] = None
+    if invite.invited_by:
+        inviter_name = invite.invited_by.display_name or invite.invited_by.email
+
+    return {
+        "status": "pending",
+        "business_name": invite.business.business_name if invite.business else None,
+        "invited_email": invite.invited_email,
+        "role": invite.role,
+        "inviter_name": inviter_name,
+        "expires_at": invite.expires_at.isoformat(),
+    }
+
+
+@router.post("/team/accept-invite/{token}")
+async def accept_invite(
+    token: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """For an already-registered user who receives an invite and wants to join.
+
+    Validates the invite token, checks the current user's email matches, then
+    creates the BusinessMember record.
+    """
+    invite_repo = InvitationRepository(session)
+    invite = await invite_repo.get_by_token(token)
+
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+
+    if invite.status != "pending" or invite.expires_at < datetime.now(tz.utc):
+        raise HTTPException(status_code=410, detail="Invitation has expired or already been used")
+
+    if current_user.email != invite.invited_email:
+        raise HTTPException(
+            status_code=403,
+            detail="This invitation was sent to a different email address",
+        )
 
     existing = (
         await session.execute(
             select(BusinessMemberModel).where(
                 and_(
-                    BusinessMemberModel.business_id == caller.business_id,
-                    BusinessMemberModel.user_id == target_user.id,
+                    BusinessMemberModel.business_id == invite.business_id,
+                    BusinessMemberModel.user_id == current_user.id,
                 )
             )
         )
     ).scalars().first()
 
     if existing:
-        raise HTTPException(status_code=409, detail="User is already a member of this team")
-
-    from datetime import datetime, timezone as tz
+        raise HTTPException(status_code=409, detail="You are already a member of this team")
 
     member = BusinessMemberModel(
-        business_id=caller.business_id,
-        user_id=target_user.id,
-        role=body.role,
+        business_id=invite.business_id,
+        user_id=current_user.id,
+        role=invite.role,
         joined_at=datetime.now(tz.utc),
     )
     session.add(member)
-    await session.flush()
+    await invite_repo.mark_accepted(invite)
 
     return {
-        "status": "invited",
-        "member": _serialize_member(member, target_user),
+        "status": "accepted",
+        "business_id": str(invite.business_id),
+        "role": invite.role,
     }
 
 
@@ -187,7 +359,9 @@ async def update_member_role(
     _require_owner(caller)
 
     if body.role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {VALID_ROLES}")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid role. Must be one of: {VALID_ROLES}"
+        )
 
     try:
         mid = uuid.UUID(member_id)
@@ -244,9 +418,187 @@ async def remove_member(
         raise HTTPException(status_code=404, detail="Team member not found")
 
     if target.user_id == current_user.id:
-        raise HTTPException(status_code=400, detail="Cannot remove yourself from the team")
+        raise HTTPException(
+            status_code=400, detail="Cannot remove yourself from the team"
+        )
 
     await session.delete(target)
     await session.flush()
 
     return {"status": "removed"}
+
+
+# ── Bulk import ───────────────────────────────────────────────────────────────
+
+
+@router.get("/team/import/template")
+async def download_import_template():
+    """Return a CSV template for bulk team member import.
+
+    Columns: email, role, first_name (optional), last_name (optional)
+    Roles:   analyst | approver
+    """
+    rows = [
+        ["email", "role", "first_name", "last_name"],
+        ["alice@example.com", "analyst", "Alice", "Smith"],
+        ["bob@example.com", "approver", "Bob", "Jones"],
+    ]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(rows)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=team_import_template.csv"},
+    )
+
+
+@router.post("/team/import")
+async def bulk_import_members(
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Import multiple team members from a CSV file.
+
+    Only the business owner can use this endpoint.
+    CSV must have a header row with at minimum: email, role.
+    Roles must be 'analyst' or 'approver' (owners cannot be imported).
+
+    Returns a summary of added, invited, skipped, and failed rows.
+    """
+    caller = await _get_caller_membership(session, current_user.id)
+    _require_owner(caller)
+
+    if file.content_type not in ("text/csv", "application/vnd.ms-excel", "text/plain"):
+        raise HTTPException(status_code=400, detail="File must be a CSV")
+
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig")  # strip BOM if present
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None or "email" not in [f.lower().strip() for f in reader.fieldnames]:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must have an 'email' column. Download the template to see the expected format.",
+        )
+
+    # Normalize header names to lowercase
+    def _col(row: dict, name: str) -> str:
+        for k, v in row.items():
+            if k.lower().strip() == name:
+                return (v or "").strip()
+        return ""
+
+    user_repo = UserRepository(session)
+    invite_repo = InvitationRepository(session)
+    business_name = caller.business.business_name if caller.business else "your organisation"
+    inviter_name = current_user.display_name or current_user.email
+    dashboard_url = f"{Settings.FRONTEND_URL}/dashboard"
+
+    results: list[dict] = []
+    added = invited = skipped = failed = 0
+
+    for line_num, row in enumerate(reader, start=2):
+        email_raw = _col(row, "email")
+        role_raw = _col(row, "role") or "analyst"
+
+        if not email_raw:
+            results.append({"line": line_num, "status": "error", "reason": "Missing email"})
+            failed += 1
+            continue
+
+        try:
+            normalized = normalize_email(email_raw)
+        except Exception:
+            results.append({"line": line_num, "email": email_raw, "status": "error", "reason": "Invalid email format"})
+            failed += 1
+            continue
+
+        role = role_raw.lower()
+        if role not in INVITE_ROLES:
+            results.append({
+                "line": line_num,
+                "email": normalized,
+                "status": "error",
+                "reason": f"Invalid role '{role_raw}'. Must be: analyst or approver",
+            })
+            failed += 1
+            continue
+
+        # Check if already a member
+        target_user = await user_repo.get_by_email(normalized)
+        if target_user:
+            existing = (
+                await session.execute(
+                    select(BusinessMemberModel).where(
+                        and_(
+                            BusinessMemberModel.business_id == caller.business_id,
+                            BusinessMemberModel.user_id == target_user.id,
+                        )
+                    )
+                )
+            ).scalars().first()
+
+            if existing:
+                results.append({"line": line_num, "email": normalized, "status": "skipped", "reason": "Already a member"})
+                skipped += 1
+                continue
+
+            # Add existing user directly
+            member = BusinessMemberModel(
+                business_id=caller.business_id,
+                user_id=target_user.id,
+                role=role,
+                joined_at=datetime.now(tz.utc),
+            )
+            session.add(member)
+            await session.flush()
+            await send_team_added_email(
+                to=target_user.email,
+                business_name=business_name,
+                inviter_name=inviter_name,
+                role=role,
+                dashboard_url=dashboard_url,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+            results.append({"line": line_num, "email": normalized, "status": "added", "role": role})
+            added += 1
+
+        else:
+            # Check for existing pending invite
+            existing_invite = await invite_repo.get_pending_for_business(caller.business_id, normalized)
+            if existing_invite:
+                results.append({"line": line_num, "email": normalized, "status": "skipped", "reason": "Invitation already pending"})
+                skipped += 1
+                continue
+
+            invite = await invite_repo.create(
+                business_id=caller.business_id,
+                invited_email=normalized,
+                role=role,
+                invited_by_user_id=current_user.id,
+            )
+            accept_url = f"{Settings.FRONTEND_URL}{Settings.ACCEPT_INVITE_PATH}?token={invite.token}"
+            await send_team_invite_email(
+                to=normalized,
+                business_name=business_name,
+                inviter_name=inviter_name,
+                role=role,
+                accept_url=accept_url,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+            results.append({"line": line_num, "email": normalized, "status": "invited", "role": role})
+            invited += 1
+
+    await session.commit()
+
+    return {
+        "summary": {"added": added, "invited": invited, "skipped": skipped, "failed": failed, "total": added + invited + skipped + failed},
+        "results": results,
+    }

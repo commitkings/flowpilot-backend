@@ -287,6 +287,21 @@ class Settings:
         return bool(cls.get_google_client_id() and cls.get_google_client_secret())
 
     # ------------------------------------------------------------------
+    # Email (Resend)
+    # ------------------------------------------------------------------
+    RESEND_API_KEY: Optional[str] = os.getenv("RESEND_API_KEY")
+    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@flowpilot.club")
+    ACCEPT_INVITE_PATH: str = os.getenv("ACCEPT_INVITE_PATH", "/accept-invite")
+
+    @classmethod
+    def get_resend_api_key(cls) -> Optional[str]:
+        return cls._get_secret("RESEND_API_KEY", "RESEND_API_KEY")
+
+    @classmethod
+    def is_email_configured(cls) -> bool:
+        return bool(cls.get_resend_api_key())
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

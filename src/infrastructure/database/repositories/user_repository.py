@@ -28,22 +28,28 @@ class UserRepository:
         email: str,
         display_name: str,
         avatar_url: Optional[str] = None,
+        email_verified_at: Optional[datetime] = None,
     ) -> UserModel:
         """Create or update a user from an OAuth provider callback.
 
         On conflict (external_id already exists) we update profile fields
-        and bump last_login_at.
+        and bump last_login_at. email_verified_at is set on first insert only
+        (existing users keep their existing verification state).
         """
         now = datetime.now(timezone_mod.utc)
+        insert_values: dict = {
+            "external_id": external_id,
+            "email": email,
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+            "last_login_at": now,
+        }
+        if email_verified_at is not None:
+            insert_values["email_verified_at"] = email_verified_at
+
         stmt = (
             pg_insert(UserModel)
-            .values(
-                external_id=external_id,
-                email=email,
-                display_name=display_name,
-                avatar_url=avatar_url,
-                last_login_at=now,
-            )
+            .values(**insert_values)
             .on_conflict_do_update(
                 index_elements=["external_id"],
                 set_={
@@ -51,6 +57,12 @@ class UserRepository:
                     "display_name": display_name,
                     "avatar_url": avatar_url,
                     "last_login_at": now,
+                    # Only set email_verified_at if not already verified
+                    **(
+                        {"email_verified_at": email_verified_at}
+                        if email_verified_at is not None
+                        else {}
+                    ),
                 },
             )
             .returning(UserModel)

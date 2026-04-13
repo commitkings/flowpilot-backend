@@ -21,9 +21,6 @@ from src.infrastructure.database.repositories.institution_repository import (
 from src.infrastructure.database.repositories.notification_repository import (
     NotificationRepository,
 )
-from src.infrastructure.database.repositories.password_reset_token_repository import (
-    PasswordResetTokenRepository,
-)
 from src.infrastructure.database.repositories.plan_step_repository import (
     PlanStepRepository,
 )
@@ -55,7 +52,6 @@ __all__ = [
     "ExecutionDetailRepository",
     "InstitutionRepository",
     "NotificationRepository",
-    "PasswordResetTokenRepository",
     "PlanStepRepository",
     "RiskFeatureRepository",
     "RunEventRepository",

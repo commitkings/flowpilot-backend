@@ -22,17 +22,25 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
-    op.alter_column(
-        "user",
-        "external_id",
-        existing_type=sa.String(length=255),
-        nullable=True,
-    )
-    op.add_column("user", sa.Column("password_hash", sa.String(length=255), nullable=True))
-    op.add_column(
-        "user",
-        sa.Column("password_changed_at", sa.TIMESTAMP(timezone=True), nullable=True),
-    )
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    user_cols = {c["name"] for c in insp.get_columns("user")}
+
+    if "password_hash" not in user_cols:
+        op.alter_column(
+            "user",
+            "external_id",
+            existing_type=sa.String(length=255),
+            nullable=True,
+        )
+        op.add_column("user", sa.Column("password_hash", sa.String(length=255), nullable=True))
+        op.add_column(
+            "user",
+            sa.Column("password_changed_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        )
+
+    if bind.dialect.has_table(bind, "password_reset_token"):
+        return
 
     op.create_table(
         "password_reset_token",

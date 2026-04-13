@@ -7,7 +7,7 @@ from uuid import UUID
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.infrastructure.database.flowpilot_models import AuditLogModel
+from src.infrastructure.database.flowpilot_models import AgentRunModel, AuditLogModel
 
 
 class AuditRepository:
@@ -65,6 +65,7 @@ class AuditRepository:
         self,
         stmt,
         *,
+        business_id: Optional[UUID] = None,
         run_id: Optional[UUID] = None,
         agent_type: Optional[str] = None,
         action: Optional[str] = None,
@@ -73,6 +74,10 @@ class AuditRepository:
     ):
         A = AuditLogModel
         filters = []
+        if business_id is not None:
+            # Join run table to filter by business — keeps audit data scoped per org
+            stmt = stmt.join(AgentRunModel, A.run_id == AgentRunModel.id)
+            filters.append(AgentRunModel.business_id == business_id)
         if run_id is not None:
             filters.append(A.run_id == run_id)
         if agent_type is not None:
@@ -90,6 +95,7 @@ class AuditRepository:
     async def list_all(
         self,
         *,
+        business_id: Optional[UUID] = None,
         run_id: Optional[UUID] = None,
         agent_type: Optional[str] = None,
         action: Optional[str] = None,
@@ -98,12 +104,12 @@ class AuditRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[AuditLogModel], int]:
-        """Return (rows, total_count) for the global audit trail."""
+        """Return (rows, total_count) for the global audit trail scoped to a business."""
         A = AuditLogModel
         base = select(A).order_by(A.created_at.desc())
         base = self._apply_filters(
-            base, run_id=run_id, agent_type=agent_type, action=action,
-            from_date=from_date, to_date=to_date,
+            base, business_id=business_id, run_id=run_id, agent_type=agent_type,
+            action=action, from_date=from_date, to_date=to_date,
         )
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self._session.execute(count_stmt)).scalar_one()
