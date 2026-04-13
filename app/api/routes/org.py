@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.business_repository import (
     BusinessRepository,
@@ -104,6 +105,7 @@ async def update_org_profile(
     body: UpdateOrgRequest,
     current_user=Depends(get_current_user),
     session=Depends(get_db_session),
+    _=Depends(require_role("owner")),
 ):
     """Update the business profile for the user's organisation."""
     payload = body.model_dump(exclude_none=True)
@@ -138,6 +140,7 @@ async def update_org_config(
     body: UpdateOrgConfigRequest,
     current_user=Depends(get_current_user),
     session=Depends(get_db_session),
+    _=Depends(require_role("owner")),
 ):
     """Update the business config (financial profile) for the user's organisation."""
     payload = body.model_dump(exclude_none=True)

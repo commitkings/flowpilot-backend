@@ -5,11 +5,13 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel
 from src.infrastructure.database.repositories import CandidateRepository, RunRepository
 
 logger = logging.getLogger(__name__)
@@ -62,11 +64,25 @@ async def list_approvals(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
+    # Resolve caller's business — scope all results to their org
+    membership_result = await session.execute(
+        select(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id
+        )
+    )
+    membership = membership_result.scalars().first()
+    if not membership:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No business membership found",
+        )
+
     run_uuid = _parse_uuid(run_id, "run_id") if run_id else None
     candidate_repo = CandidateRepository(session)
     run_repo = RunRepository(session)
 
     candidates, total = await candidate_repo.list_all(
+        business_id=membership.business_id,
         run_id=run_uuid,
         approval_status=approval_status,
         risk_decision=risk_decision,

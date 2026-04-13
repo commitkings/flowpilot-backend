@@ -14,11 +14,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
 from src.agents.orchestrator import RunOrchestrator
+from src.services.email_service import send_run_awaiting_approval_email
 from src.agents.event_publisher import EventPublisher, subscribe, unsubscribe
 from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel, UserModel
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
@@ -201,9 +204,25 @@ async def create_run(
     request: CreateRunRequest,
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
 ):
     operator_id = current_user.id
     business_uuid = _parse_uuid(request.business_id, "business_id")
+
+    # Validate the user actually belongs to the requested business
+    from sqlalchemy import select as _select
+    membership_check = await session.execute(
+        _select(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == business_uuid,
+        )
+    )
+    if not membership_check.scalars().first():
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this organisation",
+        )
+
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)
     institution_repo = InstitutionRepository(session)
@@ -325,6 +344,31 @@ async def create_run(
         if state.get("current_step") == "awaiting_approval":
             final_status = "awaiting_approval"
             _running_states[run_id] = state
+
+            # Notify all approvers and owners in the business
+            try:
+                from sqlalchemy import select as _select2
+                approver_rows = (await session.execute(
+                    _select2(BusinessMemberModel, UserModel)
+                    .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+                    .where(
+                        BusinessMemberModel.business_id == business_uuid,
+                        BusinessMemberModel.role.in_(["owner", "approver"]),
+                    )
+                )).all()
+                candidate_count = len(state.get("scored_candidates", []))
+                for member, approver_user in approver_rows:
+                    await send_run_awaiting_approval_email(
+                        to=approver_user.email,
+                        run_id=run_id,
+                        objective=request.objective,
+                        candidate_count=candidate_count,
+                        approver_name=approver_user.display_name or approver_user.email,
+                        frontend_url=Settings.FRONTEND_URL,
+                    )
+            except Exception as _email_exc:
+                logger.warning(f"Run {run_id}: failed to notify approvers: {_email_exc}")
+
         elif state.get("error"):
             final_status = "failed"
             _running_states.pop(run_id, None)

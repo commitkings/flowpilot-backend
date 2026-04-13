@@ -19,6 +19,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+    # Guard: table was created by the definitive schema migration
+    bind = op.get_bind()
+    if bind.dialect.has_table(bind, "run_memory_digest"):
+        return
+
     op.create_table(
         "run_memory_digest",
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),

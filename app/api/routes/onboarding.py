@@ -9,11 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.auth.dependencies import get_current_user
+from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.business_repository import (
     BusinessRepository,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
+from src.services.email_service import send_welcome_email
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,14 @@ async def complete_onboarding(
     )
 
     logger.info("Onboarding complete for user=%s business=%s", current_user.id, business.id)
+
+    # Send welcome email — best-effort, never blocks the response
+    await send_welcome_email(
+        to=current_user.email,
+        display_name=current_user.display_name,
+        business_name=business.business_name,
+        frontend_url=Settings.FRONTEND_URL,
+    )
 
     return {
         "business": {

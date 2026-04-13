@@ -79,6 +79,7 @@ async def mark_notification_read(
     success = await repo.mark_read(nid, current_user.id)
     if not success:
         raise HTTPException(status_code=404, detail="Notification not found")
+    await session.commit()
     return {"status": "ok"}
 
 
@@ -89,6 +90,7 @@ async def mark_all_read(
 ):
     repo = NotificationRepository(session)
     count = await repo.mark_all_read(current_user.id)
+    await session.commit()
     return {"marked_read": count}
 
 
@@ -106,4 +108,5 @@ async def delete_notification(
     success = await repo.delete(nid, current_user.id)
     if not success:
         raise HTTPException(status_code=404, detail="Notification not found")
+    await session.commit()
     return {"status": "deleted"}

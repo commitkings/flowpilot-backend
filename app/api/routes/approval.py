@@ -7,12 +7,16 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
 from app.api.routes.runs import _parse_uuid, _running_states
+from src.services.email_service import send_run_completed_email
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.event_publisher import EventPublisher
 from src.agents.state import AgentState
 from src.config.settings import Settings
+from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.flowpilot_models import UserModel
 from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
@@ -288,6 +292,7 @@ async def approve_candidates(
     request: ApprovalRequest,
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     # Validate input BEFORE acquiring CAS lock to avoid wedging the run
@@ -389,6 +394,26 @@ async def approve_candidates(
             session, run_uuid, final_status, state.get("error")
         )
 
+        # Email run creator about the outcome
+        try:
+            from sqlalchemy import select as _select
+            if run.created_by:
+                creator_row = await session.execute(
+                    _select(UserModel).where(UserModel.id == run.created_by)
+                )
+                creator = creator_row.scalar_one_or_none()
+                if creator:
+                    await send_run_completed_email(
+                        to=creator.email,
+                        run_id=run_id,
+                        objective=run.objective,
+                        status=final_status,
+                        approved_count=approved_count,
+                        frontend_url=Settings.FRONTEND_URL,
+                    )
+        except Exception as _email_exc:
+            logger.warning(f"Run {run_id}: failed to notify creator: {_email_exc}")
+
         return {
             "run_id": run_id,
             "status": final_status,
@@ -421,6 +446,7 @@ async def reject_candidates(
     request: RejectionRequest,
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     candidate_ids = _parse_uuid_list(request.candidate_ids, "candidate_ids")

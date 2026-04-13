@@ -19,16 +19,17 @@ from app.api.auth.passwords import (
     hash_password,
     hash_password_reset_token,
     normalize_email,
-    password_reset_expires_at,
-    validate_password,
     verify_password,
 )
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.repositories.password_reset_token_repository import (
-    PasswordResetTokenRepository,
+from src.infrastructure.database.repositories.invitation_repository import (
+    InvitationRepository,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
+from src.services.email_service import send_password_reset_email, send_verification_email
+from src.infrastructure.cache import otp_store
+from src.infrastructure.cache import password_reset_store
 
 
 class RegisterRequest(BaseModel):
@@ -102,6 +103,7 @@ def _user_response(user, memberships) -> dict:
         "timezone": user.timezone,
         "department": user.department,
         "is_active": user.is_active,
+        "email_verified": user.email_verified_at is not None,
         "last_login_at": (
             user.last_login_at.isoformat() if user.last_login_at else None
         ),
@@ -121,7 +123,19 @@ async def register_with_password(
     body: RegisterRequest,
     session=Depends(get_db_session),
 ):
-    """Create a new user with email + password."""
+    """Create a new user with email + password.
+
+    OTP is stored in Redis (15-minute TTL) — no token columns in the DB.
+    After creating the user, auto-accepts any pending invitations matching
+    the email address, then sends the verification code.
+    """
+    from datetime import datetime, timezone as tz
+
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessMemberModel,
+        UserModel,
+    )
+
     repo = UserRepository(session)
     normalized = normalize_email(body.email)
 
@@ -132,19 +146,174 @@ async def register_with_password(
             detail="An account with this email already exists",
         )
 
-    password_hashed = hash_password(body.password)
-
-    from src.infrastructure.database.flowpilot_models import UserModel
-
     new_user = UserModel(
         email=normalized,
         display_name=body.name.strip(),
-        password_hash=password_hashed,
+        password_hash=hash_password(body.password),
         is_active=True,
     )
     session.add(new_user)
     await session.flush()
     await session.refresh(new_user)
+
+    # Auto-accept any pending invites for this email
+    invite_repo = InvitationRepository(session)
+    pending = await invite_repo.get_pending_by_email(normalized)
+    for invite in pending:
+        session.add(BusinessMemberModel(
+            business_id=invite.business_id,
+            user_id=new_user.id,
+            role=invite.role,
+            joined_at=datetime.now(tz.utc),
+        ))
+        await invite_repo.mark_accepted(invite)
+
+    token = create_access_token(new_user.id, new_user.email)
+    await session.commit()
+
+    # Generate OTP → Redis (best-effort; code still generated even if Redis is down)
+    code = otp_store.generate_code()
+    await otp_store.save(str(new_user.id), code)
+
+    await send_verification_email(
+        to=normalized,
+        code=code,
+        display_name=body.name.strip(),
+        frontend_url=Settings.FRONTEND_URL,
+    )
+
+    return {
+        "token": token,
+        "user": {
+            "id": str(new_user.id),
+            "email": new_user.email,
+            "display_name": new_user.display_name,
+        },
+    }
+
+
+class VerifyEmailRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+@router.post("/verify-email", response_model=MessageResponse)
+async def verify_email(
+    body: VerifyEmailRequest,
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+):
+    """Verify the user's email with the 6-digit OTP (stored in Redis)."""
+    from datetime import datetime, timezone as tz
+
+    if current_user.email_verified_at is not None:
+        return MessageResponse(message="Email already verified")
+
+    matched = await otp_store.verify(str(current_user.id), body.code)
+    if not matched:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification code",
+        )
+
+    current_user.email_verified_at = datetime.now(tz.utc)
+    await session.commit()
+
+    return MessageResponse(message="Email verified successfully")
+
+
+@router.post("/resend-verification", response_model=MessageResponse)
+async def resend_verification(
+    current_user=Depends(get_current_user),
+):
+    """Issue a fresh OTP (stored in Redis) and re-send the verification email."""
+    if current_user.email_verified_at is not None:
+        return MessageResponse(message="Email already verified")
+
+    code = otp_store.generate_code()
+    await otp_store.save(str(current_user.id), code)
+
+    await send_verification_email(
+        to=current_user.email,
+        code=code,
+        display_name=current_user.display_name,
+        frontend_url=Settings.FRONTEND_URL,
+    )
+
+    return MessageResponse(message="Verification code sent")
+
+
+class RegisterViaInviteRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=512)
+
+
+@router.post("/register-via-invite", status_code=status.HTTP_201_CREATED)
+async def register_via_invite(
+    body: RegisterViaInviteRequest,
+    session=Depends(get_db_session),
+):
+    """Create an account and join the invited organisation in one shot.
+
+    Only works with a valid, pending invitation token. The email address
+    is taken directly from the invitation — the registrant cannot change it.
+    """
+    from datetime import datetime, timezone as tz
+
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessMemberModel,
+        UserModel,
+    )
+
+    invite_repo = InvitationRepository(session)
+    invite = await invite_repo.get_by_token(body.token)
+
+    if not invite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation not found",
+        )
+
+    if invite.status != "pending" or invite.expires_at < datetime.now(tz.utc):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Invitation has expired or already been used",
+        )
+
+    user_repo = UserRepository(session)
+    existing = await user_repo.get_by_email(invite.invited_email)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists. Please log in instead.",
+        )
+
+    display_name = f"{body.first_name.strip()} {body.last_name.strip()}"
+    password_hashed = hash_password(body.password)
+
+    new_user = UserModel(
+        email=invite.invited_email,
+        display_name=display_name,
+        first_name=body.first_name.strip(),
+        last_name=body.last_name.strip(),
+        password_hash=password_hashed,
+        is_active=True,
+        # Invitation proves email ownership — mark as verified immediately
+        email_verified_at=datetime.now(tz.utc),
+    )
+    session.add(new_user)
+    await session.flush()
+    await session.refresh(new_user)
+
+    member = BusinessMemberModel(
+        business_id=invite.business_id,
+        user_id=new_user.id,
+        role=invite.role,
+        joined_at=datetime.now(tz.utc),
+    )
+    session.add(member)
+    await invite_repo.mark_accepted(invite)
 
     token = create_access_token(new_user.id, new_user.email)
     await session.commit()
@@ -285,13 +454,15 @@ async def google_callback(
 
     google_user = userinfo_resp.json()
 
-    # Upsert user in local DB
+    # Upsert user in local DB — Google already verifies the email
+    from datetime import datetime, timezone as _tz
     repo = UserRepository(session)
     user = await repo.upsert_from_oauth(
         external_id=f"google:{google_user['id']}",
         email=google_user["email"],
         display_name=google_user.get("name", google_user["email"]),
         avatar_url=google_user.get("picture"),
+        email_verified_at=datetime.now(_tz.utc),
     )
 
     # Issue JWT
@@ -321,6 +492,7 @@ async def logout(
     """Stateless logout — clears last_login_at. Frontend discards the JWT."""
     repo = UserRepository(session)
     await repo.clear_last_login(current_user.id)
+    await session.commit()
     return {"message": "Logged out"}
 
 
@@ -373,6 +545,7 @@ async def change_password(
     repo = UserRepository(session)
     pw_hash = hash_password(body.new_password)
     await repo.set_password(current_user.id, pw_hash)
+    await session.commit()
     return {"message": "Password updated successfully"}
 
 
@@ -451,37 +624,33 @@ async def forgot_password(
     body: ForgotPasswordRequest,
     session=Depends(get_db_session),
 ):
-    if Settings.is_production():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Password reset delivery is not configured",
-        )
-
+    """Issue a password-reset link. Token is stored in Redis with TTL — no DB write."""
     normalized_email = normalize_email(body.email)
     user_repo = UserRepository(session)
-    token_repo = PasswordResetTokenRepository(session)
 
     user = await user_repo.get_by_email(normalized_email)
     if user is None or not user.is_active:
+        # Generic message prevents email enumeration
         return MessageResponse(message=FORGOT_PASSWORD_RESPONSE)
-
-    await token_repo.revoke_active_tokens_for_user(user.id)
 
     raw_token = generate_password_reset_token()
     token_hash = hash_password_reset_token(raw_token)
-    await token_repo.create(
-        user_id=user.id,
-        token_hash=token_hash,
-        expires_at=password_reset_expires_at(),
-    )
+
+    # Saves to Redis, invalidates any previous reset token for this user
+    await password_reset_store.save(str(user.id), token_hash)
 
     reset_url = build_password_reset_url(raw_token)
-    logger.info(
-        "Generated password reset link for user_id=%s email=%s reset_url=%s",
-        user.id,
-        normalized_email,
-        reset_url,
+    sent = await send_password_reset_email(
+        to=normalized_email,
+        reset_url=reset_url,
+        frontend_url=Settings.FRONTEND_URL,
     )
+    if not sent:
+        logger.warning(
+            "Password reset email could not be delivered — reset_url=%s user_id=%s",
+            reset_url,
+            user.id,
+        )
 
     return MessageResponse(message=FORGOT_PASSWORD_RESPONSE)
 
@@ -495,19 +664,21 @@ async def reset_password(
     body: ResetPasswordRequest,
     session=Depends(get_db_session),
 ):
-    token_repo = PasswordResetTokenRepository(session)
-    user_repo = UserRepository(session)
+    """Consume the Redis reset token and update the user's password."""
+    import uuid
 
     token_hash = hash_password_reset_token(body.token)
-    token_record = await token_repo.get_active_by_token_hash(token_hash)
-    if token_record is None:
+    user_id_str = await password_reset_store.get_user_id(token_hash)
+
+    if not user_id_str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired password reset token",
         )
 
+    user_repo = UserRepository(session)
     updated_user = await user_repo.set_password(
-        token_record.user_id,
+        uuid.UUID(user_id_str),
         hash_password(body.new_password),
     )
     if updated_user is None:
@@ -516,10 +687,9 @@ async def reset_password(
             detail="Password reset token references a missing user",
         )
 
-    await token_repo.mark_used(token_record)
-    await token_repo.revoke_active_tokens_for_user(
-        token_record.user_id,
-        exclude_token_id=token_record.id,
-    )
+    await session.commit()
+
+    # Token is single-use — delete it from Redis
+    await password_reset_store.consume(user_id_str, token_hash)
 
     return MessageResponse(message="Password has been reset successfully.")

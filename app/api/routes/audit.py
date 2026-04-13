@@ -3,12 +3,14 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel
 from src.infrastructure.database.repositories import AuditRepository
 
 logger = logging.getLogger(__name__)
@@ -130,9 +132,23 @@ async def list_audit_entries(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
+    # Scope audit log to caller's organisation
+    membership_result = await session.execute(
+        select(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id
+        )
+    )
+    membership = membership_result.scalars().first()
+    if not membership:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No business membership found",
+        )
+
     run_uuid = _parse_uuid(run_id, "run_id") if run_id else None
     audit_repo = AuditRepository(session)
     entries, total = await audit_repo.list_all(
+        business_id=membership.business_id,
         run_id=run_uuid,
         agent_type=agent_type,
         action=action,

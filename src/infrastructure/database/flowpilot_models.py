@@ -59,6 +59,7 @@ class UserModel(Base):
     external_provider: Mapped[Optional[str]] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -67,9 +68,6 @@ class UserModel(Base):
     )
 
     memberships: Mapped[list["BusinessMemberModel"]] = relationship(
-        back_populates="user",
-    )
-    password_reset_tokens: Mapped[list["PasswordResetTokenModel"]] = relationship(
         back_populates="user",
     )
 
@@ -88,37 +86,56 @@ class UserModel(Base):
 
 
 # --------------------------------------------------------------------------- #
-# 2. password_reset_token — one-time token for local password reset
+# 2. invitation — pending team invite for a not-yet-registered email
 # --------------------------------------------------------------------------- #
-class PasswordResetTokenModel(Base):
-    __tablename__ = "password_reset_token"
+class InvitationModel(Base):
+    __tablename__ = "invitation"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
+    business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("user.id", ondelete="CASCADE"),
+        ForeignKey("business.id", ondelete="CASCADE"),
     )
-    token_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    invited_email: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(Text, server_default=text("'analyst'"))
+    invited_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    token: Mapped[str] = mapped_column(String(128), unique=True)
+    status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    used_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
 
     __table_args__ = (
-        Index("password_reset_token_user_id_idx", "user_id"),
-        Index("password_reset_token_expires_at_idx", "expires_at"),
+        CheckConstraint(
+            "role IN ('approver', 'analyst')",
+            name="invitation_role_check",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'expired')",
+            name="invitation_status_check",
+        ),
+        Index("invitation_token_idx", "token"),
+        Index("invitation_email_status_idx", "invited_email", "status"),
+        Index("invitation_business_id_idx", "business_id"),
     )
 
-    user: Mapped["UserModel"] = relationship(back_populates="password_reset_tokens")
+    business: Mapped["BusinessModel"] = relationship()
+    invited_by: Mapped[Optional["UserModel"]] = relationship(
+        foreign_keys=[invited_by_user_id]
+    )
 
 
 # --------------------------------------------------------------------------- #
-# 3. business_member — M:N user ↔ business with role
+# 4. business_member — M:N user ↔ business with role
 # --------------------------------------------------------------------------- #
 class BusinessMemberModel(Base):
     __tablename__ = "business_member"

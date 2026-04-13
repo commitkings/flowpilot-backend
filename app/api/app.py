@@ -20,6 +20,7 @@ from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.org import router as org_router
 from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.api.auth import auth_router
 from app.api.middleware import LoggingMiddleware
 from src.config.settings import Settings
@@ -119,6 +120,7 @@ app.include_router(onboarding_router, prefix="/api/v1", tags=["onboarding"])
 app.include_router(org_router, prefix="/api/v1", tags=["org"])
 app.include_router(team_router, prefix="/api/v1", tags=["team"])
 app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
+app.include_router(dashboard_router, prefix="/api/v1", tags=["dashboard"])
 
 # Serve uploaded files (avatars, etc.)
 from fastapi.staticfiles import StaticFiles
