@@ -390,6 +390,19 @@ async def login_with_password(
     user.last_login_at = datetime.now(tz.utc)
     await session.flush()
 
+    # If the user hasn't verified their email yet, issue a fresh OTP and
+    # resend the verification email so they don't have to wait out the
+    # resend cooldown on the frontend.
+    if user.email_verified_at is None:
+        code = otp_store.generate_code()
+        await otp_store.save(str(user.id), code)
+        await send_verification_email(
+            to=user.email,
+            code=code,
+            display_name=user.display_name,
+            frontend_url=Settings.FRONTEND_URL,
+        )
+
     token = create_access_token(user.id, user.email)
     await session.commit()
 
