@@ -4,7 +4,7 @@ Organisation / business profile routes.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from typing import Optional
 
@@ -14,6 +14,8 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.repositories.business_repository import (
     BusinessRepository,
 )
+from src.infrastructure.storage import s3_client
+from src.infrastructure.storage.s3_client import validate_image
 
 router = APIRouter(prefix="/org", tags=["org"])
 
@@ -92,6 +94,8 @@ async def get_org_profile(
         "website": biz.website,
         "phone": biz.phone,
         "interswitch_merchant_id": biz.interswitch_merchant_id,
+        "logo_url": biz.logo_url,
+        "kyc_status": biz.kyc_status,
         "is_active": biz.is_active,
         "config": {
             "monthly_txn_volume_range": config.monthly_txn_volume_range if config else None,
@@ -144,7 +148,48 @@ async def update_org_profile(
         "country": updated.country,
         "website": updated.website,
         "phone": updated.phone,
+        "logo_url": updated.logo_url,
+        "kyc_status": updated.kyc_status,
     }
+
+
+@router.post("/logo")
+async def upload_org_logo(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    session=Depends(get_db_session),
+    _=Depends(require_role("owner")),
+):
+    """Upload a company logo to MinIO and save the URL on the business profile."""
+    content = await file.read()
+    # Magic-byte validation (3 MB limit for logos)
+    error = validate_image(content, max_bytes=3 * 1024 * 1024)
+    if error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error,
+        )
+
+    object_key = await s3_client.upload_file(
+        content, file.filename or "logo.png", folder="logos", content_type=file.content_type
+    )
+    if object_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="File storage is unavailable. Please try again later.",
+        )
+
+    # Generate a presigned URL for immediate use
+    presigned = s3_client.get_presigned_url(object_key)
+    logo_url = presigned or object_key  # fallback to key if presigned fails
+
+    business_id = await _get_user_business_id(current_user, session)
+    repo = BusinessRepository(session)
+    updated = await repo.update(business_id, logo_url=logo_url)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
+    return {"logo_url": logo_url}
 
 
 @router.patch("/profile/config")

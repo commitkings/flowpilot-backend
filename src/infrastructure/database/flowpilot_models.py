@@ -213,6 +213,8 @@ class BusinessModel(Base):
     country: Mapped[Optional[str]] = mapped_column(String(100))
     website: Mapped[Optional[str]] = mapped_column(String(255))
     phone: Mapped[Optional[str]] = mapped_column(String(30))
+    logo_url: Mapped[Optional[str]] = mapped_column(String(512))
+    kyc_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
@@ -1776,6 +1778,56 @@ class ScheduledRunModel(Base):
     __table_args__ = (
         Index("scheduled_run_business_id_idx", "business_id"),
         Index("scheduled_run_next_run_at_idx", "next_run_at"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# KYC submission — business identity verification documents
+# --------------------------------------------------------------------------- #
+class KycSubmissionModel(Base):
+    __tablename__ = "kyc_submission"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    # status: not_submitted → pending → verified
+    status: Mapped[str] = mapped_column(String(20), server_default=text("'pending'"))
+
+    # Document object keys stored in MinIO (not full URLs — generate presigned on demand)
+    cac_certificate_key: Mapped[Optional[str]] = mapped_column(String(512))
+    tin_document_key: Mapped[Optional[str]] = mapped_column(String(512))
+    director_id_key: Mapped[Optional[str]] = mapped_column(String(512))
+    proof_of_address_key: Mapped[Optional[str]] = mapped_column(String(512))
+
+    # Director details
+    director_name: Mapped[Optional[str]] = mapped_column(String(255))
+    director_bvn: Mapped[Optional[str]] = mapped_column(String(20))
+
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'verified', 'rejected')",
+            name="kyc_submission_status_check",
+        ),
     )
 
     business: Mapped["BusinessModel"] = relationship()

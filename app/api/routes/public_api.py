@@ -29,9 +29,23 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
     AuditLogModel,
+    BusinessModel,
     PayoutCandidateModel,
     ReconciledTransactionModel,
 )
+
+
+async def _require_kyc_verified(business_id: uuid.UUID, session: AsyncSession) -> None:
+    """Raise 403 if the business has not completed KYC verification."""
+    result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == business_id)
+    )
+    biz = result.scalar_one_or_none()
+    if biz and biz.kyc_status != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Business KYC verification is required before using this endpoint.",
+        )
 
 router = APIRouter(prefix="/public/v1", tags=["public-api"])
 
@@ -221,6 +235,7 @@ async def approve_run(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Approve a run that is awaiting approval."""
+    await _require_kyc_verified(ctx.business_id, session)
     result = await session.execute(
         select(AgentRunModel).where(
             AgentRunModel.id == run_id,
@@ -251,6 +266,7 @@ async def reject_run(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Reject a run that is awaiting approval."""
+    await _require_kyc_verified(ctx.business_id, session)
     result = await session.execute(
         select(AgentRunModel).where(
             AgentRunModel.id == run_id,

@@ -22,7 +22,7 @@ from src.agents.event_publisher import EventPublisher, subscribe, unsubscribe
 from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import BusinessMemberModel, UserModel
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel, BusinessModel, UserModel
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
@@ -242,6 +242,19 @@ async def create_run(
             status_code=403,
             detail="You do not have access to this organisation",
         )
+
+    # KYC gate: business must be verified before creating runs
+    biz_check = await session.execute(
+        _select(BusinessModel).where(BusinessModel.id == business_uuid)
+    )
+    biz = biz_check.scalar_one_or_none()
+    if biz and biz.kyc_status != "verified":
+        kyc_msg = (
+            "Your business is pending KYC verification. You'll be able to create runs once verified."
+            if biz.kyc_status == "pending"
+            else "Business verification (KYC) is required before creating payout runs. Please complete your KYC."
+        )
+        raise HTTPException(status_code=403, detail=kyc_msg)
 
     run_repo = RunRepository(session)
     candidate_repo = CandidateRepository(session)

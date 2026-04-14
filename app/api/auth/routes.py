@@ -638,24 +638,39 @@ async def upload_avatar(
     current_user=Depends(get_current_user),
     session=Depends(get_db_session),
 ):
-    """Upload an avatar image for the authenticated user."""
-    import shutil, os, uuid as _uuid
+    """Upload an avatar image for the authenticated user.
 
-    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported image type")
+    Validates magic bytes (not just MIME type), enforces 3 MB limit,
+    and stores in MinIO. Falls back to local disk if MinIO is unavailable.
+    """
+    from src.infrastructure.storage import s3_client as _s3
 
-    upload_dir = os.path.join(os.getcwd(), "uploads", "avatars")
-    os.makedirs(upload_dir, exist_ok=True)
+    content = await file.read()
 
-    ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "png"
-    filename = f"{_uuid.uuid4().hex}.{ext}"
-    filepath = os.path.join(upload_dir, filename)
+    # Magic-byte validation (prevents disguised malware)
+    error = _s3.validate_image(content, max_bytes=3 * 1024 * 1024)
+    if error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
 
-    with open(filepath, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    # Try MinIO first
+    object_key = await _s3.upload_file(content, file.filename or "avatar.jpg", folder="avatars", content_type=file.content_type)
 
-    avatar_url = f"/uploads/avatars/{filename}"
+    if object_key:
+        # Generate a 30-day presigned URL so the frontend can display it
+        presigned = _s3.get_presigned_url(object_key, expiry=30 * 24 * 3600)
+        avatar_url = presigned or object_key
+    else:
+        # MinIO unavailable — fall back to local disk
+        import shutil as _shutil, os, uuid as _uuid, io as _io
+        upload_dir = os.path.join(os.getcwd(), "uploads", "avatars")
+        os.makedirs(upload_dir, exist_ok=True)
+        ext = (file.filename or "avatar.jpg").rsplit(".", 1)[-1]
+        filename = f"{_uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(upload_dir, filename)
+        with open(filepath, "wb") as buf:
+            buf.write(content)
+        avatar_url = f"/uploads/avatars/{filename}"
+
     repo = UserRepository(session)
     await repo.update_profile(current_user.id, avatar_url=avatar_url)
     return {"avatar_url": avatar_url}

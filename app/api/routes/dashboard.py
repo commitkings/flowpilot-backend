@@ -99,6 +99,36 @@ async def get_dashboard_stats(
     )
     active_runs = int(active_result.scalar() or 0)
 
+    # ── Total / completed / failed runs (all time) ──
+    total_runs_result = await session.execute(
+        select(func.count(AgentRunModel.id)).where(
+            AgentRunModel.business_id == business_id
+        )
+    )
+    total_runs = int(total_runs_result.scalar() or 0)
+
+    completed_runs_result = await session.execute(
+        select(func.count(AgentRunModel.id)).where(
+            and_(
+                AgentRunModel.business_id == business_id,
+                AgentRunModel.status.in_(["completed", "completed_with_errors"]),
+            )
+        )
+    )
+    completed_runs = int(completed_runs_result.scalar() or 0)
+
+    failed_runs_result = await session.execute(
+        select(func.count(AgentRunModel.id)).where(
+            and_(
+                AgentRunModel.business_id == business_id,
+                AgentRunModel.status == "failed",
+            )
+        )
+    )
+    failed_runs = int(failed_runs_result.scalar() or 0)
+
+    success_rate = round((completed_runs / total_runs) * 100) if total_runs > 0 else 0
+
     # ── Recent runs (last 8, newest first) ──
     candidate_count_subq = (
         select(
@@ -134,5 +164,9 @@ async def get_dashboard_stats(
         "runs_this_month": runs_this_month,
         "pending_approvals": pending_approvals,
         "active_runs": active_runs,
+        "total_runs": total_runs,
+        "completed_runs": completed_runs,
+        "failed_runs": failed_runs,
+        "success_rate": success_rate,
         "recent_runs": recent_runs,
     }
