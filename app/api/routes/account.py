@@ -21,11 +21,11 @@ from src.infrastructure.cache import account_delete_store
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
-    AuditLogModel,
     BusinessMemberModel,
     BusinessModel,
     ReconciledTransactionModel,
 )
+from src.infrastructure.database.repositories import AuditRepository
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_account_deletion_code_email
 
@@ -161,22 +161,17 @@ async def export_account_data(
     ]
 
     # ── Audit logs (most recent 500) ─────────────────────────────────────────
-    audit_rows = (
-        await session.execute(
-            select(AuditLogModel)
-            .where(AuditLogModel.business_id == business_id)
-            .order_by(AuditLogModel.created_at.desc())
-            .limit(500)
-        )
-    ).scalars().all()
+    audit_repo = AuditRepository(session)
+    audit_rows, _ = await audit_repo.list_all(business_id=business_id, limit=500)
 
     audit_logs = [
         {
-            "id": str(a.id),
+            "id": a.id,
+            "run_id": str(a.run_id),
+            "step_id": str(a.step_id) if a.step_id else None,
+            "agent_type": a.agent_type,
             "action": a.action,
-            "actor_email": a.actor_email,
-            "resource_type": a.resource_type,
-            "resource_id": str(a.resource_id) if a.resource_id else None,
+            "detail": a.detail,
             "created_at": a.created_at.isoformat() if a.created_at else None,
         }
         for a in audit_rows
