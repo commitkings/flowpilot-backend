@@ -101,22 +101,33 @@ async def get_dashboard_stats(
     active_runs = int(active_result.scalar() or 0)
 
     # ── Recent runs (last 8, newest first) ──
+    candidate_count_subq = (
+        select(
+            PayoutCandidateModel.run_id,
+            func.count(PayoutCandidateModel.id).label("candidate_count"),
+        )
+        .group_by(PayoutCandidateModel.run_id)
+        .subquery()
+    )
     recent_result = await session.execute(
-        select(AgentRunModel)
+        select(AgentRunModel, func.coalesce(candidate_count_subq.c.candidate_count, 0))
+        .outerjoin(
+            candidate_count_subq,
+            AgentRunModel.id == candidate_count_subq.c.run_id,
+        )
         .where(AgentRunModel.business_id == business_id)
         .order_by(AgentRunModel.created_at.desc())
         .limit(8)
     )
-    recent_runs_orm = recent_result.scalars().all()
     recent_runs = [
         {
             "run_id": str(r.id),
             "objective": r.objective,
             "status": r.status,
-            "candidate_count": r.candidate_count,
+            "candidate_count": int(count),
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
-        for r in recent_runs_orm
+        for r, count in recent_result.all()
     ]
 
     return {
