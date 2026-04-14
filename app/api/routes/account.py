@@ -5,26 +5,36 @@ Both actions are restricted to the business owner.
 
 import json
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import pyotp
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import Response
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.auth.dependencies import get_current_user
+from src.config.settings import Settings
+from src.infrastructure.cache import account_delete_store
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
     AuditLogModel,
     BusinessMemberModel,
     BusinessModel,
-    PayoutCandidateModel,
     ReconciledTransactionModel,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
+from src.services.email_service import send_account_deletion_code_email
 
 router = APIRouter(prefix="/account", tags=["account"])
+
+
+class DeleteAccountRequest(BaseModel):
+    totp_code: Optional[str] = None
+    delete_code: Optional[str] = None
 
 
 async def _require_owner(session: AsyncSession, user_id) -> BusinessMemberModel:
@@ -129,7 +139,7 @@ async def export_account_data(
         await session.execute(
             select(ReconciledTransactionModel)
             .where(ReconciledTransactionModel.business_id == business_id)
-            .order_by(ReconciledTransactionModel.transaction_date.desc())
+            .order_by(ReconciledTransactionModel.transaction_timestamp.desc())
             .limit(500)
         )
     ).scalars().all()
@@ -137,12 +147,15 @@ async def export_account_data(
     transactions = [
         {
             "id": str(t.id),
-            "reference": t.reference,
-            "beneficiary_name": t.beneficiary_name,
+            "reference": t.interswitch_ref,
+            "counterparty_name": t.counterparty_name,
+            "counterparty_bank": t.counterparty_bank,
             "amount": float(t.amount) if t.amount else None,
             "currency": t.currency,
+            "direction": t.direction,
             "status": t.status,
-            "transaction_date": t.transaction_date.isoformat() if t.transaction_date else None,
+            "narration": t.narration,
+            "transaction_date": t.transaction_timestamp.isoformat() if t.transaction_timestamp else None,
         }
         for t in txn_rows
     ]
@@ -205,21 +218,80 @@ async def export_account_data(
     )
 
 
+@router.post("/request-delete-code")
+async def request_delete_code(
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Send a 6-digit deletion confirmation code to the owner's email.
+
+    Only applicable when the owner does not have 2FA enabled.
+    If 2FA is enabled, the client should use the TOTP code instead.
+    Owner only.
+    """
+    await _require_owner(session, current_user.id)
+
+    if getattr(current_user, "totp_enabled_at", None) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use your authenticator app code — 2FA is enabled on this account",
+        )
+
+    code = account_delete_store.generate_code()
+    await account_delete_store.save(str(current_user.id), code)
+
+    await send_account_deletion_code_email(
+        to=current_user.email,
+        display_name=current_user.display_name or current_user.email,
+        code=code,
+        frontend_url=Settings.FRONTEND_URL,
+    )
+
+    return {"message": "Verification code sent to your email"}
+
+
 @router.delete("/delete")
 async def delete_account(
+    body: DeleteAccountRequest = Body(default_factory=DeleteAccountRequest),
     current_user=Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
     """Permanently deactivate the owner's account and their business. Owner only.
 
-    Soft-deletes by setting is_active = False on both the BusinessModel and the
-    UserModel. Disabled accounts cannot log in. Team members lose dashboard access
-    because their business is gone.
+    Requires verification:
+    - If 2FA is enabled: provide a valid TOTP code via `totp_code`
+    - If 2FA is not enabled: provide the email code sent via /account/request-delete-code
     """
     membership = await _require_owner(session, current_user.id)
     business_id = membership.business_id
 
-    # Deactivate the business
+    # ── Verify identity ───────────────────────────────────────────────────────
+    if getattr(current_user, "totp_enabled_at", None) is not None:
+        if not body.totp_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Two-factor authentication code required",
+            )
+        totp = pyotp.TOTP(current_user.totp_secret)
+        if not totp.verify(body.totp_code, valid_window=1):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authentication code",
+            )
+    else:
+        if not body.delete_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email verification code required",
+            )
+        ok = await account_delete_store.verify(str(current_user.id), body.delete_code)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired verification code",
+            )
+
+    # ── Soft-delete ───────────────────────────────────────────────────────────
     biz = (
         await session.execute(
             select(BusinessModel).where(BusinessModel.id == business_id)
@@ -228,7 +300,6 @@ async def delete_account(
     if biz:
         biz.is_active = False
 
-    # Deactivate all members of this business so they cannot re-access
     members = (
         await session.execute(
             select(BusinessMemberModel).where(
@@ -239,7 +310,6 @@ async def delete_account(
     for m in members:
         m.is_active = False
 
-    # Deactivate the owner's user account
     current_user.is_active = False
 
     await session.commit()

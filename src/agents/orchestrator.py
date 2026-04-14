@@ -155,11 +155,15 @@ class RunOrchestrator:
                 return state
 
         if has_execution:
-            log_run_event(str(run_id), "approval_gate_entered", {
-                "candidate_count": len(state.get("candidates", [])),
-            })
-            await self._enter_approval_gate(run_id, state)
-            return state
+            needs_approval = await self._should_require_approval(run_id, state)
+            if needs_approval:
+                log_run_event(str(run_id), "approval_gate_entered", {
+                    "candidate_count": len(state.get("scored_candidates", [])),
+                })
+                await self._enter_approval_gate(run_id, state)
+                return state
+            # No approval rule matched — execute immediately without halting
+            return await self.resume_after_approval(run_id, state)
 
         audit_step_name, audit_status, audit_agent = _AGENT_REGISTRY["audit"]
         state = await self._execute_step(
@@ -821,6 +825,84 @@ class RunOrchestrator:
                 state["error"] = err_summary
 
     # ------------------------------------------------------------------
+    # Internal: approval rules evaluation
+    # ------------------------------------------------------------------
+
+    async def _should_require_approval(
+        self, run_id: uuid.UUID, state: AgentState
+    ) -> bool:
+        """Evaluate active approval rules for this business against scored candidates.
+
+        Conditions:
+          - 'always'            → always require approval
+          - 'amount_above'      → any candidate amount > threshold
+          - 'risk_score_above'  → any candidate risk_score > threshold
+
+        If no active rules are configured, defaults to True (always require
+        approval) so the system is safe out of the box.
+        """
+        from sqlalchemy import select as _select
+        from src.infrastructure.database.flowpilot_models import ApprovalRuleModel
+
+        raw_biz_id = state.get("business_id", "")
+        try:
+            business_id = uuid.UUID(raw_biz_id)
+        except (ValueError, AttributeError):
+            logger.warning(f"Run {run_id}: invalid business_id '{raw_biz_id}', defaulting to approval required")
+            return True
+
+        result = await self._session.execute(
+            _select(ApprovalRuleModel).where(
+                ApprovalRuleModel.business_id == business_id,
+                ApprovalRuleModel.is_active == True,  # noqa: E712
+            )
+        )
+        rules = result.scalars().all()
+
+        # No rules configured → safe default: always require approval
+        if not rules:
+            return True
+
+        candidates = state.get("scored_candidates", [])
+
+        for rule in rules:
+            if rule.condition == "always":
+                log_run_event(str(run_id), "approval_rule_matched", {
+                    "rule_id": str(rule.id), "rule_name": rule.name,
+                    "condition": "always",
+                })
+                return True
+
+            threshold = float(rule.threshold)
+            for c in candidates:
+                amount = float(c.get("amount") or 0)
+                risk_score = float(c.get("risk_score") or 0)
+
+                if rule.condition == "amount_above" and amount > threshold:
+                    log_run_event(str(run_id), "approval_rule_matched", {
+                        "rule_id": str(rule.id), "rule_name": rule.name,
+                        "condition": "amount_above", "threshold": threshold,
+                        "candidate_amount": amount,
+                    })
+                    return True
+
+                if rule.condition == "risk_score_above" and risk_score > threshold:
+                    log_run_event(str(run_id), "approval_rule_matched", {
+                        "rule_id": str(rule.id), "rule_name": rule.name,
+                        "condition": "risk_score_above", "threshold": threshold,
+                        "candidate_risk_score": risk_score,
+                    })
+                    return True
+
+        # All rules evaluated — no candidate triggered any rule
+        log_run_event(str(run_id), "approval_gate_skipped", {
+            "reason": "no approval rule matched",
+            "rules_evaluated": len(rules),
+            "candidates_evaluated": len(candidates),
+        })
+        return False
+
+    # ------------------------------------------------------------------
     # Internal: approval gate
     # ------------------------------------------------------------------
 
@@ -830,7 +912,7 @@ class RunOrchestrator:
         await self._run_repo.update_status(run_id, "awaiting_approval")
 
         if self._publisher:
-            n_candidates = len(state.get("candidates", []))
+            n_candidates = len(state.get("scored_candidates", []))
             await self._publisher.approval_gate(
                 {
                     "candidates_count": n_candidates,

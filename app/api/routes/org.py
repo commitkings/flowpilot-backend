@@ -107,6 +107,7 @@ async def get_org_profile(
             "risk_alert_threshold": float(config.risk_alert_threshold) if config and config.risk_alert_threshold else None,
             "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config and config.liquidity_alert_buffer else None,
             "preferences": config.preferences if config else None,
+            "require_2fa": config.require_2fa if config else False,
         } if config else None,
     }
 

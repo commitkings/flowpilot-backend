@@ -489,3 +489,26 @@ async def send_2fa_enforced_email(
         subject=f"Action required: Set up 2FA within {grace_hours} hours — FlowPilot",
         html=html,
     )
+
+
+async def send_account_deletion_code_email(
+    to: str,
+    display_name: str,
+    code: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Send a 6-digit account deletion confirmation code."""
+    base = frontend_url or Settings.FRONTEND_URL
+    html = _render(
+        "account_deletion_code.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        code=code,
+        settings_url=f"{base}/dashboard/settings",
+    )
+    return await _send(
+        to=to,
+        subject="Your FlowPilot account deletion code",
+        html=html,
+    )

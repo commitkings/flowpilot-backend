@@ -97,7 +97,6 @@ class EnableRequest(BaseModel):
 
 class DisableRequest(BaseModel):
     password: str
-    code: str  # Current TOTP code (or backup code)
 
 
 class VerifyMfaRequest(BaseModel):
@@ -230,14 +229,6 @@ async def disable_2fa(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect password.",
-        )
-
-    # Verify TOTP code
-    totp = pyotp.TOTP(current_user.totp_secret)
-    if not totp.verify(body.code, valid_window=1):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid authenticator code.",
         )
 
     current_user.totp_secret = None

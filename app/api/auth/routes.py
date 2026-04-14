@@ -7,6 +7,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+import pyotp
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import RedirectResponse
 from pydantic import AliasChoices, BaseModel, Field
@@ -61,6 +62,7 @@ class UpdateProfileRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=512)
     new_password: str = Field(min_length=1, max_length=512)
+    totp_code: Optional[str] = None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -601,6 +603,20 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Current password is incorrect",
         )
+
+    # If the user has 2FA enabled, require a valid TOTP code
+    if getattr(current_user, "totp_enabled_at", None) is not None:
+        if not body.totp_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Two-factor authentication code required",
+            )
+        totp = pyotp.TOTP(current_user.totp_secret)
+        if not totp.verify(body.totp_code, valid_window=1):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid two-factor authentication code",
+            )
 
     errors = validate_password(body.new_password)
     if errors:

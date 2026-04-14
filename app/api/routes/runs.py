@@ -138,7 +138,7 @@ async def _normalize_candidate_institutions(
     if not rows:
         return []
 
-    institutions = await institution_repo.get_all_active()
+    institutions, _ = await institution_repo.get_all_active(limit=10_000)
     alias_map = _build_institution_alias_map(institutions)
     errors: list[str] = []
 
