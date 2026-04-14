@@ -79,6 +79,7 @@ def _serialize(r: ScheduledRunModel) -> dict:
         "frequency_label": r.frequency_label,
         "next_run_at": r.next_run_at.isoformat() if r.next_run_at else None,
         "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+        "last_reminded_at": r.last_reminded_at.isoformat() if r.last_reminded_at else None,
         "is_active": r.is_active,
         "created_at": r.created_at.isoformat(),
     }

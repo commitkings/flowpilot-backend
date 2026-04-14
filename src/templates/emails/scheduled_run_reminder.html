@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Scheduled run reminder</title>
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .light-logo { display: none !important; }
+      .dark-logo { display: block !important; }
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f2ef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;color:#f4f2ef;font-size:1px;">
+    Heads up — "{{ schedule_name }}" is scheduled to fire tomorrow at {{ fires_at }}. &nbsp;&zwnj;&nbsp;
+  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f2ef;">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;">
+          <!-- Logo -->
+          <tr>
+            <td align="center" style="background-color:#ffffff;border-radius:14px 14px 0 0;padding:32px 40px 24px;">
+              <img class="light-logo" src="{{ logo_url }}" alt="FlowPilot" width="140" style="display:block;" />
+              <img class="dark-logo" src="{{ logo_dark_url }}" alt="FlowPilot" width="140" style="display:none;" />
+            </td>
+          </tr>
+          <!-- Icon + heading -->
+          <tr>
+            <td style="background-color:#ffffff;padding:0 40px 24px;text-align:center;">
+              <div style="display:inline-flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:16px;background-color:#ede9fe;margin-bottom:16px;">
+                <span style="font-size:28px;">🗓️</span>
+              </div>
+              <h1 style="margin:0 0 8px;font-size:22px;font-weight:800;color:#0f172a;letter-spacing:-0.5px;">Scheduled run fires tomorrow</h1>
+              <p style="margin:0;font-size:15px;color:#64748b;">Hi {{ first_name }}, here's a heads-up about an upcoming automated run.</p>
+            </td>
+          </tr>
+          <!-- Run details card -->
+          <tr>
+            <td style="background-color:#ffffff;padding:0 40px 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;">
+                <tr>
+                  <td style="padding:24px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="padding-bottom:14px;border-bottom:1px solid #e2e8f0;">
+                          <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#94a3b8;">Schedule</span><br />
+                          <span style="font-size:17px;font-weight:800;color:#0f172a;">{{ schedule_name }}</span>
+                          <span style="display:inline-block;margin-left:8px;background-color:#ede9fe;color:#6d28d9;font-size:11px;font-weight:700;padding:2px 8px;border-radius:100px;">{{ frequency_label }}</span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-top:14px;padding-bottom:14px;border-bottom:1px solid #e2e8f0;">
+                          <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#94a3b8;">Objective</span><br />
+                          <span style="font-size:14px;color:#334155;line-height:1.5;">{{ objective }}</span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-top:14px;">
+                          <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#94a3b8;">Fires at</span><br />
+                          <span style="font-size:15px;font-weight:700;color:#4f46e5;">{{ fires_at }}</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <!-- Info blurb -->
+          <tr>
+            <td style="background-color:#ffffff;padding:0 40px 32px;">
+              <p style="margin:0;font-size:14px;line-height:1.6;color:#475569;">
+                The run will go through the normal approval flow before any payouts are processed.
+                If you need to make changes or want to skip this occurrence, you can pause the schedule before it fires.
+              </p>
+            </td>
+          </tr>
+          <!-- CTA -->
+          <tr>
+            <td align="center" style="background-color:#ffffff;padding:0 40px 40px;">
+              <a href="{{ schedules_url }}" style="display:inline-block;background-color:#4f46e5;color:#ffffff;font-size:15px;font-weight:700;text-decoration:none;padding:14px 32px;border-radius:100px;">Manage Schedules</a>
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td align="center" style="background-color:#f4f2ef;border-radius:0 0 14px 14px;padding:24px 40px;">
+              <p style="margin:0;font-size:12px;color:#94a3b8;">You're receiving this because you're the owner of an organisation on FlowPilot with active scheduled runs.</p>
+              <p style="margin:8px 0 0;font-size:12px;color:#cbd5e1;">© FlowPilot. All rights reserved.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

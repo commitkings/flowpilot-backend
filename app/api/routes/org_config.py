@@ -115,6 +115,27 @@ async def create_approval_rule(
         )
 
     business_id = await _get_business_id(current_user, session)
+
+    # Safety check: if the rule requires more than 1 approver, ensure the business
+    # has enough members with owner or approver role to satisfy the requirement.
+    if body.required_approvers > 1:
+        capable_count = (await session.execute(
+            select(func.count()).select_from(BusinessMemberModel).where(
+                BusinessMemberModel.business_id == business_id,
+                BusinessMemberModel.role.in_(["owner", "approver"]),
+                BusinessMemberModel.is_active == True,
+            )
+        )).scalar_one()
+        if capable_count < body.required_approvers:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"This rule requires {body.required_approvers} approver(s), but your team "
+                    f"only has {capable_count} member(s) with the owner or approver role. "
+                    "Please invite additional team members before enabling this rule."
+                ),
+            )
+
     rule = ApprovalRuleModel(
         business_id=business_id,
         name=body.name,
@@ -151,6 +172,26 @@ async def update_approval_rule(
     rule = result.scalars().first()
     if not rule:
         raise HTTPException(status_code=404, detail="Approval rule not found")
+
+    # Safety check: if increasing required_approvers, ensure enough capable members exist
+    new_required = body.required_approvers if body.required_approvers is not None else rule.required_approvers
+    if new_required > 1:
+        capable_count = (await session.execute(
+            select(func.count()).select_from(BusinessMemberModel).where(
+                BusinessMemberModel.business_id == business_id,
+                BusinessMemberModel.role.in_(["owner", "approver"]),
+                BusinessMemberModel.is_active == True,
+            )
+        )).scalar_one()
+        if capable_count < new_required:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"This rule requires {new_required} approver(s), but your team "
+                    f"only has {capable_count} member(s) with the owner or approver role. "
+                    "Please invite additional team members before enabling this rule."
+                ),
+            )
 
     values: dict = {"updated_at": datetime.now(timezone.utc)}
     if body.name is not None:

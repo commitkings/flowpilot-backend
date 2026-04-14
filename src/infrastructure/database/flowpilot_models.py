@@ -386,6 +386,11 @@ class AgentRunModel(Base):
     status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
     plan_graph: Mapped[Optional[dict]] = mapped_column(JSONB)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    assigned_to_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     approved_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
@@ -1768,6 +1773,11 @@ class ScheduledRunModel(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, server_default=text("true"), nullable=False
     )
+    # Tracks which next_run_at we already sent the day-before reminder for,
+    # so we never send it twice for the same occurrence.
+    last_reminded_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
     )
@@ -1831,6 +1841,105 @@ class KycSubmissionModel(Base):
     )
 
     business: Mapped["BusinessModel"] = relationship()
+
+
+# =========================================================================== #
+#  WALLET (2 tables)
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# wallet — one per business, tracks prepaid balance
+# --------------------------------------------------------------------------- #
+class WalletModel(Base):
+    __tablename__ = "wallet"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    balance: Mapped[Decimal] = mapped_column(
+        Numeric(18, 2), server_default=text("0.00")
+    )
+    currency: Mapped[str] = mapped_column(
+        CHAR(3), server_default=text("'NGN'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="wallet_balance_non_negative"),
+        Index("wallet_business_id_idx", "business_id"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+    transactions: Mapped[list["WalletTransactionModel"]] = relationship(
+        back_populates="wallet",
+        order_by="WalletTransactionModel.created_at.desc()",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# wallet_transaction — immutable ledger of credits and debits
+# --------------------------------------------------------------------------- #
+class WalletTransactionModel(Base):
+    __tablename__ = "wallet_transaction"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    wallet_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wallet.id", ondelete="CASCADE"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+    )
+    # "credit" = top-up, "debit" = run spend
+    type: Mapped[str] = mapped_column(Text)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    # Unique key for idempotency — prevents double-processing the same operation
+    reference: Mapped[str] = mapped_column(String(255), unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    # Set when this debit is linked to a specific run
+    run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    balance_before: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    balance_after: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="wallet_tx_amount_positive"),
+        CheckConstraint(
+            "type IN ('credit', 'debit')",
+            name="wallet_tx_type_check",
+        ),
+        Index("wallet_tx_wallet_id_idx", "wallet_id"),
+        Index("wallet_tx_business_id_idx", "business_id"),
+        Index("wallet_tx_reference_idx", "reference", unique=True),
+        Index("wallet_tx_run_id_idx", "run_id"),
+        Index("wallet_tx_created_at_idx", text("created_at DESC")),
+    )
+
+    wallet: Mapped["WalletModel"] = relationship(back_populates="transactions")
 
 
 # =========================================================================== #

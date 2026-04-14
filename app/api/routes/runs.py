@@ -82,6 +82,9 @@ class CreateRunRequest(BaseModel):
     candidates: Optional[list[CandidateInput]] = Field(
         None, description="Payout candidates to score and execute"
     )
+    assigned_approver_id: Optional[str] = Field(
+        None, description="UUID of the team member pre-assigned to approve this run"
+    )
 
 
 class RunResponse(BaseModel):
@@ -200,6 +203,42 @@ def _candidates_to_response(candidates) -> list[CandidateResponse]:
     ]
 
 
+def _resolve_approval_assignment(all_approvers: list, run, business_uuid) -> list:
+    """Determine which approval-capable member(s) to notify when a run needs approval.
+
+    Rules:
+    - 0 capable members : return empty (edge case, cannot approve)
+    - 1 capable member  : self-approve allowed — notify that single member
+    - 2 capable members : auto-assign to the non-creator; if creator is the only one, fall back
+    - 3+ capable members: honour run.assigned_to_id if set, otherwise auto-pick first
+                          non-creator approver (role=approver preferred over owner)
+    """
+    if not all_approvers:
+        return []
+
+    if len(all_approvers) == 1:
+        # Only one approval-capable person — self-approve is permitted
+        return all_approvers
+
+    # 2+ members: try to exclude the run creator
+    non_creator = [(m, u) for m, u in all_approvers if m.user_id != run.created_by]
+
+    if len(all_approvers) == 2:
+        # Auto-assign to the non-creator
+        return non_creator if non_creator else all_approvers[:1]
+
+    # 3+ members: honour explicit assignment first
+    if run.assigned_to_id:
+        explicit = [(m, u) for m, u in all_approvers if m.user_id == run.assigned_to_id]
+        if explicit:
+            return explicit
+
+    # Fall back: prefer a dedicated approver (not owner) from non-creators
+    pool = non_creator if non_creator else all_approvers
+    approver_role = [(m, u) for m, u in pool if m.role == "approver"]
+    return approver_role[:1] if approver_role else pool[:1]
+
+
 async def _notify(session, user_id, business_id, title: str, message: str,
                   type: str = "info", resource_type: str | None = None, resource_id: str | None = None):
     """Create an in-app notification — best-effort, never raises."""
@@ -301,8 +340,81 @@ async def create_run(
             else None
         ),
     )
+    # Store manually pre-assigned approver if provided (for 3+ member teams)
+    if request.assigned_approver_id:
+        try:
+            run.assigned_to_id = uuid.UUID(request.assigned_approver_id)
+        except ValueError:
+            pass  # Invalid UUID — ignore silently, auto-assign will take over
+
+    # ── Wallet debit ────────────────────────────────────────────────────────
+    # If a budget_cap is specified, deduct it from the wallet atomically.
+    # run_repo.create() calls flush() (not commit()), so run.id is available
+    # here.  The wallet debit and the run creation are in the same DB
+    # transaction — a balance failure rolls back the run row too.
+    _wallet_balance_after: float | None = None
+    if request.budget_cap is not None:
+        from src.infrastructure.database.repositories.wallet_repository import (
+            WalletRepository as _WalletRepo,
+            InsufficientBalanceError as _InsufficientBalance,
+            LOW_BALANCE_THRESHOLD as _LOW_THRESHOLD,
+        )
+        _wallet_repo = _WalletRepo(session)
+        try:
+            _debit_tx, _ = await _wallet_repo.debit(
+                business_id=business_uuid,
+                amount=Decimal(str(request.budget_cap)),
+                reference=f"run_debit_{run.id}",
+                description=f"Run: {request.objective[:100]}",
+                run_id=run.id,
+            )
+            _wallet_balance_after = float(_debit_tx.balance_after)
+        except _InsufficientBalance as exc:
+            raise HTTPException(
+                status_code=402,
+                detail=str(exc),
+            )
+        except ValueError as exc:
+            # Wallet doesn't exist yet (no top-up has ever happened)
+            raise HTTPException(
+                status_code=402,
+                detail="Your organisation wallet has no balance. Please top up before creating a run.",
+            )
+    # ────────────────────────────────────────────────────────────────────────
+
     await session.commit()
     await session.refresh(run)
+
+    # Fire low-balance email in background (after commit so balance is final)
+    if _wallet_balance_after is not None:
+        from src.infrastructure.database.repositories.wallet_repository import LOW_BALANCE_THRESHOLD as _LBT
+        if Decimal(str(_wallet_balance_after)) < _LBT:
+            try:
+                import asyncio as _asyncio
+                from src.services.email_service import send_wallet_low_balance_email as _send_lb
+                _owner_result = await session.execute(
+                    _select(BusinessMemberModel, UserModel)
+                    .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+                    .where(
+                        BusinessMemberModel.business_id == business_uuid,
+                        BusinessMemberModel.role == "owner",
+                        BusinessMemberModel.is_active.is_(True),
+                    )
+                    .limit(1)
+                )
+                _owner_row = _owner_result.first()
+                if _owner_row:
+                    _, _owner_user = _owner_row
+                    _asyncio.create_task(
+                        _send_lb(
+                            to=_owner_user.email,
+                            display_name=_owner_user.display_name or _owner_user.email,
+                            balance=_wallet_balance_after,
+                            threshold=float(_LBT),
+                        )
+                    )
+            except Exception as _lb_exc:
+                logger.warning("[Wallet] Could not send low-balance email: %s", _lb_exc)
 
     run_id = str(run.id)
 
@@ -400,16 +512,25 @@ async def create_run(
 
             try:
                 from sqlalchemy import select as _select2
-                approver_rows = (await session.execute(
+                # Fetch all approval-capable members for this business
+                all_approvers = (await session.execute(
                     _select2(BusinessMemberModel, UserModel)
                     .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
                     .where(
                         BusinessMemberModel.business_id == business_uuid,
                         BusinessMemberModel.role.in_(["owner", "approver"]),
+                        BusinessMemberModel.is_active == True,
                     )
                 )).all()
+
                 candidate_count = len(state.get("scored_candidates", []))
-                for member, approver_user in approver_rows:
+
+                # Smart assignment: determine who gets notified
+                assigned_members = _resolve_approval_assignment(
+                    all_approvers, run, business_uuid
+                )
+
+                for member, approver_user in assigned_members:
                     await send_run_awaiting_approval_email(
                         to=approver_user.email,
                         run_id=run_id,
@@ -484,8 +605,17 @@ async def list_runs(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
+    from sqlalchemy import select as _select_biz
+    membership_result = await session.execute(
+        _select_biz(BusinessMemberModel).where(BusinessMemberModel.user_id == current_user.id)
+    )
+    membership = membership_result.scalars().first()
+    if not membership:
+        return {"runs": [], "total": 0, "limit": limit, "offset": offset}
+
     run_repo = RunRepository(session)
-    runs, total = await run_repo.list_all(
+    runs, total = await run_repo.list_by_business(
+        membership.business_id,
         status=status,
         search=search,
         from_date=from_date,

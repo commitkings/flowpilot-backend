@@ -181,6 +181,17 @@ class CandidateRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_all_approved_by_business(self, business_id: UUID) -> list[PayoutCandidateModel]:
+        """Return approved payout candidates scoped to a specific business."""
+        C = PayoutCandidateModel
+        stmt = (
+            select(C)
+            .where(C.approval_status == "approved", C.business_id == business_id)
+            .order_by(C.created_at.desc())
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     # ── Global query helpers (cross-run approvals queue) ──────
 
     def _apply_filters(

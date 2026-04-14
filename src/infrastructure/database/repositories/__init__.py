@@ -41,6 +41,10 @@ from src.infrastructure.database.repositories.transaction_repository import (
     TransactionRepository,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
+from src.infrastructure.database.repositories.wallet_repository import (
+    WalletRepository,
+    InsufficientBalanceError,
+)
 
 __all__ = [
     "AuditRepository",
@@ -60,4 +64,6 @@ __all__ = [
     "RunRepository",
     "TransactionRepository",
     "UserRepository",
+    "WalletRepository",
+    "InsufficientBalanceError",
 ]

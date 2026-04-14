@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel
 from src.infrastructure.database.repositories import (
     CandidateRepository,
     TransactionRepository,
@@ -109,11 +110,19 @@ async def list_transactions(
     all approved/executed payout candidates across all runs.
     When a run_id is provided: always includes payouts for that run.
     """
+    from sqlalchemy import select as _sel_biz
+    membership_result = await session.execute(
+        _sel_biz(BusinessMemberModel).where(BusinessMemberModel.user_id == current_user.id)
+    )
+    membership = membership_result.scalars().first()
+    business_id = membership.business_id if membership else None
+
     repo = TransactionRepository(session)
     run_uuid = UUID(run_id) if run_id else None
 
     filter_kwargs = dict(
         run_id=run_uuid,
+        business_id=business_id,
         status=status,
         channel=channel,
         search=search,
@@ -136,8 +145,11 @@ async def list_transactions(
             # Scoped to specific run
             approved = await candidate_repo.get_by_run(run_uuid, approval_status="approved")
         else:
-            # All Activity view: get all approved/executed payouts
-            approved = await candidate_repo.list_all_approved()
+            # All Activity view: get all approved/executed payouts scoped to this business
+            if business_id is not None:
+                approved = await candidate_repo.list_all_approved_by_business(business_id)
+            else:
+                approved = await candidate_repo.list_all_approved()
         for c in approved:
             payout_rows.append(_serialize_candidate_as_transaction(c))
 

@@ -577,6 +577,100 @@ async def send_kyc_verified_email(
     )
 
 
+async def send_scheduled_run_reminder_email(
+    to: str,
+    display_name: str,
+    schedule_name: str,
+    objective: str,
+    fires_at: str,
+    frequency_label: str,
+    scheduled_run_id: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the business owner that a scheduled run fires tomorrow.
+
+    Template: src/templates/emails/scheduled_run_reminder.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "scheduled_run_reminder.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        schedule_name=schedule_name,
+        objective=objective,
+        fires_at=fires_at,
+        frequency_label=frequency_label,
+        schedules_url=f"{base}/dashboard/runs?tab=scheduled",
+    )
+    return await _send(
+        to=to,
+        subject=f"Reminder: \"{schedule_name}\" runs tomorrow",
+        html=html,
+    )
+
+
+async def send_wallet_topup_email(
+    to: str,
+    display_name: str,
+    amount: float,
+    new_balance: float,
+    reference: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the business owner that a wallet top-up was successful.
+
+    Template: src/templates/emails/wallet_topup.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "wallet_topup.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        amount=f"{amount:,.2f}",
+        new_balance=f"{new_balance:,.2f}",
+        reference=reference,
+        wallet_url=f"{base}/dashboard/wallet",
+    )
+    return await _send(
+        to=to,
+        subject=f"₦{amount:,.2f} added to your FlowPilot wallet",
+        html=html,
+    )
+
+
+async def send_wallet_low_balance_email(
+    to: str,
+    display_name: str,
+    balance: float,
+    threshold: float,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Warn the business owner that their wallet balance is running low.
+
+    Template: src/templates/emails/wallet_low_balance.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "wallet_low_balance.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        balance=f"{balance:,.2f}",
+        threshold=f"{threshold:,.2f}",
+        wallet_url=f"{base}/dashboard/wallet",
+    )
+    return await _send(
+        to=to,
+        subject="Low wallet balance — top up to keep your runs running",
+        html=html,
+    )
+
+
 async def send_account_deletion_code_email(
     to: str,
     display_name: str,
