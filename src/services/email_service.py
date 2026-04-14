@@ -111,6 +111,7 @@ async def send_team_invite_email(
     html = _render(
         "team_invite.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         business_name=business_name,
         inviter_name=inviter_name,
         role_display=role.capitalize(),
@@ -139,6 +140,7 @@ async def send_team_added_email(
     html = _render(
         "team_added.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         business_name=business_name,
         inviter_name=inviter_name,
         role_display=role.capitalize(),
@@ -167,6 +169,7 @@ async def send_welcome_email(
     html = _render(
         "welcome.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         first_name=first_name,
         business_name=business_name,
         dashboard_url=f"{base}/dashboard",
@@ -195,6 +198,7 @@ async def send_run_awaiting_approval_email(
     html = _render(
         "run_awaiting_approval.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         approver_name=approver_name.split()[0] if approver_name else "there",
         objective=objective,
         candidate_count=candidate_count,
@@ -224,6 +228,7 @@ async def send_run_completed_email(
     html = _render(
         "run_completed.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         objective=objective,
         status=status,
         approved_count=approved_count,
@@ -253,6 +258,7 @@ async def send_verification_email(
     html = _render(
         "verify_email.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         first_name=first_name,
         code=code,
     )
@@ -313,6 +319,7 @@ async def send_transaction_export_email(
     html = _render(
         "transaction_export.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         row_count=len(rows),
         total_volume=f"{total_volume:,.2f}",
         exported_by=exported_by,
@@ -377,6 +384,7 @@ async def send_audit_export_email(
     html = _render(
         "audit_export.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         entry_count=len(entries),
         date_range=date_range,
         exported_by=exported_by,
@@ -405,6 +413,7 @@ async def send_password_reset_email(
     html = _render(
         "password_reset.html",
         logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         reset_url=reset_url,
     )
     return await _send(
