@@ -11,6 +11,447 @@ from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# Maps internal risk reason slugs (from RiskAgent / tools) to short SME-facing sentences.
+_RISK_REASON_PLAIN: dict[str, str] = {
+    "high amount deviation": (
+        "The amount stood out compared with what we could learn from your recent "
+        "payout patterns, so we treated it with extra care."
+    ),
+    "new beneficiary": (
+        "This recipient did not look like someone you pay often through this flow, "
+        "so there was less past success to lean on."
+    ),
+    "duplicate similarity": (
+        "This payment looked very similar to another one on file, so we wanted "
+        "to be sure it was not a double payment."
+    ),
+    "velocity": (
+        "The timing or frequency of this payment looked unusual compared with "
+        "recent activity."
+    ),
+    "transaction_data_unavailable": (
+        "We could not load enough bank transaction history for the period you chose, "
+        "so the review leaned more on the payout details themselves."
+    ),
+}
+
+
+def _normalize_risk_reason_list(reasons: Any) -> list[str]:
+    if reasons is None:
+        return []
+    if isinstance(reasons, list):
+        out: list[str] = []
+        for r in reasons:
+            if r is None:
+                continue
+            s = str(r).strip()
+            if not s:
+                continue
+            out.extend(part.strip() for part in s.split("|") if part.strip())
+        return out
+    s = str(reasons).strip()
+    if not s:
+        return []
+    return [part.strip() for part in s.split("|") if part.strip()]
+
+
+def _plain_language_risk_drivers(reasons: Any) -> list[str]:
+    """Turn scorer reason codes into plain-language lines for the audit narrative."""
+    normalized = _normalize_risk_reason_list(reasons)
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in normalized:
+        key = raw.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        mapped = _RISK_REASON_PLAIN.get(key)
+        if mapped:
+            lines.append(mapped)
+        else:
+            friendly = raw.replace("_", " ").strip()
+            lines.append(
+                f"Our checks picked up the following signal: {friendly}. "
+                "That contributed to the overall reading for this person."
+            )
+    return lines
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_ngn(value: Any) -> str:
+    return f"NGN {_safe_float(value):,.2f}"
+
+
+def _join_plain(items: list[str]) -> str:
+    clean = [item.strip() for item in items if item and item.strip()]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return ", ".join(clean[:-1]) + f", and {clean[-1]}"
+
+
+def _account_suffix(value: Any) -> str:
+    text = str(value or "").strip()
+    return text[-3:] if len(text) >= 3 else text or "unknown"
+
+
+def _display_institution(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.isdigit():
+        return None
+    return text
+
+
+def _lookup_status_summary(detail: dict[str, Any]) -> str:
+    status = str(detail.get("lookup_status", "")).lower()
+    lookup_name = str(detail.get("lookup_name") or "").strip()
+    if status == "success":
+        if lookup_name:
+            return (
+                f"We confirmed the account holder name with the bank, and it came back as "
+                f"{lookup_name}."
+            )
+        return "We confirmed the account holder name with the bank, and it matched."
+    if status in {"mismatch", "name_mismatch"}:
+        return (
+            "We reached the bank, but the returned account holder name did not match the "
+            "name entered for this recipient."
+        )
+    if status == "failed":
+        return "We could not confirm the account holder name with the bank."
+    if status == "not_performed":
+        return "We did not run a bank-name confirmation for this recipient."
+    return "The bank-name confirmation outcome for this recipient was unclear."
+
+
+def _execution_status_summary(detail: dict[str, Any]) -> str:
+    exec_status = str(detail.get("execution_status", "")).lower()
+    lookup_status = str(detail.get("lookup_status", "")).lower()
+    decision = str(detail.get("risk_decision", "")).lower()
+
+    if exec_status == "success":
+        return "The payout was sent successfully."
+    if exec_status == "pending":
+        return "The payout request was submitted and is still awaiting a final completion update."
+    if exec_status == "failed":
+        return "A payout attempt was made, but it did not complete successfully."
+    if lookup_status in {"failed", "mismatch", "name_mismatch"}:
+        return "Because the bank-name confirmation did not pass, no payout was sent."
+    if decision == "block":
+        return "Because this recipient was held back under the safety rules, no payout was sent."
+    if decision == "review":
+        return "After review, this recipient still did not reach a payable state in this run."
+    return "No payout was sent for this recipient in this run."
+
+
+def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
+    candidate_details = list(bundle.get("candidate_details") or [])
+    risk_tolerance = _safe_float(bundle.get("risk_tolerance_used"), 0.35)
+    payout_mode = str(bundle.get("payout_mode") or "live")
+    objective = str(bundle.get("objective") or "this payout run").strip()
+    metrics = bundle.get("metrics") or {}
+
+    total_candidates = len(candidate_details)
+    approved_count = int(metrics.get("total_approved") or 0)
+    success_count = int(metrics.get("execution_success") or 0)
+    pending_count = int(metrics.get("execution_pending") or 0)
+    failed_count = int(metrics.get("execution_failed") or 0)
+    total_requested_amount = _safe_float(metrics.get("total_requested_amount"))
+    total_paid_amount = _safe_float(metrics.get("total_amount_disbursed"))
+
+    if not candidate_details:
+        parts = [
+            f"This run was created for {objective}, but there were no recipients in the summary bundle.",
+        ]
+        if payout_mode == "simulated":
+            parts.append("This was a test run, so no real money was sent.")
+        return " ".join(parts)
+
+    named_people = [str(detail.get("name") or "Unknown recipient") for detail in candidate_details[:5]]
+    if total_candidates <= 5:
+        people_phrase = f"{total_candidates} recipient(s): {_join_plain(named_people)}"
+    else:
+        people_phrase = f"{total_candidates} recipients"
+
+    score_list: list[str] = []
+    for detail in candidate_details:
+        score = detail.get("risk_score")
+        if isinstance(score, (int, float)):
+            score_list.append(f"{float(score):.2f}")
+
+    review_count = sum(
+        1 for detail in candidate_details if str(detail.get("risk_decision", "")).lower() == "review"
+    )
+    block_count = sum(
+        1 for detail in candidate_details if str(detail.get("risk_decision", "")).lower() == "block"
+    )
+    lookup_failed_count = sum(
+        1
+        for detail in candidate_details
+        if str(detail.get("lookup_status", "")).lower() in {"failed", "mismatch", "name_mismatch"}
+    )
+
+    parts = [
+        (
+            f"This run reviewed {people_phrase} for {objective}, with a planned total of "
+            f"{_format_ngn(total_requested_amount)}."
+        )
+    ]
+
+    if score_list:
+        if review_count == total_candidates:
+            parts.append(
+                f"The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
+                f"comfort setting, so every recipient was held for human review before money could move."
+            )
+        else:
+            parts.append(
+                f"The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
+                "comfort setting, which led to a mix of automatic holds and review decisions."
+            )
+
+    if approved_count:
+        parts.append(
+            f"You approved {approved_count} recipient(s) after review so the run could continue."
+        )
+
+    scoring_context_note = str(bundle.get("scoring_context_note") or "").strip()
+    if scoring_context_note:
+        parts.append(scoring_context_note)
+
+    for detail in candidate_details:
+        name = str(detail.get("name") or "Unknown recipient")
+        amount = _format_ngn(detail.get("amount"))
+        account_suffix = _account_suffix(detail.get("account_masked"))
+        institution = _display_institution(detail.get("institution"))
+        score = detail.get("risk_score")
+        score_text = (
+            f"{float(score):.2f}"
+            if isinstance(score, (int, float))
+            else str(score or "unknown")
+        )
+        intro = f"For {name}, amount {amount}"
+        if institution:
+            intro += f", through {institution}"
+        intro += f", account ending in {account_suffix}"
+
+        drivers = list(detail.get("what_drove_the_score") or [])
+        driver_text = _join_plain(drivers)
+        candidate_parts = [
+            f"{intro}.",
+            (
+                f"The score was {score_text} against your {risk_tolerance:.2f} comfort setting, "
+                f"so this recipient {detail.get('decision_in_plain_words', 'needed extra review')}."
+            ),
+        ]
+        if driver_text:
+            candidate_parts.append(f"The main reasons were: {driver_text}")
+        tolerance_explanation = str(detail.get("tolerance_explanation") or "").strip()
+        if tolerance_explanation:
+            candidate_parts.append(tolerance_explanation)
+        candidate_parts.append(_lookup_status_summary(detail))
+        candidate_parts.append(_execution_status_summary(detail))
+        parts.append(" ".join(candidate_parts))
+
+    if total_paid_amount > 0:
+        parts.append(
+            f"In the end, {_format_ngn(total_paid_amount)} was sent successfully."
+        )
+    elif pending_count > 0:
+        parts.append(
+            f"No payout has fully completed yet, and {pending_count} payout(s) are still awaiting a final update."
+        )
+    else:
+        parts.append("No payout was completed in this run.")
+
+    if failed_count > 0 or lookup_failed_count > 0 or block_count > 0:
+        parts.append(
+            f"The run finished with exceptions because {lookup_failed_count} recipient(s) could not be confirmed "
+            f"with the bank, {failed_count} payout attempt(s) failed after submission, and {success_count} of "
+            f"{approved_count or total_candidates} approved payout(s) reached a successful finish."
+        )
+    else:
+        parts.append("The run finished cleanly with no unresolved payout issues.")
+
+    if payout_mode == "simulated":
+        parts.append("This was a test run, so no real money was sent.")
+
+    return " ".join(parts)
+
+
+def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
+    candidates = state.get("scored_candidates") or []
+    exec_results = state.get("candidate_execution_results") or []
+    lookup_results = state.get("candidate_lookup_results") or []
+    transactions = state.get("transactions") or []
+    risk_tolerance = state.get("risk_tolerance") or 0.35
+    batch_details = state.get("batch_details") or {}
+    approved_ids = {str(candidate_id) for candidate_id in state.get("approved_candidate_ids", [])}
+    rejected_ids = {str(candidate_id) for candidate_id in state.get("rejected_candidate_ids", [])}
+
+    success_exec = sum(
+        1 for er in exec_results if er.get("execution_status") == "success"
+    )
+    pending_exec = sum(
+        1 for er in exec_results if er.get("execution_status") == "pending"
+    )
+    failed_exec = sum(
+        1 for er in exec_results if er.get("execution_status") == "failed"
+    )
+
+    total_requested_amount = sum(
+        _safe_float(candidate.get("amount")) for candidate in candidates
+    )
+    total_disbursed_amount = _safe_float(batch_details.get("total_amount"))
+
+    candidate_details: list[dict[str, Any]] = []
+    for c in candidates:
+        cid = str(c.get("candidate_id", "") or "")
+        name = c.get("beneficiary_name", "Unknown")
+        score = c.get("risk_score", 0)
+        decision = c.get("risk_decision", "unknown")
+        amount = c.get("amount", 0)
+        institution = c.get("institution_code", "?")
+        account = c.get("account_number", "?")
+        reasons = c.get("risk_reasons", [])
+        reason_list = _normalize_risk_reason_list(
+            reasons if isinstance(reasons, list) else reasons
+        )
+        what_drove = _plain_language_risk_drivers(reason_list)
+
+        score_f: float | None
+        try:
+            score_f = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_f = None
+        tol_f = float(risk_tolerance) if risk_tolerance is not None else 0.35
+
+        if score_f is not None and score_f > tol_f:
+            tolerance_explanation = (
+                f"The overall risk reading was {score_f:.2f}, which is above your "
+                f"comfort setting of {tol_f:.2f}. That is why this payment was marked "
+                f"for review before it could continue."
+            )
+        elif score_f is not None:
+            tolerance_explanation = (
+                f"The overall risk reading was {score_f:.2f}, at or below your "
+                f"comfort setting of {tol_f:.2f} for automatic treatment."
+            )
+        else:
+            tolerance_explanation = (
+                "The overall risk reading could not be compared numerically to your "
+                "comfort setting in this summary bundle."
+            )
+
+        decision_plain = {
+            "allow": "was cleared to move forward under automatic rules",
+            "review": "needed a human review before money could move",
+            "block": "was held back under automatic rules",
+        }.get(str(decision).lower(), "had an unclear automatic status")
+
+        lookup = next(
+            (lr for lr in lookup_results if str(lr.get("candidate_id", "")) == cid),
+            {},
+        )
+        lookup_status = lookup.get("lookup_status", "not_performed")
+        lookup_name = lookup.get("lookup_account_name", "")
+        match_score = lookup.get("lookup_match_score")
+
+        exec_result = next(
+            (er for er in exec_results if str(er.get("candidate_id", "")) == cid),
+            {},
+        )
+        exec_status = exec_result.get("execution_status", "not_executed")
+
+        candidate_details.append(
+            {
+                "name": name,
+                "amount": amount,
+                "institution": institution,
+                "account_masked": f"***{account[-3:]}" if len(account) >= 3 else account,
+                "risk_score": round(score_f, 2) if score_f is not None else score,
+                "risk_tolerance": risk_tolerance,
+                "risk_decision": decision,
+                "risk_reasons_raw": reason_list,
+                "what_drove_the_score": what_drove,
+                "tolerance_explanation": tolerance_explanation,
+                "decision_in_plain_words": decision_plain,
+                "score_vs_tolerance": (
+                    f"{score_f:.2f} vs {tol_f:.2f} threshold"
+                    if score_f is not None
+                    else "?"
+                ),
+                "lookup_status": lookup_status,
+                "lookup_name": lookup_name,
+                "name_match_score": match_score,
+                "execution_status": exec_status,
+                "approved_after_review": cid in approved_ids,
+                "rejected_after_review": cid in rejected_ids,
+            }
+        )
+
+    payout_mode = (
+        "simulated" if batch_details.get("batch_reference", "").startswith("FP_") else "live"
+    )
+    dq_flags = state.get("data_quality_flags") or []
+    recon_degraded = any(
+        f.get("flag") == "transaction_data_unavailable" for f in dq_flags
+    )
+    scoring_context_note = None
+    if recon_degraded:
+        scoring_context_note = (
+            "We could not load recent bank transaction history for the selected period, "
+            "so the review leaned more on who was being paid, how much, and how new "
+            "each recipient looked in this flow."
+        )
+
+    state_hash = hashlib.sha256(
+        json.dumps(state, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+
+    bundle = {
+        "run_id": state.get("run_id"),
+        "objective": state.get("objective"),
+        "payout_mode": payout_mode,
+        "risk_tolerance_used": risk_tolerance,
+        "reconciliation_degraded": recon_degraded,
+        "scoring_context_note": scoring_context_note,
+        "total_bank_transactions": len(transactions),
+        "candidate_details": candidate_details,
+        "metrics": {
+            "total_candidates_scored": len(candidates),
+            "total_approved": len(approved_ids),
+            "total_rejected": len(rejected_ids),
+            "total_executed": len(exec_results),
+            "execution_success": success_exec,
+            "execution_pending": pending_exec,
+            "execution_failed": failed_exec,
+            "success_rate": round(
+                (success_exec + pending_exec) / max(len(exec_results), 1), 2
+            ),
+            "total_amount_disbursed": total_disbursed_amount,
+            "total_requested_amount": total_requested_amount,
+        },
+        "data_integrity_hash": state_hash,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    bundle["executive_summary"] = _build_deterministic_executive_summary(bundle)
+    return bundle
+
+
 AUDIT_SYSTEM_PROMPT = """You are a financial audit and compliance analyst for FlowPilot.
 
 Your job: perform deep analysis of the complete run data, audit risk decisions against outcomes, analyze costs, verify compliance, and produce a thorough audit report with actionable recommendations.
@@ -58,6 +499,8 @@ A GOOD executive summary includes:
 - The exact purpose and number of recipients (by name if 5 or fewer)
 - The total amount with currency symbol (use the Naira sign)
 - Each candidate's risk score vs the tolerance you set, and whether they passed
+- A dedicated explanation of **why** each score landed where it did: you MUST weave in the plain-language lines from `generate_executive_summary` tool output (`what_drove_the_score`, `tolerance_explanation`). Do not only repeat the numeric score.
+- If `reconciliation_degraded` is true in that tool output, say clearly that payout history for the chosen dates could not be loaded, and that reviews leaned more on beneficiary and amount signals.
 - Whether account names were confirmed with the bank
 - Whether this was a test run or a real payout
 - Any issues found, in plain language
@@ -307,106 +750,7 @@ def _build_audit_tools(state: AgentState, db_session=None) -> list[Tool]:
         }
 
     async def generate_executive_summary() -> dict[str, Any]:
-        candidates = state.get("scored_candidates") or []
-        exec_results = state.get("candidate_execution_results") or []
-        lookup_results = state.get("candidate_lookup_results") or []
-        transactions = state.get("transactions") or []
-        ledger = state.get("reconciled_ledger") or {}
-        risk_tolerance = state.get("risk_tolerance") or 0.35
-        batch_details = state.get("batch_details") or {}
-
-        success_exec = sum(
-            1 for er in exec_results if er.get("execution_status") == "success"
-        )
-        pending_exec = sum(
-            1 for er in exec_results if er.get("execution_status") == "pending"
-        )
-        failed_exec = sum(
-            1 for er in exec_results if er.get("execution_status") == "failed"
-        )
-        total_amount = batch_details.get("total_amount", 0)
-
-        # Build per-candidate detail for the LLM to use
-        candidate_details = []
-        for c in candidates:
-            cid = c.get("candidate_id", "")
-            name = c.get("beneficiary_name", "Unknown")
-            score = c.get("risk_score", 0)
-            decision = c.get("risk_decision", "unknown")
-            amount = c.get("amount", 0)
-            institution = c.get("institution_code", "?")
-            account = c.get("account_number", "?")
-            reasons = c.get("risk_reasons", [])
-
-            # Find lookup result for this candidate
-            lookup = next(
-                (lr for lr in lookup_results if lr.get("candidate_id") == cid),
-                {},
-            )
-            lookup_status = lookup.get("lookup_status", "not_performed")
-            lookup_name = lookup.get("lookup_account_name", "")
-            match_score = lookup.get("lookup_match_score")
-
-            # Find execution result
-            exec_result = next(
-                (er for er in exec_results if er.get("candidate_id") == cid),
-                {},
-            )
-            exec_status = exec_result.get("execution_status", "not_executed")
-
-            candidate_details.append({
-                "name": name,
-                "amount": amount,
-                "institution": institution,
-                "account_masked": f"***{account[-3:]}" if len(account) >= 3 else account,
-                "risk_score": round(score, 2) if isinstance(score, (int, float)) else score,
-                "risk_tolerance": risk_tolerance,
-                "risk_decision": decision,
-                "risk_reasons": reasons if isinstance(reasons, list) else str(reasons).split("|"),
-                "score_vs_tolerance": f"{score:.2f} vs {risk_tolerance:.2f} threshold" if isinstance(score, (int, float)) else "?",
-                "lookup_status": lookup_status,
-                "lookup_name": lookup_name,
-                "name_match_score": match_score,
-                "execution_status": exec_status,
-            })
-
-        # Determine payout mode
-        bd = state.get("batch_details") or {}
-        payout_mode = "simulated" if bd.get("batch_reference", "").startswith("FP_") else "live"
-        # Check for data quality issues
-        dq_flags = state.get("data_quality_flags") or []
-        recon_degraded = any(
-            f.get("flag") == "transaction_data_unavailable" for f in dq_flags
-        )
-
-        state_hash = hashlib.sha256(
-            json.dumps(state, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-
-        return {
-            "run_id": state.get("run_id"),
-            "objective": state.get("objective"),
-            "payout_mode": payout_mode,
-            "risk_tolerance_used": risk_tolerance,
-            "reconciliation_degraded": recon_degraded,
-            "total_bank_transactions": len(transactions),
-            "candidate_details": candidate_details,
-            "metrics": {
-                "total_candidates_scored": len(candidates),
-                "total_approved": len(state.get("approved_candidate_ids", [])),
-                "total_rejected": len(state.get("rejected_candidate_ids", [])),
-                "total_executed": len(exec_results),
-                "execution_success": success_exec,
-                "execution_pending": pending_exec,
-                "execution_failed": failed_exec,
-                "success_rate": round(
-                    (success_exec + pending_exec) / max(len(exec_results), 1), 2
-                ),
-                "total_amount_disbursed": total_amount,
-            },
-            "data_integrity_hash": state_hash,
-            "generated_at": datetime.utcnow().isoformat(),
-        }
+        return _build_executive_summary_bundle(state)
 
     # ────────────────────────────────────────────────────────────────────────
     # NEW TOOL: analyze_risk_decisions — audit risk decisions vs outcomes
@@ -967,6 +1311,9 @@ Then produce the final audit report JSON with all findings, costs, compliance st
                 audit_report = report["audit_report"]
             else:
                 audit_report = report
+
+            summary_bundle = _build_executive_summary_bundle(state)
+            audit_report["executive_summary"] = summary_bundle["executive_summary"]
 
             state_hash = hashlib.sha256(
                 json.dumps(state, sort_keys=True, default=str).encode()

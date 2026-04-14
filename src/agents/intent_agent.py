@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from groq import AsyncGroq
@@ -288,6 +288,8 @@ CRITICAL DATE RULES:
 - Accept any human date format: "April 1st 2026", "1st April 2026", "april 2026", "01/04/2026", "2026-04-01"
 - Always convert to YYYY-MM-DD format in your output
 - If only month+year given, use the 1st as the day (e.g. "April 2026" = "2026-04-01")
+- If the user gives month and day but NO year (e.g. "April 1st", "april 30th"), use the **current calendar year** from the server context, never an old training year like 2022
+- Never invent a year before 2000 when the user did not state one
 
 Respond with ONLY a valid JSON object:
 {
@@ -807,6 +809,9 @@ class IntentAgent(BaseAgent):
 
         merged_slots = self._coalesce_legacy_candidate_fields(merged_slots)
 
+        if intent == "create_payout_run":
+            merged_slots = self._snap_stale_payout_years(merged_slots)
+
         if intent == "create_payout_run" and db_session:
             await self._canonicalize_candidate_institutions(
                 merged_slots, user_message, db_session
@@ -1183,6 +1188,8 @@ Generate your response to the user. Use tools if you need to look up business in
                 else:
                     del normalized[date_key]
 
+        normalized = self._snap_stale_payout_years(normalized)
+
         # Clamp risk tolerance
         if "risk_tolerance" in normalized:
             try:
@@ -1203,6 +1210,37 @@ Generate your response to the user. Use tools if you need to look up business in
                         candidate["amount"] = parsed
 
         return normalized
+
+    @staticmethod
+    def _snap_stale_payout_years(normalized: dict) -> dict:
+        """If both bounds share an implausible past year (LLM default), use current year.
+
+        Keeps month and day; only fixes obvious wrong-year pairs such as 2022-04-01
+        to 2026-04-01 when the server year is 2026.
+        """
+        df_s = normalized.get("date_from")
+        dt_s = normalized.get("date_to")
+        if not isinstance(df_s, str) or not isinstance(dt_s, str):
+            return normalized
+        try:
+            df = date.fromisoformat(df_s)
+            dt = date.fromisoformat(dt_s)
+        except ValueError:
+            return normalized
+        if df.year != dt.year:
+            return normalized
+        ref_y = date.today().year
+        if df.year > ref_y - 3:
+            return normalized
+        try:
+            df2 = df.replace(year=ref_y)
+            dt2 = dt.replace(year=ref_y)
+        except ValueError:
+            return normalized
+        out = dict(normalized)
+        out["date_from"] = df2.isoformat()
+        out["date_to"] = dt2.isoformat()
+        return out
 
     @staticmethod
     def _parse_amount(value) -> Optional[float]:
@@ -1246,7 +1284,8 @@ Generate your response to the user. Use tools if you need to look up business in
     def _parse_date(value) -> Optional[str]:
         """Parse a date string and normalize to YYYY-MM-DD.
 
-        Handles: '2025-02-01', '01/02/2025', 'February 2025', '1st February 2025'
+        Handles: '2026-02-01', '01/02/2026', 'February 2026', '1st February 2026',
+        'April 1st' (year defaults to today.year), 'april 30th'.
         Returns None if invalid.
         """
         if not isinstance(value, str):
@@ -1256,11 +1295,12 @@ Generate your response to the user. Use tools if you need to look up business in
         if not cleaned:
             return None
 
+        ref = date.today()
+
         # Already YYYY-MM-DD?
         iso_match = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', cleaned)
         if iso_match:
             try:
-                from datetime import date
                 d = date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
                 return d.isoformat()
             except ValueError:
@@ -1270,13 +1310,11 @@ Generate your response to the user. Use tools if you need to look up business in
         dmy_match = re.fullmatch(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', cleaned)
         if dmy_match:
             try:
-                from datetime import date
                 d = date(int(dmy_match.group(3)), int(dmy_match.group(2)), int(dmy_match.group(1)))
                 return d.isoformat()
             except ValueError:
                 return None
 
-        # Month-name formats: "February 2025", "1st February 2025"
         month_names = {
             'january': 1, 'february': 2, 'march': 3, 'april': 4,
             'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -1284,25 +1322,47 @@ Generate your response to the user. Use tools if you need to look up business in
             'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
             'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
         }
-        lower = cleaned.lower()
-        for month_str, month_num in month_names.items():
-            if month_str in lower:
-                # Extract year
-                year_match = re.search(r'(\d{4})', lower)
-                if year_match:
-                    try:
-                        from datetime import date
-                        year = int(year_match.group(1))
-                        # Extract day if present
-                        day_match = re.search(r'(\d{1,2})(?:st|nd|rd|th)?', lower)
-                        day = int(day_match.group(1)) if day_match and int(day_match.group(1)) <= 31 else 1
-                        d = date(year, month_num, day)
-                        return d.isoformat()
-                    except ValueError:
-                        pass
-                break
 
-        return None
+        lowered = cleaned.lower()
+        # "1st april" -> "1 april" for stable tokenization
+        deord = re.sub(r'(\d{1,2})(?:st|nd|rd|th)\b', r'\1', lowered)
+
+        month_num: int | None = None
+        for month_str in sorted(month_names.keys(), key=len, reverse=True):
+            if month_str in deord:
+                month_num = month_names[month_str]
+                break
+        if month_num is None:
+            return None
+
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', deord)
+        explicit_year: int | None = int(year_match.group(1)) if year_match else None
+        year = explicit_year if explicit_year is not None else ref.year
+
+        scratch = deord
+        if year_match:
+            scratch = (deord[: year_match.start()] + " " + deord[year_match.end() :]).strip()
+
+        day = 1
+        day_match = re.search(r'(?<!\d)(\d{1,2})(?!\d)', scratch)
+        if day_match:
+            cand = int(day_match.group(1))
+            if 1 <= cand <= 31:
+                day = cand
+
+        try:
+            d = date(year, month_num, day)
+        except ValueError:
+            return None
+
+        # Month+day without explicit year: nudge forward if far in the past
+        if explicit_year is None and (d - ref).days < -120:
+            try:
+                d = date(year + 1, month_num, day)
+            except ValueError:
+                pass
+
+        return d.isoformat()
 
     _HELP_REQUEST_PATTERNS = re.compile(
         r"\b(give me|show me|suggest|suggestions?|options?|examples?|help me|what (?:can|should)|recommend)\b",
