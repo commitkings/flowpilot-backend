@@ -25,11 +25,17 @@ class BusinessRepository:
         owner_id: uuid.UUID,
         business_name: str,
         business_type: str | None = None,
+        interswitch_merchant_id: str | None = None,
         monthly_txn_volume_range: str | None = None,
         avg_monthly_payouts_range: str | None = None,
         primary_bank: str | None = None,
         primary_use_cases: list[str] | None = None,
         risk_appetite: str | None = None,
+        merchant_state: str | None = None,
+        daily_payout_limit: float | None = None,
+        single_payout_cap: float | None = None,
+        risk_alert_threshold: float | None = None,
+        liquidity_alert_buffer: float | None = None,
     ) -> tuple[BusinessModel, BusinessConfigModel, BusinessMemberModel]:
         """Create a business, its config, and assign the caller as owner.
 
@@ -40,6 +46,7 @@ class BusinessRepository:
         business = BusinessModel(
             business_name=business_name,
             business_type=business_type,
+            interswitch_merchant_id=interswitch_merchant_id,
         )
         self._s.add(business)
         await self._s.flush()  # assigns business.id
@@ -53,6 +60,11 @@ class BusinessRepository:
             primary_bank=primary_bank,
             primary_use_cases=primary_use_cases,
             risk_appetite=risk_appetite,
+            merchant_state=merchant_state,
+            daily_payout_limit=daily_payout_limit,
+            single_payout_cap=single_payout_cap,
+            risk_alert_threshold=risk_alert_threshold,
+            liquidity_alert_buffer=liquidity_alert_buffer,
         )
         self._s.add(config)
 
@@ -85,6 +97,7 @@ class BusinessRepository:
         allowed = {
             "business_name", "business_type", "rc_number", "tax_id",
             "city", "state", "country", "website", "phone",
+            "interswitch_merchant_id",
         }
         for key, value in kwargs.items():
             if key in allowed and value is not None:
@@ -111,6 +124,8 @@ class BusinessRepository:
             "monthly_txn_volume_range", "avg_monthly_payouts_range",
             "primary_bank", "primary_use_cases", "risk_appetite",
             "default_risk_tolerance", "default_budget_cap", "preferences",
+            "merchant_state", "daily_payout_limit", "single_payout_cap",
+            "risk_alert_threshold", "liquidity_alert_buffer",
         }
         for key, value in kwargs.items():
             if key in allowed and value is not None:

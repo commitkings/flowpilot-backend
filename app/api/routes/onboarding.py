@@ -33,6 +33,13 @@ class OnboardingRequest(BaseModel):
     primary_bank: Optional[str] = None
     primary_use_cases: Optional[list[str]] = None
     risk_appetite: Optional[str] = None
+    # Step 3 financial setup
+    interswitch_merchant_id: Optional[str] = None
+    merchant_state: Optional[str] = None
+    daily_payout_limit: Optional[float] = None
+    single_payout_cap: Optional[float] = None
+    risk_alert_threshold: Optional[float] = None
+    liquidity_alert_buffer: Optional[float] = None
 
 
 @router.post("/complete", status_code=status.HTTP_201_CREATED)
@@ -66,11 +73,17 @@ async def complete_onboarding(
         owner_id=current_user.id,
         business_name=body.business_name,
         business_type=body.business_type,
+        interswitch_merchant_id=body.interswitch_merchant_id,
         monthly_txn_volume_range=body.monthly_txn_volume_range,
         avg_monthly_payouts_range=body.avg_monthly_payouts_range,
         primary_bank=body.primary_bank,
         primary_use_cases=body.primary_use_cases,
         risk_appetite=body.risk_appetite,
+        merchant_state=body.merchant_state,
+        daily_payout_limit=body.daily_payout_limit,
+        single_payout_cap=body.single_payout_cap,
+        risk_alert_threshold=body.risk_alert_threshold,
+        liquidity_alert_buffer=body.liquidity_alert_buffer,
     )
 
     logger.info("Onboarding complete for user=%s business=%s", current_user.id, business.id)
@@ -109,6 +122,11 @@ async def complete_onboarding(
             "primary_bank": config.primary_bank,
             "primary_use_cases": config.primary_use_cases,
             "risk_appetite": config.risk_appetite,
+            "merchant_state": config.merchant_state,
+            "daily_payout_limit": float(config.daily_payout_limit) if config.daily_payout_limit else None,
+            "single_payout_cap": float(config.single_payout_cap) if config.single_payout_cap else None,
+            "risk_alert_threshold": float(config.risk_alert_threshold) if config.risk_alert_threshold else None,
+            "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config.liquidity_alert_buffer else None,
         },
         "membership": {
             "business_id": str(member.business_id),

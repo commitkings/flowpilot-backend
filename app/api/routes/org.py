@@ -28,6 +28,7 @@ class UpdateOrgRequest(BaseModel):
     country: Optional[str] = None
     website: Optional[str] = None
     phone: Optional[str] = None
+    interswitch_merchant_id: Optional[str] = None
 
 
 class UpdateOrgConfigRequest(BaseModel):
@@ -38,6 +39,11 @@ class UpdateOrgConfigRequest(BaseModel):
     risk_appetite: Optional[str] = None
     default_risk_tolerance: Optional[float] = None
     default_budget_cap: Optional[float] = None
+    merchant_state: Optional[str] = None
+    daily_payout_limit: Optional[float] = None
+    single_payout_cap: Optional[float] = None
+    risk_alert_threshold: Optional[float] = None
+    liquidity_alert_buffer: Optional[float] = None
 
 
 async def _get_user_business_id(current_user, session) -> uuid.UUID:
@@ -95,6 +101,11 @@ async def get_org_profile(
             "risk_appetite": config.risk_appetite if config else None,
             "default_risk_tolerance": config.default_risk_tolerance if config else None,
             "default_budget_cap": float(config.default_budget_cap) if config and config.default_budget_cap else None,
+            "merchant_state": config.merchant_state if config else None,
+            "daily_payout_limit": float(config.daily_payout_limit) if config and config.daily_payout_limit else None,
+            "single_payout_cap": float(config.single_payout_cap) if config and config.single_payout_cap else None,
+            "risk_alert_threshold": float(config.risk_alert_threshold) if config and config.risk_alert_threshold else None,
+            "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config and config.liquidity_alert_buffer else None,
             "preferences": config.preferences if config else None,
         } if config else None,
     }
@@ -164,6 +175,11 @@ async def update_org_config(
         "risk_appetite": config.risk_appetite,
         "default_risk_tolerance": config.default_risk_tolerance,
         "default_budget_cap": float(config.default_budget_cap) if config.default_budget_cap else None,
+        "merchant_state": config.merchant_state,
+        "daily_payout_limit": float(config.daily_payout_limit) if config.daily_payout_limit else None,
+        "single_payout_cap": float(config.single_payout_cap) if config.single_payout_cap else None,
+        "risk_alert_threshold": float(config.risk_alert_threshold) if config.risk_alert_threshold else None,
+        "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config.liquidity_alert_buffer else None,
     }
 
 
