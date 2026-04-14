@@ -72,7 +72,7 @@ jobs:
 
           echo "Updating tag for backend to $VERSION"
           sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" deployment/backend.yaml
-          sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" jobs/db-migrate.yaml
+          # sed -i "s|image: ${REGISTRY_PROJECT}/flowpilot-backend:.*|image: ${REGISTRY_PROJECT}/flowpilot-backend:${VERSION}|g" jobs/db-migrate.yaml
 
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
