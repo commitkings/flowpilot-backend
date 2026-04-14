@@ -39,6 +39,12 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:oracle@localhost:5432/flowpilot"
 )
 
+# Sanitize DATABASE_URL for psycopg2 (it doesn't support +asyncpg scheme)
+if DATABASE_URL.startswith("postgresql+asyncpg://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+elif DATABASE_URL.startswith("postgres+asyncpg://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres+asyncpg://", "postgresql://", 1)
+
 # ---------------------------------------------------------------------------
 # Known IDs (from existing DB data)
 # ---------------------------------------------------------------------------
