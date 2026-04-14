@@ -25,6 +25,7 @@ from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
+    InvitationModel,
     UserModel,
 )
 from src.infrastructure.database.repositories.invitation_repository import (
@@ -73,6 +74,7 @@ def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) ->
         "is_active": getattr(member, "is_active", True),
         "joined_at": member.joined_at.isoformat() if member.joined_at else None,
         "created_at": member.created_at.isoformat(),
+        "totp_enabled": bool(getattr(user, "totp_enabled_at", None)) if user else False,
         "user": {
             "display_name": user.display_name if user else None,
             "email": user.email if user else None,
@@ -136,9 +138,43 @@ async def list_team_members(
         .all()
     )
 
+    # Fetch pending invitations and append them as virtual members
+    pending_invites = list(
+        (
+            await session.execute(
+                select(InvitationModel).where(
+                    InvitationModel.business_id == caller.business_id,
+                    InvitationModel.status == "pending",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    def _serialize_invite(invite: InvitationModel) -> dict:
+        return {
+            "id": str(invite.id),
+            "user_id": str(invite.id),  # no real user yet
+            "role": invite.role,
+            "is_active": True,
+            "is_pending": True,
+            "joined_at": None,
+            "created_at": invite.created_at.isoformat(),
+            "totp_enabled": False,
+            "user": {
+                "display_name": None,
+                "email": invite.invited_email,
+                "avatar_url": None,
+            },
+        }
+
+    members = [_serialize_member(m, m.user) for m in rows]
+    pending = [_serialize_invite(i) for i in pending_invites]
+
     return {
-        "members": [_serialize_member(m, m.user) for m in rows],
-        "total": total,
+        "members": members + pending,
+        "total": total + len(pending),
         "limit": limit,
         "offset": offset,
     }

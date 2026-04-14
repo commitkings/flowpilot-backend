@@ -61,6 +61,11 @@ class UserModel(Base):
     has_taken_tour: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    # 2FA / TOTP
+    totp_secret: Mapped[Optional[str]] = mapped_column(String(64))
+    totp_enabled_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    backup_codes_hash: Mapped[Optional[str]] = mapped_column(Text)  # JSON array of bcrypt hashes
+    totp_grace_until: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))  # org-enforced grace deadline
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -264,6 +269,9 @@ class BusinessConfigModel(Base):
         Numeric(5, 4), server_default=text("0.3500")
     )
     default_budget_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+    # Org-level 2FA enforcement (owner-controlled)
+    require_2fa: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    require_2fa_enforced_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     # Preferences as JSONB
     preferences: Mapped[Optional[dict]] = mapped_column(
         JSONB, server_default=text("'{}'")
@@ -1518,6 +1526,249 @@ class RunMemoryDigestModel(Base):
     )
 
     agent_run: Mapped["AgentRunModel"] = relationship()
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 28. api_key — programmatic access keys for organisations
+# --------------------------------------------------------------------------- #
+class ApiKeyModel(Base):
+    __tablename__ = "api_key"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # First 10 chars of the raw key — used as a fast lookup prefix
+    key_prefix: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    # PBKDF2-SHA256 hash of the full raw key
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    scopes: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("api_key_business_id_idx", "business_id"),
+        Index("api_key_prefix_idx", "key_prefix"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 29. webhook — org-level HTTP notification endpoints
+# --------------------------------------------------------------------------- #
+class WebhookModel(Base):
+    __tablename__ = "webhook"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    events: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    # PBKDF2 hash of the signing secret (kept for backward compat, not used for signing)
+    secret_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Raw whsec_... secret stored for HMAC-SHA256 payload signing
+    signing_secret: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    failure_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    last_triggered_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("webhook_business_id_idx", "business_id"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 30. approval_rule — configurable approval gates per business
+# --------------------------------------------------------------------------- #
+class ApprovalRuleModel(Base):
+    __tablename__ = "approval_rule"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    condition: Mapped[str] = mapped_column(Text, nullable=False)
+    threshold: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), server_default=text("0"), nullable=False
+    )
+    required_approvers: Mapped[int] = mapped_column(
+        Integer, server_default=text("1"), nullable=False
+    )
+    approver_roles: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[\"approver\"]'::jsonb"), nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "condition IN ('amount_above', 'risk_score_above', 'always')",
+            name="approval_rule_condition_check",
+        ),
+        CheckConstraint(
+            "required_approvers >= 1",
+            name="approval_rule_min_approvers_check",
+        ),
+        Index("approval_rule_business_id_idx", "business_id"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 31. blocklist_entry — blocked accounts / names / bank codes per business
+# --------------------------------------------------------------------------- #
+class BlocklistEntryModel(Base):
+    __tablename__ = "blocklist_entry"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    added_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, server_default=text("''"), nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('account_number', 'beneficiary_name', 'bank_code')",
+            name="blocklist_entry_type_check",
+        ),
+        Index("blocklist_entry_business_id_idx", "business_id"),
+        Index("blocklist_entry_type_value_idx", "business_id", "type", "value"),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# 32. scheduled_run — recurring payout run definitions
+# --------------------------------------------------------------------------- #
+class ScheduledRunModel(Base):
+    __tablename__ = "scheduled_run"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    cron_expression: Mapped[str] = mapped_column(String(128), nullable=False)
+    frequency_label: Mapped[str] = mapped_column(String(64), nullable=False)
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("scheduled_run_business_id_idx", "business_id"),
+        Index("scheduled_run_next_run_at_idx", "next_run_at"),
+    )
+
     business: Mapped["BusinessModel"] = relationship()
 
 

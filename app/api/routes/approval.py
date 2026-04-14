@@ -390,6 +390,22 @@ async def approve_candidates(
 
         final_status = "failed" if state.get("error") else "completed"
 
+        # Fire webhooks for approval.completed and run outcome
+        try:
+            import asyncio as _asyncio
+            from src.services.webhook_dispatcher import dispatch_event as _dispatch
+            webhook_payload = {
+                "run_id": run_id,
+                "objective": run.objective,
+                "status": final_status,
+                "approved_count": approved_count,
+            }
+            _asyncio.create_task(_dispatch(run.business_id, "approval.completed", webhook_payload))
+            run_event = "run.completed" if final_status == "completed" else "run.failed"
+            _asyncio.create_task(_dispatch(run.business_id, run_event, webhook_payload))
+        except Exception as _wh_exc:
+            logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
+
         # Sync linked conversation so chat UI reflects run completion
         await _sync_conversation_after_run(
             session, run_uuid, final_status, state.get("error")
@@ -520,6 +536,19 @@ async def reject_candidates(
         remaining_approved = len(state["approved_candidate_ids"])
 
     logger.info(f"Run {run_id}: rejected {rejected_count} candidates")
+
+    # Fire approval.completed webhook for rejection
+    try:
+        import asyncio as _asyncio
+        from src.services.webhook_dispatcher import dispatch_event as _dispatch
+        _asyncio.create_task(_dispatch(run.business_id, "approval.completed", {
+            "run_id": run_id,
+            "objective": run.objective,
+            "action": "rejected",
+            "rejected_count": rejected_count,
+        }))
+    except Exception as _wh_exc:
+        logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
 
     # Notify run creator about rejection
     if run.created_by:

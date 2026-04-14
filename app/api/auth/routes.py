@@ -121,6 +121,13 @@ def _user_response(user, memberships) -> dict:
             for m in active_memberships
         ],
         "has_completed_onboarding": len(active_memberships) > 0,
+        # 2FA fields
+        "totp_enabled": getattr(user, "totp_enabled_at", None) is not None,
+        "totp_grace_until": (
+            user.totp_grace_until.isoformat()
+            if getattr(user, "totp_grace_until", None)
+            else None
+        ),
     }
 
 
@@ -403,9 +410,21 @@ async def login_with_password(
             frontend_url=Settings.FRONTEND_URL,
         )
 
-    token = create_access_token(user.id, user.email)
     await session.commit()
 
+    # If 2FA is enabled, return a short-lived mfa_token instead of the real JWT.
+    # The client must call POST /auth/2fa/verify (or /backup-login) to get the token.
+    if user.totp_enabled_at is not None:
+        from src.infrastructure.cache import totp_challenge_store
+        from app.api.auth.jwt_utils import create_mfa_token
+        challenge_id = await totp_challenge_store.create(str(user.id))
+        mfa_token = create_mfa_token(user.id, challenge_id)
+        return {
+            "mfa_required": True,
+            "mfa_token": mfa_token,
+        }
+
+    token = create_access_token(user.id, user.email)
     return {
         "token": token,
         "user": {
@@ -506,10 +525,17 @@ async def google_callback(
         email_verified_at=datetime.now(_tz.utc),
     )
 
-    # Issue JWT
-    jwt_token = create_access_token(user.id, user.email)
+    # If 2FA is enabled, redirect to the MFA challenge page instead
+    if user.totp_enabled_at is not None:
+        from src.infrastructure.cache import totp_challenge_store
+        from app.api.auth.jwt_utils import create_mfa_token
+        challenge_id = await totp_challenge_store.create(str(user.id))
+        mfa_token = create_mfa_token(user.id, challenge_id)
+        redirect_url = f"{Settings.FRONTEND_URL}/verify-2fa?mfa_token={mfa_token}"
+        return RedirectResponse(redirect_url)
 
-    # Redirect to frontend with token
+    # Issue JWT and redirect to frontend
+    jwt_token = create_access_token(user.id, user.email)
     redirect_url = f"{Settings.FRONTEND_URL}/auth/callback?token={jwt_token}"
     return RedirectResponse(redirect_url)
 

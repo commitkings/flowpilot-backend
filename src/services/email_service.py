@@ -421,3 +421,71 @@ async def send_password_reset_email(
         subject="Reset your FlowPilot password",
         html=html,
     )
+
+
+# ── 2FA emails ────────────────────────────────────────────────────────────────
+
+
+async def send_2fa_enabled_email(
+    to: str,
+    display_name: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Security alert: 2FA was enabled on the account."""
+    base = frontend_url or Settings.FRONTEND_URL
+    html = _render(
+        "2fa_enabled.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        settings_url=f"{base}/dashboard/settings",
+    )
+    return await _send(
+        to=to,
+        subject="Two-factor authentication enabled — FlowPilot",
+        html=html,
+    )
+
+
+async def send_2fa_disabled_email(
+    to: str,
+    display_name: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Security alert: 2FA was disabled on the account."""
+    base = frontend_url or Settings.FRONTEND_URL
+    html = _render(
+        "2fa_disabled.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        settings_url=f"{base}/dashboard/settings",
+    )
+    return await _send(
+        to=to,
+        subject="Two-factor authentication disabled — FlowPilot",
+        html=html,
+    )
+
+
+async def send_2fa_enforced_email(
+    to: str,
+    display_name: str,
+    grace_hours: int = 24,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify a team member that their org now requires 2FA within a grace period."""
+    base = frontend_url or Settings.FRONTEND_URL
+    html = _render(
+        "2fa_enforced.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        grace_hours=grace_hours,
+        setup_url=f"{base}/dashboard/settings",
+    )
+    return await _send(
+        to=to,
+        subject=f"Action required: Set up 2FA within {grace_hours} hours — FlowPilot",
+        html=html,
+    )

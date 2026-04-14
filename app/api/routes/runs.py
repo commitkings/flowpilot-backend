@@ -373,6 +373,18 @@ async def create_run(
             _running_states[run_id] = state
 
             # Notify all approvers and owners in the business
+            # Fire approval.requested webhook
+            try:
+                import asyncio as _asyncio
+                from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                _asyncio.create_task(_dispatch(business_uuid, "approval.requested", {
+                    "run_id": run_id,
+                    "objective": request.objective,
+                    "candidate_count": len(state.get("scored_candidates", [])),
+                }))
+            except Exception as _wh_exc:
+                logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
+
             try:
                 from sqlalchemy import select as _select2
                 approver_rows = (await session.execute(

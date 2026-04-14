@@ -21,7 +21,11 @@ from app.api.routes.org import router as org_router
 from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
 from app.api.routes.dashboard import router as dashboard_router
-from app.api.auth import auth_router
+from app.api.routes.developer import router as developer_router
+from app.api.routes.org_config import router as org_config_router
+from app.api.routes.scheduled_runs import router as scheduled_runs_router
+from app.api.routes.public_api import router as public_api_router
+from app.api.auth import auth_router, two_factor_router
 from app.api.middleware import LoggingMiddleware
 from src.config.settings import Settings
 from src.infrastructure.database.connection import (
@@ -57,9 +61,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("FlowPilot API starting up")
     _validate_payout_config()
     await init_db()
+    from src.services.scheduler import start_scheduler, stop_scheduler
+    start_scheduler()
     try:
         yield
     finally:
+        stop_scheduler()
         await close_db()
         logger.info("FlowPilot API shutting down")
 
@@ -108,6 +115,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
+app.include_router(two_factor_router, prefix="/api/v1/auth", tags=["2fa"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
 app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
@@ -121,6 +129,10 @@ app.include_router(org_router, prefix="/api/v1", tags=["org"])
 app.include_router(team_router, prefix="/api/v1", tags=["team"])
 app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
 app.include_router(dashboard_router, prefix="/api/v1", tags=["dashboard"])
+app.include_router(developer_router, prefix="/api/v1", tags=["developer"])
+app.include_router(org_config_router, prefix="/api/v1", tags=["org-config"])
+app.include_router(scheduled_runs_router, prefix="/api/v1", tags=["scheduled-runs"])
+app.include_router(public_api_router, prefix="/api/v1", tags=["public-api"])
 
 # Serve uploaded files (avatars, etc.)
 from fastapi.staticfiles import StaticFiles
