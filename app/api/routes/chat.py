@@ -1,4 +1,5 @@
 import asyncio
+import re
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -112,26 +113,84 @@ def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
 
 
 def _is_affirmative_confirmation(message: str) -> bool:
-    normalized = " ".join("".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in message).split())
+    normalized = " ".join(
+        "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in message).split()
+    )
     if not normalized:
         return False
-    affirmatives = {
-        "yes",
-        "y",
-        "yeah",
-        "yea",
-        "yep",
-        "sure",
-        "ok",
-        "okay",
-        "alright",
-        "go ahead",
-        "proceed",
-        "confirmed",
-        "confirm",
-        "do it",
-    }
-    return normalized in affirmatives
+    negative_markers = (
+        "do not",
+        "don't",
+        "dont",
+        "not yet",
+        "wait",
+        "hold on",
+        "stop",
+        "cancel",
+        "nevermind",
+        "never mind",
+    )
+    if any(marker in normalized for marker in negative_markers):
+        return False
+
+    affirmative_patterns = (
+        r"^(?:y|yes|yeah|yea|yep)\b",
+        r"^(?:ok|okay|sure|alright)\b",
+        r"\bgo ahead\b",
+        r"\bproceed\b",
+        r"\bconfirm(?:ed)?\b",
+        r"\bdo it\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in affirmative_patterns)
+
+
+def _eligible_fast_confirm_slots(conv, business_id: str) -> Optional[dict]:
+    if conv.run_id is not None:
+        return None
+    if conv.status not in ("gathering", "confirming"):
+        return None
+    if conv.current_intent != "create_payout_run" and not (conv.extracted_slots or {}).get(
+        "objective"
+    ):
+        return None
+
+    agent = IntentAgent()
+    normalized_slots = agent.normalize_slots_for_confirmation(conv.extracted_slots or {})
+    if not agent.can_confirm_slots(normalized_slots):
+        return None
+    return normalized_slots
+
+
+def _run_status_reply(status: str, objective: str) -> str:
+    label = objective or "this payout run"
+    human_status = {
+        "pending": "pending",
+        "planning": "being planned",
+        "reconciling": "being reconciled",
+        "scoring": "being risk scored",
+        "forecasting": "being forecasted",
+        "awaiting_approval": "awaiting approval",
+        "executing": "executing",
+        "completed": "completed",
+        "completed_with_errors": "completed with some errors",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(status, status)
+
+    if status == "awaiting_approval":
+        return (
+            f"Your payout run for {label} has already been created and is awaiting approval. "
+            "You don't need to confirm again here."
+        )
+    if status in {"completed", "completed_with_errors", "failed", "cancelled"}:
+        return (
+            f"Your payout run for {label} is {human_status}. "
+            "If you want to start another payout, open a new conversation."
+        )
+    return (
+        f"Your payout run for {label} has already been created and is currently {human_status}. "
+        "You don't need to confirm again here."
+    )
 
 
 def _validate_chat_candidates(raw_candidates: object) -> list[str]:
@@ -506,7 +565,7 @@ async def chat_send(
         conversation_id=str(conv.id),
     )
 
-    if conv.status == "confirming" and _is_affirmative_confirmation(request.message):
+    if conv.run_id is not None:
         await conv_repo.add_message(
             conv.id,
             role="user",
@@ -514,6 +573,83 @@ async def chat_send(
         )
         await session.commit()
         await append_turn(str(conv.id), "user", request.message)
+
+        run_status = conv.status
+        objective = ""
+        run_repo = RunRepository(session)
+        run = await run_repo.get_by_id(conv.run_id)
+        if run is not None:
+            run_status = run.status
+            objective = run.objective or ""
+        if not objective:
+            objective = str((conv.resolved_run_config or {}).get("objective", "") or "")
+
+        response_text = _run_status_reply(run_status, objective)
+        await conv_repo.add_message(
+            conv.id,
+            role="assistant",
+            content=response_text,
+            intent_classification="check_run_status",
+            confidence=1.0,
+        )
+        await session.commit()
+        await append_turn(str(conv.id), "assistant", response_text)
+
+        log_chat_message(
+            role="assistant",
+            content=response_text,
+            conversation_id=str(conv.id),
+            intent="check_run_status",
+            confidence=1.0,
+        )
+
+        return ChatSendResponse(
+            conversation_id=str(conv.id),
+            response=response_text,
+            intent="check_run_status",
+            confidence=1.0,
+            extracted_slots={},
+            merged_slots=conv.extracted_slots or {},
+            should_confirm=False,
+            conversation_status=conv.status,
+            run_config=conv.resolved_run_config,
+            run_created=False,
+            run_id=str(conv.run_id),
+        )
+
+    affirmative_message = _is_affirmative_confirmation(request.message)
+    fast_confirm_slots = (
+        _eligible_fast_confirm_slots(conv, request.business_id)
+        if affirmative_message
+        else None
+    )
+
+    if affirmative_message and (
+        conv.status == "confirming" or fast_confirm_slots is not None
+    ):
+        await conv_repo.add_message(
+            conv.id,
+            role="user",
+            content=request.message,
+        )
+        await session.commit()
+        await append_turn(str(conv.id), "user", request.message)
+
+        if fast_confirm_slots is not None:
+            agent = IntentAgent()
+            await conv_repo.update_conversation(
+                conv.id,
+                status="confirming",
+                current_intent="create_payout_run",
+                extracted_slots=fast_confirm_slots,
+                resolved_run_config=agent.build_run_config(
+                    fast_confirm_slots, request.business_id
+                ),
+            )
+            await session.commit()
+            refreshed = await conv_repo.get_by_id(conv.id)
+            if refreshed is not None:
+                conv = refreshed
 
         confirm_result = await _create_run_from_conversation(
             conv,

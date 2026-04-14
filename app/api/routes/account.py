@@ -115,24 +115,29 @@ async def export_account_data(
     runs_rows = (
         await session.execute(
             select(AgentRunModel)
+            .options(selectinload(AgentRunModel.payout_candidates))
             .where(AgentRunModel.business_id == business_id)
             .order_by(AgentRunModel.created_at.desc())
             .limit(500)
         )
     ).scalars().all()
 
-    runs = [
-        {
-            "id": str(r.id),
-            "objective": r.objective,
-            "state": r.state,
-            "total_amount": float(r.total_amount) if r.total_amount else None,
-            "candidate_count": r.candidate_count,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-        }
-        for r in runs_rows
-    ]
+    runs = []
+    for run in runs_rows:
+        pcs = run.payout_candidates or []
+        cand_count = len(pcs)
+        total_amt = float(sum(pc.amount for pc in pcs)) if pcs else None
+        runs.append(
+            {
+                "id": str(run.id),
+                "objective": run.objective,
+                "status": run.status,
+                "total_amount": total_amt,
+                "candidate_count": cand_count,
+                "created_at": run.created_at.isoformat() if run.created_at else None,
+                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            }
+        )
 
     # ── Transactions (most recent 500) ────────────────────────────────────────
     txn_rows = (

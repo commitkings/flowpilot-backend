@@ -6,7 +6,6 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, func, and_
-
 from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (

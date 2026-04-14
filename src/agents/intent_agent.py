@@ -276,7 +276,7 @@ The parameters you can extract are:
 - date_to (string, YYYY-MM-DD): End date. Same format rules as date_from.
 - risk_tolerance (number, 0.0-1.0): How strict to be with risk scoring. 0.0 = block everything suspicious, 1.0 = allow everything. "use the default" means 0.35.
 - budget_cap (number): Maximum total amount for the entire payout run. If user says "no budget cap" or "none", set to null.
-- candidates (array of objects): Beneficiary list. Each object should have: institution_code, beneficiary_name, account_number, amount. Optional: currency (default NGN), purpose
+- candidates (array of objects): Beneficiary list. Each object should have: institution_code (official bank code from your catalog, e.g. NIP/CBN code like 058 for GTBank), beneficiary_name, account_number, amount. You may also use a temporary key \"bank\" with the human bank name; institution_code is preferred when you know it. Optional: currency (default NGN), purpose
 
 CRITICAL AMOUNT RULES:
 - ALWAYS expand shorthand amounts to their full numeric value:
@@ -318,6 +318,7 @@ For create_payout_run:
 - Before confirming a payout run, make sure you have the objective, start date, end date, risk tolerance, and at least one beneficiary.
 - If objective exists, ask naturally for the next missing piece. Always acknowledge what you've already captured.
 - When ready: give a brief summary and ask "Should I go ahead?"
+- Never say you are about to create, execute, or submit the payout run inside a normal chat turn. Only the API confirmation flow can do that.
 - Never claim a payout run has been created, executed, or validated inside normal chat unless the system has explicitly confirmed that action.
 - Never claim bank or beneficiary validation happened unless a tool actually performed it.
 
@@ -357,6 +358,7 @@ def _institution_alias_variants(value: str) -> set[str]:
     variants.add(normalized.replace("guaranty", "guarantee"))
 
     nickname_map = {
+        "gt": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
         "gtbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
         "gtb": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
         "guarantytrustbank": {
@@ -535,7 +537,7 @@ def _build_intent_tools(
             )
 
             repo = InstitutionRepository(db_session)
-            institutions = await repo.get_all_active()
+            institutions = await repo.get_all_active_rows()
             resolved_code = _resolve_institution_code(code, institutions)
             if resolved_code:
                 for inst in institutions:
@@ -561,7 +563,7 @@ def _build_intent_tools(
             )
 
             repo = InstitutionRepository(db_session)
-            institutions = await repo.get_all_active()
+            institutions = await repo.get_all_active_rows()
             return {
                 "count": len(institutions),
                 "institutions": [
@@ -731,6 +733,7 @@ class IntentAgent(BaseAgent):
         current_intent: Optional[str] = None,
     ) -> dict:
         self.registry = ToolRegistry()
+        current_slots = self._coalesce_legacy_candidate_fields(current_slots)
         history_for_llm = conversation_history
         if conversation_id and db_session:
             from src.infrastructure.memory.redis_working_memory import (
@@ -753,6 +756,9 @@ class IntentAgent(BaseAgent):
         )
         intent = classification.get("intent", "unclear")
         confidence = classification.get("confidence", 0.0)
+        standalone_greeting = (
+            intent == "greeting" and self._is_standalone_greeting_message(user_message)
+        )
 
         if self._should_continue_payout_flow(
             user_message=user_message,
@@ -778,6 +784,10 @@ class IntentAgent(BaseAgent):
             for key, value in contextual_updates.items():
                 extracted[key] = value
 
+            extracted = self._coalesce_legacy_candidate_fields(
+                extracted,
+                prefer_legacy=True,
+            )
             # Validate and normalize extracted values deterministically
             extracted = self._validate_and_normalize_slots(extracted)
 
@@ -795,11 +805,29 @@ class IntentAgent(BaseAgent):
 
             merged_slots[key] = value
 
+        merged_slots = self._coalesce_legacy_candidate_fields(merged_slots)
+
+        if intent == "create_payout_run" and db_session:
+            await self._canonicalize_candidate_institutions(
+                merged_slots, user_message, db_session
+            )
+
+        should_confirm = intent == "create_payout_run" and self._has_sufficient_slots(
+            merged_slots
+        )
+
         response_text = None
         if intent == "create_payout_run" and not self._is_help_or_suggestion_request(
             user_message
         ):
             response_text = self._build_required_slot_prompt(merged_slots)
+            if response_text and standalone_greeting:
+                response_text = (
+                    f"{self._greeting_opener(user_message)} {response_text}"
+                ).strip()
+
+        if response_text is None and should_confirm:
+            response_text = self.build_confirmation_prompt(merged_slots)
 
         if response_text is None:
             response_text = await self._generate_response(
@@ -809,10 +837,6 @@ class IntentAgent(BaseAgent):
                 slots=merged_slots,
                 business_id=business_id,
             )
-
-        should_confirm = intent == "create_payout_run" and self._has_sufficient_slots(
-            merged_slots
-        )
 
         return {
             "intent": intent,
@@ -828,6 +852,57 @@ class IntentAgent(BaseAgent):
             },
             "tool_calls": self.registry.call_log if self.registry else [],
         }
+
+    def _coalesce_legacy_candidate_fields(
+        self,
+        slots: dict,
+        *,
+        prefer_legacy: bool = False,
+    ) -> dict:
+        """Move stray candidate fields into candidates[0].
+
+        Some model responses incorrectly return beneficiary fields at the top level,
+        e.g. ``{"institution_code": "GT"}`` instead of nesting them inside
+        ``candidates[0]``. The rest of the payout flow only reads
+        ``candidates[].institution_code``, so the conversation gets stuck asking for
+        the bank repeatedly.
+        """
+        if not isinstance(slots, dict):
+            return {}
+
+        merged = dict(slots)
+        legacy_keys = (
+            "beneficiary_name",
+            "institution_code",
+            "account_number",
+            "amount",
+            "bank",
+            "institution",
+            "bank_name",
+        )
+        legacy_fields = {
+            key: merged.pop(key)
+            for key in legacy_keys
+            if merged.get(key) not in (None, "", [])
+        }
+        if not legacy_fields:
+            return merged
+
+        candidates = merged.get("candidates")
+        if (
+            isinstance(candidates, list)
+            and candidates
+            and isinstance(candidates[0], dict)
+        ):
+            first_candidate = dict(candidates[0])
+            for key, value in legacy_fields.items():
+                if prefer_legacy or first_candidate.get(key) in (None, "", []):
+                    first_candidate[key] = value
+            merged["candidates"] = [first_candidate, *candidates[1:]]
+            return merged
+
+        merged["candidates"] = [legacy_fields]
+        return merged
 
     async def _classify_intent(
         self,
@@ -1237,6 +1312,36 @@ Generate your response to the user. Use tools if you need to look up business in
     def _is_help_or_suggestion_request(self, message: str) -> bool:
         return bool(self._HELP_REQUEST_PATTERNS.search(message))
 
+    _STANDALONE_GREETING_RE = re.compile(
+        r"^\s*(?:"
+        r"hi+\b|hey+\b|hello+\b|yo+\b|sup\b|howdy\b|"
+        r"good\s+(?:morning|afternoon|evening)\b|"
+        r"what(?:'s|\s+is)\s+up\b"
+        r")(?:\s+[a-z.'-]+){0,3}\s*[!?.]*\s*$",
+        re.IGNORECASE,
+    )
+
+    def _is_standalone_greeting_message(self, message: str) -> bool:
+        stripped = message.strip()
+        if not stripped or len(stripped) > 60:
+            return False
+        if any(ch.isdigit() for ch in stripped):
+            return False
+        return bool(self._STANDALONE_GREETING_RE.match(stripped))
+
+    @staticmethod
+    def _greeting_opener(user_message: str) -> str:
+        low = user_message.strip().lower()
+        if low.startswith("hello"):
+            return "Hello again!"
+        if low.startswith("hey"):
+            return "Hey!"
+        if low.startswith("hi"):
+            return "Hi there!"
+        if low.startswith("good"):
+            return "Good to hear from you!"
+        return "Hi!"
+
     def _should_continue_payout_flow(
         self,
         user_message: str,
@@ -1282,6 +1387,79 @@ Generate your response to the user. Use tools if you need to look up business in
 
         return bool(self._get_required_missing_slots(current_slots))
 
+    async def _canonicalize_candidate_institutions(
+        self,
+        slots: dict,
+        user_message: str,
+        db_session,
+    ) -> None:
+        """Map bank synonyms to canonical NIP/institution codes and drop invalid guesses.
+
+        The extractor often fills ``bank`` / ``institution`` instead of ``institution_code``,
+        or stores a non-canonical label like ``GT``. The UI may show that as satisfied while
+        ``_candidate_details_missing`` still treats the beneficiary as incomplete.
+        """
+        if db_session is None:
+            return
+        candidates = slots.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return
+        try:
+            from src.infrastructure.database.repositories.institution_repository import (
+                InstitutionRepository,
+            )
+
+            institutions = await InstitutionRepository(db_session).get_all_active_rows()
+        except Exception as exc:
+            logger.warning(
+                "Could not load institutions for candidate canonicalization: %s", exc
+            )
+            return
+
+        valid_codes = {
+            getattr(i, "institution_code", None) for i in institutions
+        }
+        valid_codes.discard(None)
+
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+
+            chunks: list[str] = []
+            ic = str(cand.get("institution_code", "") or "").strip()
+            if ic:
+                chunks.append(ic)
+            for syn in ("bank", "institution", "bank_name"):
+                v = cand.get(syn)
+                if v:
+                    s = str(v).strip()
+                    if s and s not in chunks:
+                        chunks.append(s)
+            chunks.sort(key=len, reverse=True)
+
+            resolved: Optional[str] = None
+            for ch in chunks:
+                if ch in valid_codes:
+                    resolved = ch
+                    break
+                r = _resolve_institution_code(ch, institutions)
+                if r:
+                    resolved = r
+                    break
+
+            if not resolved and user_message.strip():
+                resolved = await self._extract_candidate_institution_from_message(
+                    user_message, db_session=db_session
+                )
+
+            if resolved:
+                cand["institution_code"] = resolved
+            elif ic and ic not in valid_codes:
+                cand.pop("institution_code", None)
+
+            for syn in ("bank", "institution", "bank_name"):
+                cand.pop(syn, None)
+
     async def _extract_contextual_slot_updates(
         self,
         user_message: str,
@@ -1290,34 +1468,34 @@ Generate your response to the user. Use tools if you need to look up business in
         db_session=None,
     ) -> dict:
         updates: dict[str, Any] = {}
-        if extracted.get("candidates"):
-            return updates
 
         if self._is_help_or_suggestion_request(user_message):
             return updates
 
         candidates = current_slots.get("candidates")
-        if candidates is not None and (
-            not isinstance(candidates, list) or len(candidates) != 1
-        ):
+        if candidates is None or not isinstance(candidates, list) or len(candidates) < 1:
             return updates
-        if (
-            isinstance(candidates, list)
-            and candidates
-            and not isinstance(candidates[0], dict)
-        ):
+        if not isinstance(candidates[0], dict):
             return updates
 
-        candidate = (
-            dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
-        )
+        candidate = dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
+
+        ext_cands = extracted.get("candidates")
+        if isinstance(ext_cands, list) and len(ext_cands) == 1 and isinstance(ext_cands[0], dict):
+            for key, value in ext_cands[0].items():
+                if value is not None and value != "" and value != []:
+                    candidate[key] = value
+
         changed = False
 
+        parsed_name = None
         if not candidate.get("beneficiary_name"):
             parsed_name = self._extract_candidate_name_from_message(user_message)
-            if parsed_name:
-                candidate["beneficiary_name"] = parsed_name
-                changed = True
+        elif self._looks_like_name_correction(user_message):
+            parsed_name = self._extract_candidate_name_from_message(user_message)
+        if parsed_name:
+            candidate["beneficiary_name"] = parsed_name
+            changed = True
 
         if not candidate.get("institution_code"):
             parsed_institution = await self._extract_candidate_institution_from_message(
@@ -1351,7 +1529,18 @@ Generate your response to the user. Use tools if you need to look up business in
         if not changed:
             return updates
 
-        updates["candidates"] = [candidate]
+        if len(candidates) == 1:
+            updates["candidates"] = [candidate]
+        else:
+            merged_list: list[Any] = []
+            for i, c in enumerate(candidates):
+                if i == 0:
+                    merged_list.append(candidate)
+                elif isinstance(c, dict):
+                    merged_list.append(dict(c))
+                else:
+                    merged_list.append(c)
+            updates["candidates"] = merged_list
         return updates
 
     def _extract_candidate_amount_from_message(
@@ -1456,10 +1645,21 @@ Generate your response to the user. Use tools if you need to look up business in
 
         return new_candidates
 
+    _NAME_CORRECTION_HINT = re.compile(
+        r"\b(?:sorry|actually|i\s+meant|my\s+bad|correction|correct\s+that|"
+        r"wrong\s+name|change\s+(?:it\s+)?to|spell(?:ing)?|"
+        r"the\s+name\s+should\s+be|it(?:'s| is)\s+(?:actually\s+)?)\b",
+        re.IGNORECASE,
+    )
+
+    def _looks_like_name_correction(self, user_message: str) -> bool:
+        return bool(self._NAME_CORRECTION_HINT.search(user_message))
+
     def _extract_candidate_name_from_message(self, user_message: str) -> Optional[str]:
         patterns = [
             r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)(?:'s)?\s+name\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
             r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
+            r"(?:sorry|actually|i\s+meant|my\s+bad)[,!\s]+(?:the\s+)?name\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
             r"\bname\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
         ]
         for pattern in patterns:
@@ -1516,7 +1716,7 @@ Generate your response to the user. Use tools if you need to look up business in
             )
 
             repo = InstitutionRepository(db_session)
-            institutions = await repo.get_all_active()
+            institutions = await repo.get_all_active_rows()
 
             phrases: list[str] = []
 
@@ -1616,3 +1816,48 @@ Generate your response to the user. Use tools if you need to look up business in
         if slots.get("candidates"):
             config["candidates"] = slots["candidates"]
         return config
+
+    def normalize_slots_for_confirmation(self, slots: Optional[dict]) -> dict:
+        return self._coalesce_legacy_candidate_fields(slots or {})
+
+    def can_confirm_slots(self, slots: Optional[dict]) -> bool:
+        normalized = self.normalize_slots_for_confirmation(slots)
+        return self._has_sufficient_slots(normalized)
+
+    def build_confirmation_prompt(self, slots: dict) -> str:
+        objective = str(slots.get("objective", "") or "this payout run")
+        date_from = str(slots.get("date_from", "") or "")
+        date_to = str(slots.get("date_to", "") or "")
+        risk = slots.get("risk_tolerance")
+        candidates = slots.get("candidates") if isinstance(slots.get("candidates"), list) else []
+        beneficiary_count = len(candidates)
+
+        first_name = ""
+        first_amount = None
+        if candidates and isinstance(candidates[0], dict):
+            first_name = str(candidates[0].get("beneficiary_name", "") or "")
+            first_amount = candidates[0].get("amount")
+
+        summary_parts = [objective]
+        if date_from and date_to:
+            summary_parts.append(f"{date_from} to {date_to}")
+        if risk is not None:
+            summary_parts.append(f"risk tolerance {risk}")
+
+        summary = ", ".join(summary_parts)
+        if beneficiary_count == 1 and first_name:
+            amount_text = ""
+            try:
+                if first_amount is not None:
+                    amount_text = f" for {float(first_amount):,.0f} NGN"
+            except (TypeError, ValueError):
+                amount_text = ""
+            return (
+                f"I've got everything I need for {summary}. "
+                f"The beneficiary is {first_name}{amount_text}. Should I go ahead?"
+            )
+
+        return (
+            f"I've got everything I need for {summary}, with {beneficiary_count} "
+            f"beneficiar{'y' if beneficiary_count == 1 else 'ies'}. Should I go ahead?"
+        )

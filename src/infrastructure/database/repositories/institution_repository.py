@@ -71,6 +71,26 @@ class InstitutionRepository:
         rows = list((await self._session.execute(rows_stmt)).scalars().all())
         return rows, total
 
+    async def get_all_active_rows(
+        self,
+        search: Optional[str] = None,
+        institution_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[InstitutionModel]:
+        """Convenience wrapper for callers that only need institution rows.
+
+        This avoids tuple/list mixups at call sites that do alias resolution and
+        never use the total count.
+        """
+        rows, _total = await self.get_all_active(
+            search=search,
+            institution_type=institution_type,
+            limit=limit,
+            offset=offset,
+        )
+        return rows
+
     async def get_by_code(self, code: str) -> InstitutionModel | None:
         stmt = select(InstitutionModel).where(
             InstitutionModel.institution_code == code

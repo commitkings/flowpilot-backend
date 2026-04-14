@@ -286,6 +286,13 @@ _FLOW_BREAK_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Mid–payout-run corrections (Tier 0b) — avoids Tier 2 "no keywords" dead-end
+_PAYOUT_FLOW_CORRECTION_PATTERN = re.compile(
+    r"\b(?:sorry|actually|i\s+meant|my\s+bad|correction|correct\s+that|"
+    r"wrong\s+name|change\s+(?:it\s+)?to|spell(?:ing)?|the\s+name\s+should\s+be)\b",
+    re.IGNORECASE,
+)
+
 
 def _tier0_slot_fill_detect(message: str) -> Optional[IntentResult]:
     """
@@ -595,6 +602,23 @@ class IntentService:
                     f"(conf={tier0.confidence:.2f}) for: '{message[:50]}'"
                 )
                 return tier0
+            stripped = message.strip()
+            if (
+                stripped
+                and len(stripped) <= 160
+                and _PAYOUT_FLOW_CORRECTION_PATTERN.search(stripped)
+            ):
+                correction = IntentResult(
+                    intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+                    confidence=0.88,
+                    reasoning="Tier 0b: payout-flow clarification or name correction",
+                    tier=0,
+                )
+                logger.info(
+                    f"Intent [T0b]: {correction.intent.value} "
+                    f"(conf={correction.confidence:.2f}) for: '{message[:50]}'"
+                )
+                return correction
 
         # ── Tier 1: Deterministic fast-path ──
         tier1 = _tier1_classify(message)
