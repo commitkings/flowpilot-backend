@@ -143,6 +143,14 @@ async def get_api_key_context(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Reject expired keys
+    if matched.expires_at and matched.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     # Best-effort update of last_used_at (never fails the request)
     try:
         await session.execute(

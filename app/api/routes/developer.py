@@ -21,7 +21,7 @@ import hashlib
 import hmac
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -46,6 +46,7 @@ VALID_SCOPES = {
     "runs:write",
     "transactions:read",
     "audit:read",
+    "approvals:read",
     "approvals:write",
 }
 
@@ -94,7 +95,7 @@ class ApiKeyOut(BaseModel):
     prefix: str          # first 10 chars of raw key
     scopes: list[str]
     last_used_at: Optional[str]
-    expires_at: Optional[str]   # not yet implemented — always null
+    expires_at: Optional[str]
     created_at: str
 
 
@@ -120,7 +121,7 @@ def _serialize_key(k: ApiKeyModel) -> ApiKeyOut:
         prefix=k.key_prefix,
         scopes=list(k.scopes or []),
         last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
-        expires_at=None,
+        expires_at=k.expires_at.isoformat() if k.expires_at else None,
         created_at=k.created_at.isoformat(),
     )
 
@@ -160,6 +161,10 @@ async def create_api_key(
     business_id = await _get_business_id(current_user, session)
     raw_key, key_prefix, key_hash = generate_api_key()
 
+    expires_at = None
+    if body.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
     api_key = ApiKeyModel(
         business_id=business_id,
         created_by=current_user.id,
@@ -167,6 +172,7 @@ async def create_api_key(
         key_prefix=key_prefix,
         key_hash=key_hash,
         scopes=body.scopes,
+        expires_at=expires_at,
     )
     session.add(api_key)
     await session.commit()
@@ -178,7 +184,7 @@ async def create_api_key(
         prefix=api_key.key_prefix,
         scopes=list(api_key.scopes or []),
         last_used_at=None,
-        expires_at=None,
+        expires_at=api_key.expires_at.isoformat() if api_key.expires_at else None,
         created_at=api_key.created_at.isoformat(),
         raw_key=raw_key,
     )

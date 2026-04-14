@@ -686,6 +686,31 @@ class RunOrchestrator:
                 logger.warning(
                     f"Run {run_id}: {skipped} candidates skipped (missing candidate_id)"
                 )
+
+            # Fire candidate.flagged for any high-risk blocked candidates
+            business_id_str = state.get("business_id")
+            if business_id_str:
+                flagged = [
+                    c for c in state["scored_candidates"]
+                    if c.get("risk_decision") == "block"
+                ]
+                if flagged:
+                    try:
+                        import asyncio as _asyncio
+                        from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                        business_uuid_wh = uuid.UUID(str(business_id_str))
+                        for c in flagged:
+                            _asyncio.create_task(_dispatch(business_uuid_wh, "candidate.flagged", {
+                                "run_id": str(run_id),
+                                "candidate_id": c.get("candidate_id"),
+                                "beneficiary_name": c.get("beneficiary_name"),
+                                "amount": c.get("amount"),
+                                "risk_score": c.get("risk_score"),
+                                "risk_reasons": c.get("risk_reasons", []),
+                            }))
+                    except Exception as _wh_exc:
+                        logger.warning(f"Run {run_id}: candidate.flagged webhook failed: {_wh_exc}")
+
             return False
 
         elif step_name == "execute":
@@ -813,6 +838,32 @@ class RunOrchestrator:
                 msg = f"execution persist for {candidate_id}: {e}"
                 logger.warning(f"Run {run_id}: {msg}")
                 persist_errors.append(msg)
+
+        # Fire payout.succeeded / payout.failed webhooks for each executed candidate
+        business_id_str = state.get("business_id")
+        if business_id_str:
+            try:
+                import asyncio as _asyncio
+                from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                business_uuid_wh = uuid.UUID(str(business_id_str))
+                for er in state.get("candidate_execution_results", []):
+                    exec_status = er.get("execution_status", "pending")
+                    if exec_status == "success":
+                        _asyncio.create_task(_dispatch(business_uuid_wh, "payout.succeeded", {
+                            "run_id": str(run_id),
+                            "candidate_id": er.get("candidate_id"),
+                            "amount": er.get("amount"),
+                            "provider_reference": er.get("provider_reference"),
+                        }))
+                    elif exec_status == "failed":
+                        _asyncio.create_task(_dispatch(business_uuid_wh, "payout.failed", {
+                            "run_id": str(run_id),
+                            "candidate_id": er.get("candidate_id"),
+                            "amount": er.get("amount"),
+                            "reason": er.get("response_message") or "execution_failed",
+                        }))
+            except Exception as _wh_exc:
+                logger.warning(f"Run {run_id}: payout webhook dispatch failed: {_wh_exc}")
 
         # Propagate critical persistence failures to state so run doesn't silently complete
         if persist_errors:

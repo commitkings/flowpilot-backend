@@ -16,7 +16,7 @@ each fire and scheduling silently stops.
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -149,18 +149,107 @@ async def _dispatch_loop() -> None:
             await asyncio.sleep(10)
 
 
+_expiry_task: Optional[asyncio.Task] = None
+
+# Days before expiry on which to send warning emails (sent once per threshold crossed)
+_EXPIRY_WARN_DAYS = {7, 3, 1}
+
+
+async def _check_api_key_expiry() -> None:
+    """Daily loop: email business owners about API keys expiring in 7, 3, or 1 day(s)."""
+    from src.infrastructure.database.connection import get_session_factory
+    from src.infrastructure.database.flowpilot_models import (
+        ApiKeyModel,
+        BusinessMemberModel,
+        UserModel,
+    )
+    from sqlalchemy import select
+
+    logger.info("[Scheduler] API key expiry check loop started")
+
+    while True:
+        try:
+            await asyncio.sleep(86_400)  # run once per day
+            now = datetime.now(timezone.utc)
+
+            async with get_session_factory()() as session:
+                # Load all active, non-revoked keys that have an expiry date
+                result = await session.execute(
+                    select(ApiKeyModel).where(
+                        ApiKeyModel.revoked_at.is_(None),
+                        ApiKeyModel.expires_at.isnot(None),
+                        ApiKeyModel.expires_at > now,
+                    )
+                )
+                keys = result.scalars().all()
+
+                for key in keys:
+                    days_left = (key.expires_at - now).days
+
+                    if days_left not in _EXPIRY_WARN_DAYS:
+                        continue
+
+                    # Find the business owner's email
+                    owner_result = await session.execute(
+                        select(UserModel)
+                        .join(
+                            BusinessMemberModel,
+                            BusinessMemberModel.user_id == UserModel.id,
+                        )
+                        .where(
+                            BusinessMemberModel.business_id == key.business_id,
+                            BusinessMemberModel.role == "owner",
+                        )
+                        .limit(1)
+                    )
+                    owner = owner_result.scalars().first()
+                    if not owner or not owner.email:
+                        continue
+
+                    display_name = (
+                        owner.display_name or owner.email.split("@")[0]
+                    )
+
+                    from src.services.email_service import send_api_key_expiry_warning
+                    await send_api_key_expiry_warning(
+                        to=owner.email,
+                        display_name=display_name,
+                        key_name=key.name,
+                        key_prefix=key.key_prefix,
+                        days_remaining=days_left,
+                    )
+                    logger.info(
+                        "[Scheduler] Sent expiry warning for key %s (%d days left) to %s",
+                        key.id,
+                        days_left,
+                        owner.email,
+                    )
+
+        except asyncio.CancelledError:
+            logger.info("[Scheduler] API key expiry check loop cancelled")
+            break
+        except Exception as exc:
+            logger.exception("[Scheduler] Error in API key expiry check: %s", exc)
+            await asyncio.sleep(60)
+
+
 def start_scheduler() -> None:
     """Start the background dispatch loop. Call once from app lifespan."""
-    global _task
-    if _task is not None and not _task.done():
-        return
-    _task = asyncio.create_task(_dispatch_loop())
-    logger.info("[Scheduler] Background task created")
+    global _task, _expiry_task
+    if _task is None or _task.done():
+        _task = asyncio.create_task(_dispatch_loop())
+        logger.info("[Scheduler] Background task created")
+    if _expiry_task is None or _expiry_task.done():
+        _expiry_task = asyncio.create_task(_check_api_key_expiry())
+        logger.info("[Scheduler] API key expiry task created")
 
 
 def stop_scheduler() -> None:
     """Cancel the background dispatch loop. Call from app shutdown."""
-    global _task
+    global _task, _expiry_task
     if _task and not _task.done():
         _task.cancel()
         logger.info("[Scheduler] Background task cancelled")
+    if _expiry_task and not _expiry_task.done():
+        _expiry_task.cancel()
+        logger.info("[Scheduler] API key expiry task cancelled")
