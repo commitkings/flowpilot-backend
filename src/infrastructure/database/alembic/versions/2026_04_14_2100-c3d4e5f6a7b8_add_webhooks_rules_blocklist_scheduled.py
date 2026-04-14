@@ -1,7 +1,7 @@
 """add webhook, approval_rule, blocklist_entry, scheduled_run tables
 
-Revision ID: c3d4e5f6a7b8
-Revises: b2c3d4e5f6a7
+Revision ID: aa0414200003
+Revises: aa0414200002
 Create Date: 2026-04-14 21:00:00.000000
 
 """
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
-revision: str = "c3d4e5f6a7b8"
-down_revision: str | None = "b2c3d4e5f6a7"
+revision: str = "aa0414200003"
+down_revision: str | None = "aa0414200002"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
