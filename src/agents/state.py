@@ -53,3 +53,13 @@ class AgentState(TypedDict, total=False):
     # Tool-use observability: accumulated tool call records per run
     # Each entry: {agent_type, tool_name, arguments, success, duration_ms, iteration}
     tool_call_log: list[dict]
+
+    # Inter-agent communication scratchpad
+    # Each entry: {agent, type, message, severity, data}
+    # Agents can write findings, warnings, and signals for downstream agents
+    agent_scratchpad: list[dict]
+
+    # Data quality flags raised by agents about upstream data issues
+    # Each entry: {source, flag, detail, severity}
+    # Example: reconciliation raises "transaction_data_unavailable" when API returns 401
+    data_quality_flags: list[dict]

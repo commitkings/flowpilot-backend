@@ -1,9 +1,9 @@
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 from uuid import UUID
 
 from groq import AsyncGroq
@@ -38,6 +38,48 @@ def _normalize_agent_type(name: str) -> str:
 
 
 MAX_REACT_ITERATIONS = 15
+MAX_VALIDATION_RETRIES = 2
+
+
+@runtime_checkable
+class OutputValidator(Protocol):
+    """Protocol for validating agent outputs before acceptance."""
+
+    def validate(self, output: str) -> tuple[bool, str]:
+        """Return (is_valid, error_message). Empty error_message if valid."""
+        ...
+
+
+class JsonSchemaValidator:
+    """Validates that output is parseable JSON with expected top-level keys."""
+
+    def __init__(self, required_keys: list[str] | None = None) -> None:
+        self.required_keys = required_keys or []
+
+    def validate(self, output: str) -> tuple[bool, str]:
+        # Strip markdown fences if present
+        stripped = output.strip()
+        if stripped.startswith("```"):
+            fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
+            if fence_match:
+                stripped = fence_match.group(1).strip()
+
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            return False, f"Invalid JSON: {e}"
+
+        if not isinstance(data, dict):
+            return False, f"Expected a JSON object, got {type(data).__name__}"
+
+        if self.required_keys:
+            missing = [k for k in self.required_keys if k not in data]
+            if missing:
+                return False, f"Missing required keys: {missing}"
+
+        return True, ""
+
+
 REACT_SYSTEM_SUFFIX = """
 
 ## Tool Use Protocol
@@ -89,6 +131,7 @@ class BaseAgent:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         max_iterations: int = MAX_REACT_ITERATIONS,
+        output_validator: Optional[OutputValidator] = None,
     ) -> str:
         model = model or Settings.GROQ_LLM_MODEL
         full_system = system_prompt + REACT_SYSTEM_SUFFIX
@@ -100,12 +143,14 @@ class BaseAgent:
 
         tools_schema = self.registry.to_llm_tools() if self.registry.tools else None
         iteration = 0
+        validation_retries = 0
 
         log_agent_event(self.name, "react_start", {
             "model": model,
             "max_iterations": max_iterations,
             "tools_count": len(self.registry.tools) if self.registry.tools else 0,
             "prompt_preview": user_prompt[:200],
+            "has_validator": output_validator is not None,
         })
 
         while iteration < max_iterations:
@@ -152,9 +197,38 @@ class BaseAgent:
             tool_calls = parse_tool_calls_from_response(msg)
             if not tool_calls:
                 final_content = msg.content or ""
+
+                # ── Output validation gate ──
+                if output_validator and validation_retries < MAX_VALIDATION_RETRIES:
+                    is_valid, error_msg = output_validator.validate(final_content)
+                    if not is_valid:
+                        validation_retries += 1
+                        log_agent_event(self.name, "react_validation_failed", {
+                            "retry": validation_retries,
+                            "max_retries": MAX_VALIDATION_RETRIES,
+                            "error": error_msg,
+                            "output_preview": final_content[:200],
+                        })
+                        logger.warning(
+                            f"[{self.name}] Output validation failed (retry {validation_retries}/{MAX_VALIDATION_RETRIES}): {error_msg}"
+                        )
+                        # Inject correction feedback and let the loop continue
+                        messages.append({"role": "assistant", "content": final_content})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"Your output is INVALID and was rejected by the validation system.\n"
+                                f"Error: {error_msg}\n\n"
+                                f"Please fix your response and try again. "
+                                f"Respond with ONLY the corrected output."
+                            ),
+                        })
+                        continue  # Re-enter the ReAct loop
+
                 log_agent_event(self.name, "react_complete", {
                     "iterations": iteration,
                     "result_length": len(final_content),
+                    "validation_retries": validation_retries,
                 })
                 logger.info(f"[{self.name}] ReAct concluded after {iteration} iteration(s)")
                 return final_content
@@ -186,6 +260,7 @@ class BaseAgent:
 
         log_agent_event(self.name, "react_max_iterations", {
             "iterations": max_iterations,
+            "validation_retries": validation_retries,
         })
         logger.warning(f"[{self.name}] ReAct hit max iterations ({max_iterations})")
         last_content = ""
@@ -203,11 +278,13 @@ class BaseAgent:
         temperature: float = 0.0,
         max_tokens: int = 4096,
         max_iterations: int = MAX_REACT_ITERATIONS,
+        required_keys: list[str] | None = None,
     ) -> str:
         json_instruction = (
             "\n\nIMPORTANT: When you are ready to give your final answer (after using tools), "
             "respond with ONLY a valid JSON object. No markdown, no explanation — just the JSON."
         )
+        validator = JsonSchemaValidator(required_keys=required_keys)
         raw = await self.reason_and_act(
             system_prompt=system_prompt,
             user_prompt=user_prompt + json_instruction,
@@ -215,6 +292,7 @@ class BaseAgent:
             temperature=temperature,
             max_tokens=max_tokens,
             max_iterations=max_iterations,
+            output_validator=validator,
         )
         return self._extract_json(raw)
 

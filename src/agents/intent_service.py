@@ -214,6 +214,193 @@ def _tier1_classify(message: str) -> Optional[IntentResult]:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────
+# Tier 0: Flow-Aware Slot-Fill Detection (bypass LLM entirely)
+# ─────────────────────────────────────────────────────────────────
+
+# Date-like pattern: YYYY-MM-DD, DD/MM/YYYY, or natural like "March 2025"
+# Strict: only date string, used for pure date-only messages
+_DATE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}"
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Date-in-context: message contains a date even with surrounding words
+# Matches "use April 1st 2026", "maybe April 30th sha", "let's do 01/04/2026"
+_DATE_IN_CONTEXT_PATTERN = re.compile(
+    r"(?:"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)(?:\s*,?\s*\d{4})?"
+    r"|\d{1,2}(?:st|nd|rd|th)\s+(?:of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?"
+    r")",
+    re.IGNORECASE,
+)
+
+# Amount-like pattern: "500k", "1.5m", "₦200,000", "50000", "naira 500000"
+_AMOUNT_PATTERN = re.compile(
+    r"^\s*(?:₦|ngn|naira)?\s*\d[\d,]*(?:\.\d+)?\s*[kKmMbB]?\s*$",
+    re.IGNORECASE,
+)
+
+# Name-like pattern: 2-5 capitalized words ("MICHAEL JOHN DOE", "Jane Doe")
+_NAME_PATTERN = re.compile(
+    r"^\s*[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){1,5}\s*$"
+)
+
+# Bank/institution mention
+_BANK_KEYWORDS = {
+    "bank", "gtbank", "gtb", "access", "zenith", "uba", "firstbank",
+    "first bank", "fidelity", "sterling", "wema", "stanbic", "polaris",
+    "keystone", "fcmb", "union", "ecobank", "heritage", "jaiz",
+    "providus", "titan", "globus", "suntrust", "citi", "standard",
+    "guaranty", "guarantee",
+}
+
+# Risk tolerance pattern: "0.35", "use 0.45", "set it to 0.5"
+_RISK_TOLERANCE_PATTERN = re.compile(
+    r"^\s*(?:use\s+|set\s+(?:it\s+)?(?:to\s+)?|try\s+)?(?:0\.\d+|1\.0|0|1)\s*$",
+    re.IGNORECASE,
+)
+
+# Account number pattern: exactly 10 digits possibly with leading text
+_ACCOUNT_NUMBER_PATTERN = re.compile(
+    r"(?:^|\s)\d{10}(?:\s|$)"
+)
+
+# "No budget cap" or similar negation
+_NO_BUDGET_PATTERN = re.compile(
+    r"\b(?:no|none|skip|without|don'?t\s+(?:need|want|set))\b.*\b(?:budget|cap|limit)\b",
+    re.IGNORECASE,
+)
+
+# Explicit flow-breaking intents that should NOT be caught by Tier 0
+_FLOW_BREAK_PATTERNS = re.compile(
+    r"\b(?:status|how\s+does|what\s+is|explain|cancel|stop|nevermind|never\s+mind)\b",
+    re.IGNORECASE,
+)
+
+
+def _tier0_slot_fill_detect(message: str) -> Optional[IntentResult]:
+    """
+    Tier 0: When the user is in an active payout flow, detect obvious slot-fill
+    messages and bypass classification entirely.
+
+    Returns IntentResult(CREATE_PAYOUT_RUN, tier=0) if the message looks like
+    a slot fill, None otherwise.
+    """
+    stripped = message.strip()
+    if not stripped:
+        return None
+
+    # Don't intercept flow-breaking messages
+    if _FLOW_BREAK_PATTERNS.search(stripped):
+        return None
+
+    # Date fill
+    if _DATE_PATTERN.match(stripped):
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.95,
+            reasoning=f"Tier 0: Date slot fill detected: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # Date-in-context fill ("use April 1st 2026", "maybe April 30th sha")
+    if _DATE_IN_CONTEXT_PATTERN.search(stripped):
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.90,
+            reasoning=f"Tier 0: Date slot fill detected in context: '{stripped[:40]}'",
+            tier=0,
+        )
+
+    # Amount fill
+    if _AMOUNT_PATTERN.match(stripped):
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.95,
+            reasoning=f"Tier 0: Amount slot fill detected: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # Risk tolerance fill
+    if _RISK_TOLERANCE_PATTERN.match(stripped):
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.90,
+            reasoning=f"Tier 0: Risk tolerance slot fill: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # Account number fill (10-digit number in message)
+    if _ACCOUNT_NUMBER_PATTERN.search(stripped) and len(stripped) < 60:
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.90,
+            reasoning=f"Tier 0: Account number fill detected: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # "No budget cap" or similar
+    if _NO_BUDGET_PATTERN.search(stripped):
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.90,
+            reasoning=f"Tier 0: Budget cap negation: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # Bank/institution mention ("use gt bank", "access bank", etc.)
+    normalized_words = set(_normalize(stripped).split())
+    if normalized_words & _BANK_KEYWORDS and len(normalized_words) <= 6:
+        return IntentResult(
+            intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+            confidence=0.90,
+            reasoning=f"Tier 0: Bank/institution slot fill: '{stripped[:30]}'",
+            tier=0,
+        )
+
+    # Name-like pattern ("MICHAEL JOHN DOE", "Jane Doe") — only if short
+    if _NAME_PATTERN.match(stripped) and len(stripped) < 80:
+        # Additional check: not a common phrase or greeting
+        lower = stripped.lower()
+        if lower not in _GREETING_PATTERNS and lower not in _FAREWELL_PATTERNS:
+            return IntentResult(
+                intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+                confidence=0.85,
+                reasoning=f"Tier 0: Name slot fill detected: '{stripped[:30]}'",
+                tier=0,
+            )
+
+    # Short objective-like text (1-6 words with financial keywords)
+    words = stripped.split()
+    if 1 <= len(words) <= 6:
+        lower_words = {w.lower() for w in words}
+        objective_keywords = {
+            "salary", "salaries", "payroll", "vendor", "vendors",
+            "contractor", "contractors", "payment", "payments",
+            "settlement", "settlements", "commission", "commissions",
+            "bonus", "bonuses", "stipend", "stipends", "wages",
+            "reimbursement", "disbursement",
+        }
+        if lower_words & objective_keywords:
+            return IntentResult(
+                intent=FlowPilotIntent.CREATE_PAYOUT_RUN,
+                confidence=0.85,
+                reasoning=f"Tier 0: Objective slot fill: '{stripped[:30]}'",
+                tier=0,
+            )
+
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Tier 2: Keyword Pre-Filter (skip LLM for non-financial messages)
 # ─────────────────────────────────────────────────────────────────────
@@ -237,6 +424,13 @@ _FINANCIAL_KEYWORDS: set[str] = {
     "account", "bank", "institution", "interswitch", "transaction",
     "transactions", "amount", "naira", "ngn", "balance", "wallet",
     "ledger", "anomaly", "fraud", "duplicate",
+    # Date/time words (so date replies don't get rejected by T2)
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "date", "start", "end", "from", "to", "period", "month", "year",
+    # Confirmation/flow words
+    "default", "proceed", "yes", "no", "none", "skip",
 }
 
 
@@ -378,17 +572,30 @@ class IntentService:
         self,
         message: str,
         history: Optional[list[dict]] = None,
+        active_intent: Optional[str] = None,
     ) -> IntentResult:
         """
-        Classify user intent through the 3-tier pipeline.
+        Classify user intent through the 4-tier pipeline.
 
         Args:
             message: The user's raw message text.
             history: Optional conversation history (list of {role, content} dicts).
+            active_intent: Current active intent from the chat session (e.g. "create_payout_run").
+                          When set, Tier 0 can bypass classification for obvious slot fills.
 
         Returns:
             IntentResult with intent, confidence, tier, and reasoning.
         """
+        # ── Tier 0: Flow-aware slot-fill detection (bypass everything) ──
+        if active_intent == "create_payout_run":
+            tier0 = _tier0_slot_fill_detect(message)
+            if tier0 is not None:
+                logger.info(
+                    f"Intent [T0]: {tier0.intent.value} "
+                    f"(conf={tier0.confidence:.2f}) for: '{message[:50]}'"
+                )
+                return tier0
+
         # ── Tier 1: Deterministic fast-path ──
         tier1 = _tier1_classify(message)
         if tier1 is not None:

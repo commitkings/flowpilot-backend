@@ -244,6 +244,8 @@ class Settings:
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL")
+    # Fast/cheap model for simple tasks (intent classification, slot extraction, response generation)
+    GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant")
 
     @property
     def groq_api_key(self) -> Optional[str]:

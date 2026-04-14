@@ -17,31 +17,154 @@ logger = logging.getLogger(__name__)
 _INSTITUTION_NAME_STOPWORDS = {"bank", "plc", "limited", "ltd", "nigeria", "nigerian"}
 _NON_NAME_TOKENS = {
     # Financial / domain terms
-    "salary", "salaries", "vendor", "vendors", "settlement", "settlements",
-    "payroll", "payment", "payments", "payout", "payouts", "budget", "risk",
-    "threshold", "reconcile", "reconciliation", "bank", "account", "amount",
-    "institution", "beneficiary", "candidate", "transaction", "naira",
+    "salary",
+    "salaries",
+    "vendor",
+    "vendors",
+    "settlement",
+    "settlements",
+    "payroll",
+    "payment",
+    "payments",
+    "payout",
+    "payouts",
+    "budget",
+    "risk",
+    "threshold",
+    "reconcile",
+    "reconciliation",
+    "bank",
+    "account",
+    "amount",
+    "institution",
+    "beneficiary",
+    "candidate",
+    "transaction",
+    "naira",
     # Months
-    "january", "february", "march", "april", "may", "june", "july",
-    "august", "september", "october", "november", "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
     # Common verbs and request words (critical: prevents "give me some suggestions" etc.)
-    "give", "get", "show", "list", "make", "run", "set", "use", "try",
-    "find", "check", "send", "create", "start", "help", "want", "need",
-    "tell", "update", "change", "pick", "select", "choose",
+    "give",
+    "get",
+    "show",
+    "list",
+    "make",
+    "run",
+    "set",
+    "use",
+    "try",
+    "find",
+    "check",
+    "send",
+    "create",
+    "start",
+    "help",
+    "want",
+    "need",
+    "tell",
+    "update",
+    "change",
+    "pick",
+    "select",
+    "choose",
     # Pronouns, determiners, and filler words
-    "me", "my", "i", "we", "our", "you", "your", "the", "a", "an",
-    "some", "any", "this", "that", "these", "those", "it", "its",
+    "me",
+    "my",
+    "i",
+    "we",
+    "our",
+    "you",
+    "your",
+    "the",
+    "a",
+    "an",
+    "some",
+    "any",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
     # Common adjectives/adverbs that aren't names
-    "new", "old", "good", "bad", "please", "just", "also", "more",
-    "other", "first", "last", "next", "all", "each", "every",
+    "new",
+    "old",
+    "good",
+    "bad",
+    "please",
+    "just",
+    "also",
+    "more",
+    "other",
+    "first",
+    "last",
+    "next",
+    "all",
+    "each",
+    "every",
     # Misc conversational words that could form multi-word phrases
-    "suggestions", "suggestion", "options", "option", "example", "examples",
-    "like", "about", "from", "with", "for", "what", "how", "which",
-    "said", "keep", "asking", "already", "gave", "told", "again",
-    "lol", "mean", "ok", "okay", "yes", "no", "not", "can", "could",
-    "would", "should", "will", "shall", "do", "does", "did", "done",
-    "is", "am", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "here", "there",
+    "suggestions",
+    "suggestion",
+    "options",
+    "option",
+    "example",
+    "examples",
+    "like",
+    "about",
+    "from",
+    "with",
+    "for",
+    "what",
+    "how",
+    "which",
+    "said",
+    "keep",
+    "asking",
+    "already",
+    "gave",
+    "told",
+    "again",
+    "lol",
+    "mean",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+    "not",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "shall",
+    "do",
+    "does",
+    "did",
+    "done",
+    "is",
+    "am",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "here",
+    "there",
 }
 
 VALID_INTENTS = [
@@ -145,15 +268,26 @@ Respond with ONLY a valid JSON object in this exact format:
 
 EXTRACT_SYSTEM_PROMPT = """You are a parameter extraction engine for FlowPilot payout run configuration.
 
-Given a user message and conversation context, extract any payout run parameters mentioned. Only extract what is explicitly stated or clearly implied — NEVER fabricate values.
+Given a user message and conversation context, extract any payout run parameters mentioned. Only extract what is explicitly stated or clearly implied. NEVER fabricate values.
 
 The parameters you can extract are:
 - objective (string): What the payout is for. E.g., "March salary payments", "vendor settlements Q1"
-- date_from (string, YYYY-MM-DD): Start date for transaction reconciliation period
-- date_to (string, YYYY-MM-DD): End date for transaction reconciliation period
-- risk_tolerance (number, 0.0-1.0): How strict to be with risk scoring. 0.0 = block everything suspicious, 1.0 = allow everything
-- budget_cap (number): Maximum total amount for the entire payout run
+- date_from (string, YYYY-MM-DD): Start date. Accept ANY date format the user gives ("April 1st 2026", "1/4/2026", "2026-04-01") and convert to YYYY-MM-DD.
+- date_to (string, YYYY-MM-DD): End date. Same format rules as date_from.
+- risk_tolerance (number, 0.0-1.0): How strict to be with risk scoring. 0.0 = block everything suspicious, 1.0 = allow everything. "use the default" means 0.35.
+- budget_cap (number): Maximum total amount for the entire payout run. If user says "no budget cap" or "none", set to null.
 - candidates (array of objects): Beneficiary list. Each object should have: institution_code, beneficiary_name, account_number, amount. Optional: currency (default NGN), purpose
+
+CRITICAL AMOUNT RULES:
+- ALWAYS expand shorthand amounts to their full numeric value:
+  "250k" = 250000, "1.5m" = 1500000, "500K" = 500000, "2M" = 2000000
+- "k" means thousands (x1,000), "m" means millions (x1,000,000)
+- NEVER return the abbreviated number (e.g. 250 for "250k" is WRONG, it must be 250000)
+
+CRITICAL DATE RULES:
+- Accept any human date format: "April 1st 2026", "1st April 2026", "april 2026", "01/04/2026", "2026-04-01"
+- Always convert to YYYY-MM-DD format in your output
+- If only month+year given, use the 1st as the day (e.g. "April 2026" = "2026-04-01")
 
 Respond with ONLY a valid JSON object:
 {
@@ -225,8 +359,18 @@ def _institution_alias_variants(value: str) -> set[str]:
     nickname_map = {
         "gtbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
         "gtb": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
-        "guarantytrustbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
-        "guaranteetrustbank": {"gtbank", "gtb", "guarantytrustbank", "guaranteetrustbank"},
+        "guarantytrustbank": {
+            "gtbank",
+            "gtb",
+            "guarantytrustbank",
+            "guaranteetrustbank",
+        },
+        "guaranteetrustbank": {
+            "gtbank",
+            "gtb",
+            "guarantytrustbank",
+            "guaranteetrustbank",
+        },
     }
     variants.update(nickname_map.get(normalized, set()))
     return {variant for variant in variants if variant}
@@ -251,8 +395,14 @@ def _build_institution_alias_map(institutions: list[Any]) -> dict[str, str]:
                 alias_map.setdefault(variant, institution.institution_code)
 
         institution_name = str(getattr(institution, "institution_name", "") or "")
-        tokens = [token for token in re.split(r"[^a-z0-9]+", institution_name.lower()) if token]
-        acronym = "".join(token[0] for token in tokens if token not in _INSTITUTION_NAME_STOPWORDS)
+        tokens = [
+            token
+            for token in re.split(r"[^a-z0-9]+", institution_name.lower())
+            if token
+        ]
+        acronym = "".join(
+            token[0] for token in tokens if token not in _INSTITUTION_NAME_STOPWORDS
+        )
         if len(acronym) >= 2:
             alias_map.setdefault(acronym, institution.institution_code)
             if "bank" in tokens:
@@ -461,7 +611,9 @@ def _build_intent_tools(
                 return {
                     "source_run_id": str(run.id),
                     "objective": run.objective,
-                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                    "created_at": run.created_at.isoformat()
+                    if run.created_at
+                    else None,
                     "candidate_count": len(rows),
                     "candidates": out,
                 }
@@ -596,7 +748,9 @@ class IntentAgent(BaseAgent):
             for tool in tools:
                 self.registry.register(tool)
 
-        classification = await self._classify_intent(user_message, history_for_llm)
+        classification = await self._classify_intent(
+            user_message, history_for_llm, current_intent=current_intent
+        )
         intent = classification.get("intent", "unclear")
         confidence = classification.get("confidence", 0.0)
 
@@ -624,13 +778,27 @@ class IntentAgent(BaseAgent):
             for key, value in contextual_updates.items():
                 extracted[key] = value
 
+            # Validate and normalize extracted values deterministically
+            extracted = self._validate_and_normalize_slots(extracted)
+
         merged_slots = {**current_slots}
         for key, value in extracted.items():
-            if value is not None and value != "" and value != []:
-                merged_slots[key] = value
+            if value is None or value == "" or value == []:
+                continue
+
+            if key == "candidates":
+                merged_slots[key] = self._merge_candidates_slot(
+                    current_slots.get("candidates"),
+                    value,
+                )
+                continue
+
+            merged_slots[key] = value
 
         response_text = None
-        if intent == "create_payout_run" and not self._is_help_or_suggestion_request(user_message):
+        if intent == "create_payout_run" and not self._is_help_or_suggestion_request(
+            user_message
+        ):
             response_text = self._build_required_slot_prompt(merged_slots)
 
         if response_text is None:
@@ -642,9 +810,8 @@ class IntentAgent(BaseAgent):
                 business_id=business_id,
             )
 
-        should_confirm = (
-            intent == "create_payout_run"
-            and self._has_sufficient_slots(merged_slots)
+        should_confirm = intent == "create_payout_run" and self._has_sufficient_slots(
+            merged_slots
         )
 
         return {
@@ -666,11 +833,16 @@ class IntentAgent(BaseAgent):
         self,
         user_message: str,
         conversation_history: list[dict],
+        current_intent: Optional[str] = None,
     ) -> dict:
-        # ── Use the multi-layered IntentService (3-tier pipeline) ──
+        # ── Use the multi-layered IntentService (4-tier pipeline) ──
         try:
             service = IntentService()
-            result = await service.classify(user_message, history=conversation_history)
+            result = await service.classify(
+                user_message,
+                history=conversation_history,
+                active_intent=current_intent,
+            )
 
             intent_str = result.legacy_intent
             if intent_str not in VALID_INTENTS:
@@ -684,7 +856,9 @@ class IntentAgent(BaseAgent):
                 "_raw_intent": result.intent.value,
             }
         except Exception as e:
-            logger.warning(f"[IntentAgent] IntentService failed, falling back to legacy: {e}")
+            logger.warning(
+                f"[IntentAgent] IntentService failed, falling back to legacy: {e}"
+            )
 
         # ── Fallback: legacy single-shot LLM classification ──
         history_text = self._format_history(conversation_history, max_turns=6)
@@ -696,13 +870,11 @@ Latest user message: "{user_message}"
 
 Classify the intent of the latest user message."""
 
-        FAST_MODEL = "llama-3.1-8b-instant"
-
         raw = await self.llm_json_call(
             system_prompt=CLASSIFY_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.0,
-            model=FAST_MODEL,
+            model=Settings.GROQ_LLM_MODEL_FAST,
         )
 
         try:
@@ -741,7 +913,7 @@ Extract any NEW payout run parameters from the latest message. Do not re-extract
             system_prompt=EXTRACT_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.0,
-            model="llama-3.1-8b-instant",
+            model=Settings.GROQ_LLM_MODEL_FAST,
         )
 
         try:
@@ -784,6 +956,9 @@ Current intent: {intent}
 IMPORTANT: The user has ALREADY provided the parameters listed above. Do NOT ask for any of them again. Only ask for missing parameters.
 Generate your response to the user. Use tools if you need to look up business info or validate anything."""
 
+        # NOTE: _generate_response uses reason_and_act with tools (ReAct loop).
+        # The 8B model cannot handle tool-calling properly — it leaks raw
+        # <function=...> syntax into the response. Use 70B here.
         response = await self.reason_and_act(
             system_prompt=RESPONSE_SYSTEM_PROMPT,
             user_prompt=user_prompt,
@@ -856,9 +1031,9 @@ Generate your response to the user. Use tools if you need to look up business in
             return f"I still need the {detail}. Can you share that?"
 
         if not slots.get("date_from"):
-            return "What start date should I use for this payout run? Please send it as YYYY-MM-DD."
+            return "What start date should I use for this payout run? Something like 'April 1st' or '01/04/2026' works fine."
         if not slots.get("date_to"):
-            return "What end date should I use for this payout run? Please send it as YYYY-MM-DD."
+            return "And what end date? Same format, anything you're comfortable with."
         if slots.get("risk_tolerance") is None:
             return (
                 "What risk tolerance should I use, between 0.0 and 1.0? "
@@ -899,6 +1074,160 @@ Generate your response to the user. Use tools if you need to look up business in
             if amount_value <= 0:
                 missing.append(f"amount for {label}")
         return missing
+
+    # ------------------------------------------------------------------
+    # Slot value validation and normalization
+    # ------------------------------------------------------------------
+
+    def _validate_and_normalize_slots(self, extracted: dict) -> dict:
+        """Parse and validate extracted slot values deterministically.
+
+        This ensures:
+        - Amounts like '500k', '1.5m', '₦200,000' are parsed to numbers
+        - Dates are valid YYYY-MM-DD strings
+        - Risk tolerance is clamped to [0.0, 1.0]
+        - Candidate amounts get the same treatment
+        """
+        normalized = dict(extracted)
+
+        # Normalize budget_cap
+        if "budget_cap" in normalized:
+            parsed = self._parse_amount(normalized["budget_cap"])
+            if parsed is not None:
+                normalized["budget_cap"] = parsed
+            else:
+                # Remove invalid value so it doesn't overwrite a good one
+                del normalized["budget_cap"]
+
+        # Normalize dates
+        for date_key in ("date_from", "date_to"):
+            if date_key in normalized:
+                parsed = self._parse_date(normalized[date_key])
+                if parsed:
+                    normalized[date_key] = parsed
+                else:
+                    del normalized[date_key]
+
+        # Clamp risk tolerance
+        if "risk_tolerance" in normalized:
+            try:
+                rt = float(normalized["risk_tolerance"])
+                normalized["risk_tolerance"] = max(0.0, min(1.0, rt))
+            except (TypeError, ValueError):
+                del normalized["risk_tolerance"]
+
+        # Normalize candidate amounts
+        if "candidates" in normalized and isinstance(normalized["candidates"], list):
+            for candidate in normalized["candidates"]:
+                if not isinstance(candidate, dict):
+                    continue
+                raw_amount = candidate.get("amount")
+                if raw_amount is not None:
+                    parsed = self._parse_amount(raw_amount)
+                    if parsed is not None:
+                        candidate["amount"] = parsed
+
+        return normalized
+
+    @staticmethod
+    def _parse_amount(value) -> Optional[float]:
+        """Parse a human-friendly amount into a float.
+
+        Handles: 500000, '500k', '1.5m', '₦200,000', '50000.50', 'naira 500k'
+        Returns None if unparseable.
+        """
+        if isinstance(value, (int, float)):
+            return float(value) if float(value) > 0 else None
+
+        if not isinstance(value, str):
+            return None
+
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+
+        # Remove currency prefixes
+        cleaned = re.sub(r'^[₦$]?\s*', '', cleaned)
+        cleaned = re.sub(r'^(?:ngn|naira)\s*', '', cleaned, flags=re.IGNORECASE)
+
+        # Remove commas
+        cleaned = cleaned.replace(',', '')
+
+        # Extract multiplier suffix
+        multiplier = 1.0
+        suffix_match = re.search(r'([kKmMbB])\s*$', cleaned)
+        if suffix_match:
+            suffix = suffix_match.group(1).lower()
+            multiplier = {'k': 1_000, 'm': 1_000_000, 'b': 1_000_000_000}[suffix]
+            cleaned = cleaned[:suffix_match.start()].strip()
+
+        try:
+            result = float(cleaned) * multiplier
+            return result if result > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _parse_date(value) -> Optional[str]:
+        """Parse a date string and normalize to YYYY-MM-DD.
+
+        Handles: '2025-02-01', '01/02/2025', 'February 2025', '1st February 2025'
+        Returns None if invalid.
+        """
+        if not isinstance(value, str):
+            return None
+
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+
+        # Already YYYY-MM-DD?
+        iso_match = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', cleaned)
+        if iso_match:
+            try:
+                from datetime import date
+                d = date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+                return d.isoformat()
+            except ValueError:
+                return None
+
+        # DD/MM/YYYY or DD-MM-YYYY
+        dmy_match = re.fullmatch(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', cleaned)
+        if dmy_match:
+            try:
+                from datetime import date
+                d = date(int(dmy_match.group(3)), int(dmy_match.group(2)), int(dmy_match.group(1)))
+                return d.isoformat()
+            except ValueError:
+                return None
+
+        # Month-name formats: "February 2025", "1st February 2025"
+        month_names = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'may': 5, 'june': 6, 'july': 7, 'august': 8,
+            'september': 9, 'october': 10, 'november': 11, 'december': 12,
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+            'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+        }
+        lower = cleaned.lower()
+        for month_str, month_num in month_names.items():
+            if month_str in lower:
+                # Extract year
+                year_match = re.search(r'(\d{4})', lower)
+                if year_match:
+                    try:
+                        from datetime import date
+                        year = int(year_match.group(1))
+                        # Extract day if present
+                        day_match = re.search(r'(\d{1,2})(?:st|nd|rd|th)?', lower)
+                        day = int(day_match.group(1)) if day_match and int(day_match.group(1)) <= 31 else 1
+                        d = date(year, month_num, day)
+                        return d.isoformat()
+                    except ValueError:
+                        pass
+                break
+
+        return None
 
     _HELP_REQUEST_PATTERNS = re.compile(
         r"\b(give me|show me|suggest|suggestions?|options?|examples?|help me|what (?:can|should)|recommend)\b",
@@ -968,12 +1297,20 @@ Generate your response to the user. Use tools if you need to look up business in
             return updates
 
         candidates = current_slots.get("candidates")
-        if candidates is not None and (not isinstance(candidates, list) or len(candidates) != 1):
+        if candidates is not None and (
+            not isinstance(candidates, list) or len(candidates) != 1
+        ):
             return updates
-        if isinstance(candidates, list) and candidates and not isinstance(candidates[0], dict):
+        if (
+            isinstance(candidates, list)
+            and candidates
+            and not isinstance(candidates[0], dict)
+        ):
             return updates
 
-        candidate = dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
+        candidate = (
+            dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
+        )
         changed = False
 
         if not candidate.get("beneficiary_name"):
@@ -1020,9 +1357,13 @@ Generate your response to the user. Use tools if you need to look up business in
     def _extract_candidate_amount_from_message(
         self, user_message: str
     ) -> Optional[float]:
+        if self._looks_like_account_number_message(user_message):
+            return None
+
         stripped = user_message.strip()
+        # Pure amount message: "250k", "₦500,000", "1.5m"
         pure_amount = re.fullmatch(
-            r"(?:₦|ngn|naira)?\s*(\d[\d,]*(?:\.\d+)?)([kK])?\s*",
+            r"(?:₦|ngn|naira)?\s*(\d[\d,]*(?:\.\d+)?)([kKmMbB])?\s*",
             stripped,
             re.IGNORECASE,
         )
@@ -1031,32 +1372,91 @@ Generate your response to the user. Use tools if you need to look up business in
                 value = float(pure_amount.group(1).replace(",", ""))
             except ValueError:
                 return None
-            if pure_amount.group(2):
-                value *= 1000
+            suffix = (pure_amount.group(2) or "").lower()
+            multiplier = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(suffix, 1)
+            value *= multiplier
             return value if value > 0 else None
 
-        normalized = user_message.lower()
-        if not any(
+        # Amount embedded in context: "pay him 250k", "send 1.5m to vendor"
+        embedded = re.search(
+            r"(?:₦|ngn|naira)?\s*(\d[\d,]*(?:\.\d+)?)\s*([kKmMbB])?",
+            stripped,
+        )
+        if embedded:
+            normalized = user_message.lower()
+            # Only extract if there's a financial context marker
+            has_marker = any(
+                marker in normalized
+                for marker in ("amount", "naira", "ngn", "₦", "k", "m", "thousand", "million", "pay", "send", "disburse")
+            )
+            has_suffix = embedded.group(2) is not None
+            if has_marker or has_suffix:
+                try:
+                    value = float(embedded.group(1).replace(",", ""))
+                except ValueError:
+                    return None
+                suffix = (embedded.group(2) or "").lower()
+                multiplier = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(suffix, 1)
+                value *= multiplier
+                return value if value > 0 else None
+
+        return None
+
+    def _looks_like_account_number_message(self, user_message: str) -> bool:
+        normalized = user_message.strip().lower()
+        if not normalized:
+            return False
+
+        has_account_marker = any(
             marker in normalized
-            for marker in ("amount", "naira", "ngn", "₦", "k", "000")
+            for marker in (
+                "account number",
+                "acct number",
+                "account no",
+                "acct no",
+                "a/c",
+            )
+        )
+        if not has_account_marker:
+            return False
+
+        explicit_amount_markers = (
+            "amount",
+            "naira",
+            "ngn",
+            "₦",
+            "thousand",
+            "million",
+            "billion",
+        )
+        if any(marker in normalized for marker in explicit_amount_markers):
+            return False
+
+        return bool(re.search(r"\b\d{10}\b", user_message))
+
+    def _merge_candidates_slot(
+        self, current_candidates: Any, new_candidates: Any
+    ) -> list[dict]:
+        """Merge candidate updates without dropping already captured fields."""
+        if not isinstance(new_candidates, list) or not new_candidates:
+            return current_candidates if isinstance(current_candidates, list) else []
+
+        if (
+            isinstance(current_candidates, list)
+            and len(current_candidates) == 1
+            and isinstance(current_candidates[0], dict)
+            and len(new_candidates) == 1
+            and isinstance(new_candidates[0], dict)
         ):
-            return None
+            merged = dict(current_candidates[0])
+            for key, value in new_candidates[0].items():
+                if value is not None and value != "" and value != []:
+                    merged[key] = value
+            return [merged]
 
-        matches = re.findall(r"\d[\d,]*(?:\.\d+)?", user_message)
-        if not matches:
-            return None
+        return new_candidates
 
-        raw = matches[-1].replace(",", "")
-        try:
-            value = float(raw)
-        except ValueError:
-            return None
-
-        return value if value > 0 else None
-
-    def _extract_candidate_name_from_message(
-        self, user_message: str
-    ) -> Optional[str]:
+    def _extract_candidate_name_from_message(self, user_message: str) -> Optional[str]:
         patterns = [
             r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)(?:'s)?\s+name\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",
             r"(?:beneficiary|recipient|vendor|employee|staff|friend|contractor)\s+is\s+([A-Za-z][A-Za-z .'\-]{1,80})",

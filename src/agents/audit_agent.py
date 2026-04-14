@@ -42,10 +42,37 @@ Your job: perform deep analysis of the complete run data, audit risk decisions a
 - Is the risk threshold appropriately calibrated?
 - Are there patterns in failures that could improve future scoring?
 
+## CRITICAL: Executive Summary Guidelines
+The `executive_summary` field is the most important part of the report. It is shown prominently to the user.
+It MUST be detailed, specific, and actionable. NEVER write generic boilerplate.
+
+STYLE RULES (MANDATORY):
+- NEVER use em dashes (the long dash character). Use commas, periods, or semicolons instead.
+- NEVER mention technical details like API errors, HTTP status codes (401, 500), service names (Interswitch, BAV), or internal system names.
+- Write for a non-technical business owner. Use plain, clear language.
+- If bank verification failed, say "We could not confirm the account holder name with the bank" not "BAV returned 500".
+- If transaction data was unavailable, say "No recent bank transactions were found for this period" not "Transaction Search returned 401".
+- If it was a simulated run, say "This was a test run, no real money was sent."
+
+A GOOD executive summary includes:
+- The exact purpose and number of recipients (by name if 5 or fewer)
+- The total amount with currency symbol (use the Naira sign)
+- Each candidate's risk score vs the tolerance you set, and whether they passed
+- Whether account names were confirmed with the bank
+- Whether this was a test run or a real payout
+- Any issues found, in plain language
+- The overall result: did everything go well, or are there things to watch?
+
+Example of a GOOD executive summary:
+"This staff salary run processed a payment of N500,000.00 to 1 person (Michael John Doe, GTBank account ending in 000). The risk score came in at 0.17, which is below your 0.20 threshold, so they were approved automatically. We confirmed the account holder name with the bank and it matched. This was a test run, so no real money was sent. No recent bank transactions were found for the Feb 2025 period, which is expected for a new setup. All compliance checks passed."
+
+Example of a BAD executive summary (DO NOT write like this):
+"The FlowPilot run was executed with a 100% success rate. All candidates were approved and executed without any issues."
+
 ## Final answer format (JSON):
 {
   "audit_report": {
-    "executive_summary": "3-5 sentence overview of the run outcome and key findings",
+    "executive_summary": "Detailed, specific narrative with amounts, names, scores, and outcomes as described above",
     "run_metrics": {
       "total_transactions": 0,
       "total_candidates": 0,
@@ -280,10 +307,13 @@ def _build_audit_tools(state: AgentState, db_session=None) -> list[Tool]:
         }
 
     async def generate_executive_summary() -> dict[str, Any]:
-        candidates = state.get("scored_candidates", [])
-        exec_results = state.get("candidate_execution_results", [])
-        transactions = state.get("transactions", [])
-        ledger = state.get("reconciled_ledger", {})
+        candidates = state.get("scored_candidates") or []
+        exec_results = state.get("candidate_execution_results") or []
+        lookup_results = state.get("candidate_lookup_results") or []
+        transactions = state.get("transactions") or []
+        ledger = state.get("reconciled_ledger") or {}
+        risk_tolerance = state.get("risk_tolerance") or 0.35
+        batch_details = state.get("batch_details") or {}
 
         success_exec = sum(
             1 for er in exec_results if er.get("execution_status") == "success"
@@ -294,6 +324,60 @@ def _build_audit_tools(state: AgentState, db_session=None) -> list[Tool]:
         failed_exec = sum(
             1 for er in exec_results if er.get("execution_status") == "failed"
         )
+        total_amount = batch_details.get("total_amount", 0)
+
+        # Build per-candidate detail for the LLM to use
+        candidate_details = []
+        for c in candidates:
+            cid = c.get("candidate_id", "")
+            name = c.get("beneficiary_name", "Unknown")
+            score = c.get("risk_score", 0)
+            decision = c.get("risk_decision", "unknown")
+            amount = c.get("amount", 0)
+            institution = c.get("institution_code", "?")
+            account = c.get("account_number", "?")
+            reasons = c.get("risk_reasons", [])
+
+            # Find lookup result for this candidate
+            lookup = next(
+                (lr for lr in lookup_results if lr.get("candidate_id") == cid),
+                {},
+            )
+            lookup_status = lookup.get("lookup_status", "not_performed")
+            lookup_name = lookup.get("lookup_account_name", "")
+            match_score = lookup.get("lookup_match_score")
+
+            # Find execution result
+            exec_result = next(
+                (er for er in exec_results if er.get("candidate_id") == cid),
+                {},
+            )
+            exec_status = exec_result.get("execution_status", "not_executed")
+
+            candidate_details.append({
+                "name": name,
+                "amount": amount,
+                "institution": institution,
+                "account_masked": f"***{account[-3:]}" if len(account) >= 3 else account,
+                "risk_score": round(score, 2) if isinstance(score, (int, float)) else score,
+                "risk_tolerance": risk_tolerance,
+                "risk_decision": decision,
+                "risk_reasons": reasons if isinstance(reasons, list) else str(reasons).split("|"),
+                "score_vs_tolerance": f"{score:.2f} vs {risk_tolerance:.2f} threshold" if isinstance(score, (int, float)) else "?",
+                "lookup_status": lookup_status,
+                "lookup_name": lookup_name,
+                "name_match_score": match_score,
+                "execution_status": exec_status,
+            })
+
+        # Determine payout mode
+        bd = state.get("batch_details") or {}
+        payout_mode = "simulated" if bd.get("batch_reference", "").startswith("FP_") else "live"
+        # Check for data quality issues
+        dq_flags = state.get("data_quality_flags") or []
+        recon_degraded = any(
+            f.get("flag") == "transaction_data_unavailable" for f in dq_flags
+        )
 
         state_hash = hashlib.sha256(
             json.dumps(state, sort_keys=True, default=str).encode()
@@ -302,9 +386,12 @@ def _build_audit_tools(state: AgentState, db_session=None) -> list[Tool]:
         return {
             "run_id": state.get("run_id"),
             "objective": state.get("objective"),
+            "payout_mode": payout_mode,
+            "risk_tolerance_used": risk_tolerance,
+            "reconciliation_degraded": recon_degraded,
+            "total_bank_transactions": len(transactions),
+            "candidate_details": candidate_details,
             "metrics": {
-                "total_transactions_reconciled": len(transactions),
-                "ledger_summary": ledger,
                 "total_candidates_scored": len(candidates),
                 "total_approved": len(state.get("approved_candidate_ids", [])),
                 "total_rejected": len(state.get("rejected_candidate_ids", [])),
@@ -312,7 +399,10 @@ def _build_audit_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "execution_success": success_exec,
                 "execution_pending": pending_exec,
                 "execution_failed": failed_exec,
-                "success_rate": round(success_exec / max(len(exec_results), 1), 2),
+                "success_rate": round(
+                    (success_exec + pending_exec) / max(len(exec_results), 1), 2
+                ),
+                "total_amount_disbursed": total_amount,
             },
             "data_integrity_hash": state_hash,
             "generated_at": datetime.utcnow().isoformat(),

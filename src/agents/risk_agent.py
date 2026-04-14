@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 # ============================================================================
 # Default Risk Weights (can be overridden via business_config.preferences)
 # ============================================================================
@@ -65,8 +66,13 @@ RISK_SYSTEM_PROMPT = """You are a financial risk analyst reviewing pre-computed 
    - Call `cross_reference_beneficiaries` if name patterns look suspicious
    - Call `detect_round_number_bias` for suspiciously round amounts
 5. Call `compute_weighted_risk_score` for each candidate to get the computed weighted score
-6. Review the computed score and features. You may adjust the score by ±0.1 with written justification.
-7. Call `score_candidate` to finalize each candidate's risk assessment
+6. Call `score_candidate` to finalize each candidate. The system will use the COMPUTED score, not any score you provide. Your adjustment is limited to ±0.05 with written justification.
+
+## CRITICAL: Score Override Policy
+You CANNOT override the computed weighted score. The score from `compute_weighted_risk_score` is the base truth.
+- The `risk_score` parameter in `score_candidate` is IGNORED — the system uses the computed score.
+- You may provide an `adjustment` of at most ±0.05 with a mandatory written `adjustment_reason`.
+- The risk decision (allow/review/block) is determined by thresholds, not by you.
 
 ## Guardrails (you CANNOT override these — they are enforced by the system):
 - If amount > budget_cap: decision MUST be "block"
@@ -74,11 +80,11 @@ RISK_SYSTEM_PROMPT = """You are a financial risk analyst reviewing pre-computed 
 - If is_new_beneficiary AND amount_z_score > 3.0: decision MUST be "review" minimum
 
 ## Scoring Model:
-The weighted score is computed from features using business-specific weights.
+The weighted score is computed deterministically from features using business-specific weights.
 Each feature is normalized to 0-1 and multiplied by its weight.
-Your role is to REVIEW and EXPLAIN the score, not to guess a score yourself.
+Your role is to REVIEW and EXPLAIN the score. The system enforces the computed score.
 
-You may adjust the final score by ±0.1 if you identify factors the model missed, but you MUST provide written justification in risk_reasons.
+You may request a micro-adjustment of ±0.05 if you identify factors the model missed, but you MUST provide written justification in adjustment_reason. Adjustments without justification are silently discarded.
 
 ## Risk Criteria Explained:
 - **amount_z_score**: Z-score > 2.0 is notable, > 3.0 is high risk (unusually large/small amount)
@@ -719,6 +725,12 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         # Compute weighted score
         weighted_score = _compute_weighted_score(feature_values, risk_weights)
 
+        # Cache the computed score on the candidate for deterministic lookup by score_candidate
+        for c in candidates:
+            if c.get("candidate_id") == candidate_id:
+                c["_computed_weighted_score"] = weighted_score
+                break
+
         # Determine suggested decision based on thresholds
         allow_max = risk_thresholds.get("allow_max", 0.30)
         review_max = risk_thresholds.get("review_max", 0.60)
@@ -771,19 +783,60 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         """
         Finalize risk score and decision for a candidate.
 
+        The risk_score parameter is IGNORED. The system uses the score from
+        compute_weighted_risk_score. Adjustment is clamped to ±0.05.
+
         Args:
             candidate_id: The candidate to score
-            risk_score: Final risk score (0.0-1.0), typically from compute_weighted_risk_score
-            risk_decision: Decision (allow/review/block)
+            risk_score: (IGNORED) LLM-supplied score — replaced by computed score
+            risk_decision: (IGNORED for allow/block) Decision is computed from thresholds
             risk_reasons: Pipe-separated risk reasons
-            adjustment: Your adjustment to the computed score (±0.1 max)
+            adjustment: Your adjustment to the computed score (±0.05 max). Default 0.
             adjustment_reason: Justification for adjustment (required if adjustment != 0)
         """
-        # Clamp adjustment
-        adjustment = max(-0.1, min(0.1, adjustment))
+        # ── Retrieve the COMPUTED weighted score (ignore LLM-supplied risk_score) ──
+        computed_result = computed_features.get(candidate_id, {})
+        computed_normalized = computed_result.get("normalized", {})
 
-        # Apply adjustment
-        final_score = max(0.0, min(1.0, risk_score + adjustment))
+        # Look up the weighted score we already calculated
+        base_score: float | None = None
+        for c in candidates:
+            if c.get("candidate_id") == candidate_id:
+                # Check if compute_weighted_risk_score was previously called
+                # and the result was stored
+                base_score = c.get("_computed_weighted_score")
+                break
+
+        if base_score is None:
+            # Recompute if not cached (safety fallback)
+            score_data = await compute_weighted_risk_score(candidate_id)
+            if "error" in score_data:
+                base_score = 0.5  # Safe default
+                logger.warning(
+                    f"[RiskAgent] Could not compute weighted score for {candidate_id}, using default 0.5"
+                )
+            else:
+                base_score = score_data.get("weighted_score", 0.5)
+
+        # Log if LLM tried to override
+        if abs(risk_score - base_score) > 0.06:
+            logger.info(
+                f"[RiskAgent] LLM attempted score override for {candidate_id}: "
+                f"llm_score={risk_score:.4f}, computed_score={base_score:.4f} — using computed"
+            )
+
+        # Clamp adjustment to ±0.05 (tighter than before)
+        adjustment = max(-0.05, min(0.05, adjustment))
+
+        # Discard adjustment if no justification provided
+        if adjustment != 0 and not adjustment_reason.strip():
+            logger.info(
+                f"[RiskAgent] Adjustment {adjustment:+.3f} for {candidate_id} discarded: no justification"
+            )
+            adjustment = 0.0
+
+        # Apply adjustment to computed score
+        final_score = max(0.0, min(1.0, base_score + adjustment))
 
         # Parse reasons
         reasons = [r.strip() for r in risk_reasons.split("|") if r.strip()]
@@ -791,8 +844,19 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         # Add adjustment reason if applicable
         if adjustment != 0 and adjustment_reason:
             reasons.append(
-                f"Manual adjustment ({adjustment:+.2f}): {adjustment_reason}"
+                f"Manual adjustment ({adjustment:+.3f}): {adjustment_reason}"
             )
+
+        # ── Deterministic decision from thresholds ──
+        allow_max = risk_thresholds.get("allow_max", 0.30)
+        review_max = risk_thresholds.get("review_max", 0.60)
+
+        if final_score <= allow_max:
+            final_decision = "allow"
+        elif final_score <= review_max:
+            final_decision = "review"
+        else:
+            final_decision = "block"
 
         # Get features for guardrail check
         features = computed_features.get(candidate_id, {})
@@ -811,10 +875,10 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             "amount_z_score_raw": features.get("z_score", 0.0),
         }
 
-        # Apply guardrails
+        # Apply guardrails (these CAN override the decision upward)
         final_score, final_decision, guardrail_reasons = _apply_guardrails(
             final_score,
-            risk_decision,
+            final_decision,
             guardrail_features,
             float(budget_cap) if budget_cap else None,
             amount,
@@ -837,10 +901,12 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             "risk_score": round(final_score, 4),
             "risk_decision": final_decision,
             "risk_reasons": reasons,
-            "original_score": round(risk_score, 4),
+            "computed_score": round(base_score, 4),
+            "llm_supplied_score": round(risk_score, 4),
             "adjustment_applied": round(adjustment, 4),
             "guardrails_triggered": len(guardrail_reasons) > 0,
             "guardrail_reasons": guardrail_reasons,
+            "note": "risk_score is computed deterministically. LLM-supplied score was ignored.",
         }
 
     # ─── Tool 8: lookup_beneficiary_history (enhanced) ─────────────────────
@@ -945,17 +1011,19 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
 
     # ─── Tool 9: get_beneficiary_reputation (Phase 7 Memory) ───────────────
 
-    async def get_beneficiary_reputation(account_number: str, bank_code: str) -> dict[str, Any]:
+    async def get_beneficiary_reputation(
+        account_number: str, bank_code: str
+    ) -> dict[str, Any]:
         """
         Query historical reputation for a beneficiary from the memory system.
-        
+
         This queries the beneficiary_reputation table which aggregates outcomes
         across all past payout attempts to this account, providing:
         - Success rate and payout counts
         - Reputation score (0-1 Bayesian estimate)
         - Last outcome and failure reason
         - Average payout amount
-        
+
         Use this to factor historical performance into risk scoring.
         """
         if not db_session:
@@ -991,13 +1059,23 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "successful_payouts": rep.successful_payouts,
                 "failed_payouts": rep.failed_payouts,
                 "success_rate": float(rep.success_rate) if rep.success_rate else 0.0,
-                "reputation_score": float(rep.reputation_score) if rep.reputation_score else 0.5,
+                "reputation_score": float(rep.reputation_score)
+                if rep.reputation_score
+                else 0.5,
                 "last_outcome": rep.last_outcome,
                 "last_failure_reason": rep.last_failure_reason,
-                "last_payout_at": rep.last_payout_at.isoformat() if rep.last_payout_at else None,
-                "total_amount_paid": float(rep.total_amount_paid) if rep.total_amount_paid else 0.0,
-                "average_amount": float(rep.average_amount) if rep.average_amount else None,
-                "first_seen_at": rep.first_seen_at.isoformat() if rep.first_seen_at else None,
+                "last_payout_at": rep.last_payout_at.isoformat()
+                if rep.last_payout_at
+                else None,
+                "total_amount_paid": float(rep.total_amount_paid)
+                if rep.total_amount_paid
+                else 0.0,
+                "average_amount": float(rep.average_amount)
+                if rep.average_amount
+                else None,
+                "first_seen_at": rep.first_seen_at.isoformat()
+                if rep.first_seen_at
+                else None,
             }
 
         except Exception as e:
@@ -1028,6 +1106,24 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         except Exception as e:
             logger.warning(f"search_similar_run_memories failed: {e}")
             return {"error": str(e), "matches": []}
+
+    async def get_data_quality_flags() -> dict[str, Any]:
+        """Get data quality flags raised by upstream agents.
+
+        Returns flags about data availability, API errors, and simulation mode.
+        Use this to understand if transaction or reconciliation data is reliable.
+        """
+        flags = state.get("data_quality_flags", [])
+        return {
+            "flags": flags,
+            "count": len(flags),
+            "has_critical_flags": any(f.get("severity") == "high" for f in flags),
+            "summary": (
+                "No data quality issues detected."
+                if not flags
+                else f"{len(flags)} flag(s): " + ", ".join(f.get("flag", "") for f in flags)
+            ),
+        }
 
     # ─── Build and return tools ────────────────────────────────────────────
 
@@ -1119,7 +1215,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 ToolParam(
                     name="adjustment",
                     param_type=ToolParamType.NUMBER,
-                    description="Optional adjustment to score (±0.1 max). Default 0.",
+                    description="Optional adjustment to score (±0.05 max). Default 0.",
                     required=False,
                 ),
                 ToolParam(
@@ -1182,6 +1278,16 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 ),
             ],
             execute=search_similar_run_memories,
+        ),
+        Tool(
+            name="get_data_quality_flags",
+            description=(
+                "Check data quality flags from upstream agents. Returns flags about "
+                "transaction data availability, API errors, and simulation mode. "
+                "ALWAYS call this first to understand if input data is reliable."
+            ),
+            parameters=[],
+            execute=get_data_quality_flags,
         ),
     ]
 
@@ -1258,14 +1364,15 @@ Candidates:
 {candidate_summary}
 
 ## Your Workflow:
-1. Call `get_risk_thresholds` to understand the risk configuration
-2. Call `compute_risk_features` to get features for all candidates
-3. For candidates with risk signals, call `compute_velocity_features`, `cross_reference_beneficiaries`, or `detect_round_number_bias` as needed
-4. Call `compute_weighted_risk_score` for each candidate to get the computed score
-5. Call `score_candidate` for EACH candidate to finalize the assessment
-6. Produce your final JSON with all scored candidates and a risk summary
+1. Call `get_data_quality_flags` to check if upstream data is reliable
+2. Call `get_risk_thresholds` to understand the risk configuration
+3. Call `compute_risk_features` to get features for all candidates
+4. For candidates with risk signals, call `compute_velocity_features`, `cross_reference_beneficiaries`, or `detect_round_number_bias` as needed
+5. Call `compute_weighted_risk_score` for each candidate to get the computed score
+6. Call `score_candidate` for EACH candidate to finalize the assessment
+7. Produce your final JSON with all scored candidates and a risk summary
 
-Remember: You are REVIEWING computed scores, not guessing them. Adjustments must be justified."""
+Remember: You are REVIEWING computed scores, not guessing them. The computed score is enforced. Adjustments are limited to ±0.05 with written justification."""
 
         try:
             await self.emit_progress(
@@ -1407,11 +1514,27 @@ Remember: You are REVIEWING computed scores, not guessing them. Adjustments must
                 )
 
             if features_list:
-                await repo.batch_create(run_id=rid, features_list=features_list)
+                # Keep feature persistence isolated from the outer run transaction.
+                # If this non-critical write fails, the savepoint rolls back without
+                # poisoning the session used by orchestrator's subsequent writes.
+                async with db_session.begin_nested():
+                    await repo.batch_create(run_id=rid, features_list=features_list)
+
                 logger.info(
                     f"[RiskAgent] Persisted {len(features_list)} risk feature records"
                 )
 
         except Exception as e:
             logger.warning(f"[RiskAgent] Feature persistence failed: {e}")
+            try:
+                tx = db_session.get_transaction() if db_session else None
+                if tx is not None and not tx.is_active:
+                    await db_session.rollback()
+                    logger.info(
+                        "[RiskAgent] Session rollback issued after failed feature persistence"
+                    )
+            except Exception as rollback_error:
+                logger.warning(
+                    f"[RiskAgent] Failed to rollback session after persistence error: {rollback_error}"
+                )
             # Non-fatal — don't fail the run for persistence issues

@@ -908,6 +908,30 @@ Steps:
             gaps = shared_data.get("gaps", [])
             insights = shared_data.get("insights", [])
 
+            # ── Write data quality flags for downstream agents ──
+            dq_flags = list(state.get("data_quality_flags", []))
+            if not transactions:
+                dq_flags.append({
+                    "source": "reconciliation",
+                    "flag": "transaction_data_unavailable",
+                    "detail": (
+                        "Transaction Search returned 0 transactions. "
+                        "This may be due to API auth errors (401/408), "
+                        "simulated mode, or genuinely no activity in the period."
+                    ),
+                    "severity": "high",
+                })
+            elif Settings.is_reconciliation_simulated():
+                dq_flags.append({
+                    "source": "reconciliation",
+                    "flag": "reconciliation_simulated",
+                    "detail": (
+                        "Reconciliation ran in simulated mode. "
+                        "Transaction data is synthetic and should not be used for risk decisions."
+                    ),
+                    "severity": "medium",
+                })
+
             await self.emit_progress(
                 f"Reconciliation complete — {len(transactions)} txns, "
                 f"{len(resolved_refs)} resolved, {len(unresolved_refs)} unresolved, "
@@ -941,6 +965,7 @@ Steps:
                 "reconciliation_patterns": patterns,
                 "reconciliation_gaps": gaps,
                 "reconciliation_insights": insights,
+                "data_quality_flags": dq_flags,
                 "current_step": "reconciliation_complete",
                 "audit_entries": audit_entries,
             }

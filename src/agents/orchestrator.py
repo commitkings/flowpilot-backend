@@ -107,6 +107,10 @@ class RunOrchestrator:
         if self._publisher:
             await self._publisher.run_started(state.get("objective", ""))
 
+        # Initialize inter-agent communication channels
+        state.setdefault("agent_scratchpad", [])
+        state.setdefault("data_quality_flags", [])
+
         planner_step_name, planner_status, planner_agent = _AGENT_REGISTRY["planner"]
         state = await self._execute_step(
             run_id,
@@ -365,6 +369,12 @@ class RunOrchestrator:
     # Internal: step execution
     # ------------------------------------------------------------------
 
+    # Steps that can be retried once on failure before giving up
+    _RETRYABLE_STEPS: dict[str, int] = {
+        "reconcile": 1,
+        "execute": 1,
+    }
+
     async def _execute_step(
         self,
         run_id: uuid.UUID,
@@ -375,7 +385,11 @@ class RunOrchestrator:
         state: AgentState,
         defer_commit: bool = False,
     ) -> AgentState:
-        """Run one agent, persist results, and update step/run status."""
+        """Run one agent, persist results, and update step/run status.
+
+        Supports automatic retry for retryable steps and degraded mode
+        for reconciliation when upstream APIs are unavailable.
+        """
         log_run_event(str(run_id), "step_started", {
             "step": step_name,
             "agent_type": agent_type,
@@ -404,35 +418,93 @@ class RunOrchestrator:
             if hasattr(agent, "set_publisher"):
                 agent.set_publisher(self._publisher, step_id=step_id)
 
-        # 4. Execute the agent (with timing)
+        # 4. Execute the agent (with timing + retry)
         #    Pass db_session so agents with DB-backed tools can query directly
+        max_retries = self._RETRYABLE_STEPS.get(agent_type, 0)
+        attempt = 0
         t0 = time.monotonic()
-        try:
-            result_state = await agent.run(state, db_session=self._session)
-        except Exception as e:
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
-            logger.error(f"Run {run_id}: agent '{step_name}' raised: {e}")
-            # Preserve original error if one existed
-            if error_before:
-                state["error"] = f"{error_before} | {agent.name} also failed: {e}"
-            else:
-                state["error"] = f"{agent.name} failed: {e}"
-            state["current_step"] = f"{step_name}_failed"
-            if self._publisher:
-                await self._publisher.step_failed(
-                    step_name,
-                    agent_type,
-                    str(e),
-                    duration_ms=elapsed_ms,
-                    step_id=step_id,
+        result_state = None
+
+        while attempt <= max_retries:
+            try:
+                result_state = await agent.run(state, db_session=self._session)
+                break  # Success, exit retry loop
+            except Exception as e:
+                attempt += 1
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+                if attempt <= max_retries:
+                    # Retry available — log and try again
+                    logger.warning(
+                        f"Run {run_id}: agent '{step_name}' failed (attempt {attempt}/{max_retries + 1}), "
+                        f"retrying: {e}"
+                    )
+                    log_run_event(str(run_id), "step_retry", {
+                        "step": step_name,
+                        "agent_type": agent_type,
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                        "error": str(e),
+                    })
+                    # Clear any error from previous attempt
+                    if state.get("error") and state["error"] != error_before:
+                        state["error"] = error_before
+                    continue
+
+                # No more retries — fail the step
+                logger.error(
+                    f"Run {run_id}: agent '{step_name}' raised after {attempt} attempt(s): {e}"
                 )
-            if step_id is not None:
-                await self._plan_step_repo.update_status(
-                    step_id, "failed", error_message=str(e)
-                )
-            await self._session.commit()
-            return state
+                if error_before:
+                    state["error"] = f"{error_before} | {agent.name} also failed: {e}"
+                else:
+                    state["error"] = f"{agent.name} failed: {e}"
+                state["current_step"] = f"{step_name}_failed"
+                if self._publisher:
+                    await self._publisher.step_failed(
+                        step_name,
+                        agent_type,
+                        str(e),
+                        duration_ms=elapsed_ms,
+                        step_id=step_id,
+                    )
+                if step_id is not None:
+                    await self._plan_step_repo.update_status(
+                        step_id, "failed", error_message=str(e)
+                    )
+                await self._session.commit()
+                return state
+
         elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        # 4b. Degraded mode: if reconciliation returned an error because
+        # external APIs are unavailable, log it but don't block the pipeline.
+        if agent_type == "reconcile" and isinstance(result_state, dict):
+            recon_error = result_state.get("error", "")
+            has_dq_flag = any(
+                f.get("flag") == "transaction_data_unavailable"
+                for f in result_state.get("data_quality_flags", [])
+            )
+            if has_dq_flag and recon_error:
+                logger.warning(
+                    f"Run {run_id}: Reconciliation in DEGRADED MODE — "
+                    f"upstream data unavailable. Continuing pipeline. Error: {recon_error}"
+                )
+                log_run_event(str(run_id), "step_degraded", {
+                    "step": step_name,
+                    "agent_type": agent_type,
+                    "reason": "transaction_data_unavailable",
+                    "original_error": recon_error,
+                })
+                # Clear the error so the pipeline continues
+                result_state["error"] = None
+                # Add a scratchpad entry
+                result_state.setdefault("agent_scratchpad", []).append({
+                    "agent": "orchestrator",
+                    "type": "degraded_mode",
+                    "message": f"Reconciliation ran in degraded mode: {recon_error}",
+                    "severity": "warning",
+                })
 
         # 5. Guard: agent must return a dict
         if not isinstance(result_state, dict):
@@ -1017,26 +1089,103 @@ class RunOrchestrator:
 
 
 def _step_summary(step_name: str, state: AgentState) -> str:
-    """Generate a concise summary string for a completed step."""
+    """Generate a rich, context-aware summary string for a completed step."""
     if step_name == "plan":
-        n = len(state.get("plan_steps", []))
-        return f"Generated {n} step(s)"
+        steps = state.get("plan_steps", [])
+        n = len(steps)
+        pipeline = " → ".join(s.get("agent_type", "?") for s in sorted(steps, key=lambda s: s.get("order", 999)))
+        objective = state.get("objective", "")[:80]
+        n_candidates = len(state.get("candidates", []))
+        parts = [f"Plan: {pipeline}" if pipeline else f"Generated {n} step(s)"]
+        if objective:
+            parts.append(f"for '{objective}'")
+        if n_candidates:
+            parts.append(f"({n_candidates} candidate{'s' if n_candidates != 1 else ''})")
+        return " ".join(parts)
+
     elif step_name == "reconcile":
         n = len(state.get("transactions", []))
-        ledger = state.get("reconciled_ledger", {})
         unresolved = len(state.get("unresolved_references", []))
-        return f"Reconciled {n} transaction(s), {unresolved} unresolved"
+        dq_flags = state.get("data_quality_flags", [])
+        degraded = any(f.get("flag") == "transaction_data_unavailable" for f in dq_flags)
+        if n == 0 and degraded:
+            date_from = state.get("date_from", "?")
+            date_to = state.get("date_to", "?")
+            return f"No bank transactions found for {date_from} to {date_to}. Reconciliation ran in degraded mode (upstream data unavailable)"
+        parts = [f"Reconciled {n} transaction{'s' if n != 1 else ''}"]
+        if unresolved:
+            parts.append(f"{unresolved} unresolved")
+        return ", ".join(parts)
+
     elif step_name == "risk":
-        n = len(state.get("scored_candidates", []))
-        return f"Scored {n} candidate(s)"
+        scored = state.get("scored_candidates", [])
+        n = len(scored)
+        tolerance = state.get("risk_tolerance", 0.35)
+        if n == 0:
+            return "No candidates to score"
+        # Build per-candidate detail for small batches, aggregate for large
+        if n <= 5:
+            details = []
+            for c in scored:
+                name = c.get("beneficiary_name", "Unknown")
+                score = c.get("risk_score", "?")
+                decision = c.get("risk_decision", "?")
+                score_str = f"{score:.2f}" if isinstance(score, (int, float)) else str(score)
+                details.append(f"{name} → {decision} (score: {score_str}/{tolerance:.2f} tolerance)")
+            return f"{n} candidate{'s' if n != 1 else ''} scored: " + "; ".join(details)
+        else:
+            allow = sum(1 for c in scored if c.get("risk_decision") == "allow")
+            review = sum(1 for c in scored if c.get("risk_decision") == "review")
+            block = sum(1 for c in scored if c.get("risk_decision") == "block")
+            parts = [f"{n} candidates scored (tolerance: {tolerance:.2f})"]
+            breakdown = []
+            if allow: breakdown.append(f"{allow} allowed")
+            if review: breakdown.append(f"{review} review")
+            if block: breakdown.append(f"{block} blocked")
+            if breakdown:
+                parts.append(" · ".join(breakdown))
+            return ": ".join(parts)
+
     elif step_name == "execute":
-        n = len(state.get("candidate_execution_results", []))
+        exec_results = state.get("candidate_execution_results", [])
+        lookup_results = state.get("candidate_lookup_results", [])
+        n = len(exec_results)
         batch = state.get("batch_details") or {}
-        ref = batch.get("batch_reference", "")
-        return f"Executed {n} payout(s)" + (f", batch {ref[:20]}" if ref else "")
+        total_amount = batch.get("total_amount", 0)
+        success = sum(1 for r in exec_results if r.get("execution_status") in ("success", "pending"))
+        failed = sum(1 for r in exec_results if r.get("execution_status") == "failed")
+        verified = sum(1 for lr in lookup_results if lr.get("lookup_status") == "success")
+        if n == 0:
+            return "No payouts executed"
+        parts = [f"{n} payout{'s' if n != 1 else ''} executed"]
+        if total_amount:
+            parts.append(f"₦{total_amount:,.2f} disbursed")
+        if verified:
+            parts.append(f"{verified} verified via Interswitch")
+        if failed:
+            parts.append(f"{failed} failed")
+        return " · ".join(parts)
+
     elif step_name == "audit":
         report = state.get("audit_report") or {}
-        return (report.get("executive_summary") or "Audit complete")[:120]
+        exec_summary = report.get("executive_summary")
+        if exec_summary:
+            return str(exec_summary)[:200]
+        # Fallback: build from state
+        scored = state.get("scored_candidates", [])
+        exec_results = state.get("candidate_execution_results", [])
+        success = sum(1 for r in exec_results if r.get("execution_status") in ("success", "pending"))
+        total = len(scored)
+        batch = state.get("batch_details") or {}
+        total_amount = batch.get("total_amount", 0)
+        parts = ["Audit complete"]
+        if total:
+            rate = round((success / total) * 100) if total else 0
+            parts.append(f"{rate}% success rate")
+        if total_amount:
+            parts.append(f"₦{total_amount:,.2f} disbursed")
+        return " · ".join(parts)
+
     return "Step completed"
 
 
