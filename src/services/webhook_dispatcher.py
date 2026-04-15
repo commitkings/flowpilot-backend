@@ -159,10 +159,11 @@ def _sign(secret: str, body: bytes) -> str:
 
 async def _deliver_one(webhook: Any, event_name: str, payload: dict[str, Any]) -> None:
     """Deliver a single event to one webhook endpoint and update its DB record."""
+    delivery_id = str(uuid.uuid4())
     body_dict = {
         "event": event_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "delivery_id": str(uuid.uuid4()),
+        "delivery_id": delivery_id,
         "data": payload,
     }
     body_bytes = json.dumps(body_dict, default=str).encode()
@@ -173,23 +174,48 @@ async def _deliver_one(webhook: Any, event_name: str, payload: dict[str, Any]) -
         "Content-Type": "application/json",
         "X-FlowPilot-Event": event_name,
         "X-FlowPilot-Signature": f"sha256={signature}",
-        "X-FlowPilot-Delivery": str(uuid.uuid4()),
+        "X-FlowPilot-Delivery": delivery_id,
         "User-Agent": "FlowPilot-Webhooks/1.0",
     }
 
     success = False
+    status_code: int | None = None
+    error_message: str | None = None
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT) as client:
             resp = await client.post(webhook.url, content=body_bytes, headers=headers)
+            status_code = resp.status_code
             success = 200 <= resp.status_code < 300
             logger.info(
                 f"[Webhook] {event_name} → {webhook.url} {resp.status_code} "
                 f"({'ok' if success else 'non-2xx'})"
             )
     except Exception as exc:
+        error_message = str(exc)[:512]
         logger.warning(f"[Webhook] Delivery to {webhook.url} failed: {exc}")
 
     await _update_webhook_record(webhook.id, success, webhook.failure_count)
+
+    # Log the delivery attempt (best-effort — fails gracefully if table doesn't exist yet)
+    try:
+        from src.infrastructure.database.connection import get_session_factory
+        from src.infrastructure.database.flowpilot_models import WebhookDeliveryModel
+
+        async with get_session_factory()() as session:
+            delivery_log = WebhookDeliveryModel(
+                webhook_id=webhook.id,
+                business_id=webhook.business_id,
+                event_name=event_name,
+                delivery_id=delivery_id,
+                payload=json.dumps(body_dict, default=str),
+                status_code=status_code,
+                success=success,
+                error_message=error_message,
+            )
+            session.add(delivery_log)
+            await session.commit()
+    except Exception as exc:
+        logger.warning(f"[Webhook] Failed to log delivery for {delivery_id}: {exc}")
 
 
 async def _update_webhook_record(

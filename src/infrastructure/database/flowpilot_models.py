@@ -1645,6 +1645,48 @@ class WebhookModel(Base):
 
 
 # --------------------------------------------------------------------------- #
+# 29b. webhook_delivery — log of every webhook delivery attempt
+# --------------------------------------------------------------------------- #
+class WebhookDeliveryModel(Base):
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    webhook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("webhook.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    delivery_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    success: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    delivered_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("webhook_delivery_webhook_id_idx", "webhook_id"),
+        Index("webhook_delivery_business_id_idx", "business_id"),
+    )
+
+    webhook: Mapped["WebhookModel"] = relationship()
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
 # 30. approval_rule — configurable approval gates per business
 # --------------------------------------------------------------------------- #
 class ApprovalRuleModel(Base):

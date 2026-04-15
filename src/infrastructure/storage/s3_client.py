@@ -209,6 +209,57 @@ def get_presigned_url(object_key: str, expiry: int = _PRESIGNED_EXPIRY) -> Optio
         return None
 
 
+async def download_file(object_key: str) -> Optional[bytes]:
+    """Download a file from MinIO and return its bytes. Returns None on failure."""
+    try:
+        loop = asyncio.get_running_loop()
+        def _download_sync():
+            client = _get_upload_client()
+            resp = client.get_object(Bucket=_BUCKET, Key=object_key)
+            return resp["Body"].read()
+        return await loop.run_in_executor(_executor, _download_sync)
+    except Exception as exc:
+        logger.error("Failed to download %s from MinIO: %s", object_key, exc)
+        return None
+
+
+def make_file_url(object_key: Optional[str]) -> Optional[str]:
+    """Construct a browser-accessible URL for a MinIO object via the backend file proxy.
+
+    Uses API_BASE_URL env var (e.g. https://api.flowpilot.club).
+    Falls back to a local /uploads path for files stored locally.
+    """
+    if not object_key:
+        return None
+    # Already a full URL (legacy presigned URL or external URL) - try to extract key
+    if object_key.startswith("http://") or object_key.startswith("https://"):
+        # Try to extract object key from MinIO URL: http://endpoint/bucket/key?sig
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(object_key)
+            path = parsed.path.lstrip("/")
+            if path.startswith(_BUCKET + "/"):
+                key = path[len(_BUCKET) + 1:]
+            else:
+                key = path
+            # Remove any query params - we have the key, reconstruct URL
+            if key:
+                object_key = key
+            else:
+                return object_key  # can't extract key, return as-is
+        except Exception:
+            return object_key
+    # Local upload path - return as-is (served via StaticFiles or Next.js proxy)
+    if object_key.startswith("/uploads/") or object_key.startswith("uploads/"):
+        return object_key
+    # Construct backend proxy URL
+    api_base = os.getenv("API_BASE_URL", "").rstrip("/")
+    if api_base:
+        return f"{api_base}/api/v1/files/{object_key}"
+    # No API_BASE_URL set - fall back to relative path (works if same origin)
+    return f"/api/v1/files/{object_key}"
+
+
 def make_url_public(stored_url: Optional[str], expiry: int = 30 * 24 * 3600) -> Optional[str]:
     """Rewrite a stored avatar/logo URL to be browser-accessible.
 

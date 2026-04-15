@@ -94,7 +94,7 @@ async def get_org_profile(
         "website": biz.website,
         "phone": biz.phone,
         "interswitch_merchant_id": biz.interswitch_merchant_id,
-        "logo_url": biz.logo_url,
+        "logo_url": s3_client.make_file_url(biz.logo_url),
         "kyc_status": biz.kyc_status,
         "is_active": biz.is_active,
         "config": {
@@ -179,9 +179,8 @@ async def upload_org_logo(
             detail="File storage is unavailable. Please try again later.",
         )
 
-    # Generate a presigned URL for immediate use
-    presigned = s3_client.get_presigned_url(object_key)
-    logo_url = presigned or object_key  # fallback to key if presigned fails
+    # Store the object key — serve via /api/v1/files/{key} proxy
+    logo_url = object_key
 
     business_id = await _get_user_business_id(current_user, session)
     repo = BusinessRepository(session)

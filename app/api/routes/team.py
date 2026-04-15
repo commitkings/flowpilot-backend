@@ -79,7 +79,7 @@ def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) ->
         "user": {
             "display_name": user.display_name if user else None,
             "email": user.email if user else None,
-            "avatar_url": _s3.make_url_public(user.avatar_url) if user else None,
+            "avatar_url": _s3.make_file_url(user.avatar_url) if user else None,
         }
         if user
         else None,

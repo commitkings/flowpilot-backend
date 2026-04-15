@@ -126,6 +126,32 @@ async def get_wallet(
     if not membership:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # KYC check — wallet requires verified KYC
+    biz_result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == business_uuid)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if biz and biz.kyc_status not in ("verified",):
+        kyc_status = biz.kyc_status or "not_submitted"
+        if kyc_status == "pending":
+            raise HTTPException(
+                status_code=403,
+                detail="KYC verification is pending. Wallet access will be enabled once verified.",
+                headers={"X-KYC-Status": "pending"},
+            )
+        elif kyc_status in ("not_submitted", None):
+            raise HTTPException(
+                status_code=403,
+                detail="Complete KYC verification to access the wallet.",
+                headers={"X-KYC-Status": "not_submitted"},
+            )
+        elif kyc_status == "rejected":
+            raise HTTPException(
+                status_code=403,
+                detail="KYC verification was rejected. Please resubmit your documents.",
+                headers={"X-KYC-Status": "rejected"},
+            )
+
     repo = WalletRepository(session)
     wallet = await repo.get_or_create(business_uuid)
     await session.commit()

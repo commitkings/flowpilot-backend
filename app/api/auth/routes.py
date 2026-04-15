@@ -106,7 +106,7 @@ def _user_response(user, memberships) -> dict:
         "id": str(user.id),
         "email": user.email,
         "display_name": user.display_name,
-        "avatar_url": _s3.make_url_public(user.avatar_url),
+        "avatar_url": _s3.make_file_url(user.avatar_url),
         "first_name": user.first_name,
         "last_name": user.last_name,
         "job_title": user.job_title,
@@ -353,6 +353,45 @@ async def register_via_invite(
         resource_id=str(invite.business_id),
     )
 
+    # Notify the business owner that a new member has joined
+    from sqlalchemy import select as _select
+    try:
+        owner_result = await session.execute(
+            _select(BusinessMemberModel).where(
+                BusinessMemberModel.business_id == invite.business_id,
+                BusinessMemberModel.role == "owner",
+                BusinessMemberModel.is_active.is_(True),
+            ).limit(1)
+        )
+        owner_member = owner_result.scalars().first()
+        if owner_member:
+            await notif_repo.create(
+                user_id=owner_member.user_id,
+                business_id=invite.business_id,
+                title="New team member joined",
+                message=f"{display_name} has joined {biz_name} as {invite.role.capitalize()}.",
+                type="info",
+                resource_type="team",
+                resource_id=str(invite.business_id),
+            )
+    except Exception as _exc:
+        logger.warning("Failed to notify owner of new team member: %s", _exc)
+
+    # Check if org requires 2FA for all members
+    from src.infrastructure.database.flowpilot_models import BusinessConfigModel
+    from datetime import timedelta
+    config_result = await session.execute(
+        _select(BusinessConfigModel).where(
+            BusinessConfigModel.business_id == invite.business_id
+        )
+    )
+    biz_config = config_result.scalars().first()
+    requires_2fa_setup = False
+    if biz_config and biz_config.require_2fa:
+        # Give new member a 48-hour grace period to set up 2FA
+        new_user.totp_grace_until = datetime.now(tz.utc) + timedelta(hours=48)
+        requires_2fa_setup = True
+
     token = create_access_token(new_user.id, new_user.email)
     await session.commit()
 
@@ -363,6 +402,7 @@ async def register_via_invite(
             "email": new_user.email,
             "display_name": new_user.display_name,
         },
+        "requires_2fa_setup": requires_2fa_setup,
     }
 
 
@@ -657,9 +697,8 @@ async def upload_avatar(
     object_key = await _s3.upload_file(content, file.filename or "avatar.jpg", folder="avatars", content_type=file.content_type)
 
     if object_key:
-        # Generate a 30-day presigned URL so the frontend can display it
-        presigned = _s3.get_presigned_url(object_key, expiry=30 * 24 * 3600)
-        avatar_url = presigned or object_key
+        # Store the object key — serve via /api/v1/files/{key} proxy
+        avatar_url = object_key
     else:
         # MinIO unavailable — fall back to local disk
         import shutil as _shutil, os, uuid as _uuid, io as _io

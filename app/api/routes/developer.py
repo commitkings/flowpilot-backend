@@ -36,6 +36,7 @@ from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     ApiKeyModel,
     BusinessMemberModel,
+    WebhookDeliveryModel,
     WebhookModel,
 )
 
@@ -420,3 +421,52 @@ async def update_webhook(
     await session.refresh(webhook)
 
     return _serialize_webhook(webhook)
+
+
+@router.get("/webhooks/{webhook_id}/deliveries")
+async def list_webhook_deliveries(
+    webhook_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner")),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Return recent delivery attempts for a specific webhook. Owner only."""
+    business_id = await _get_business_id(current_user, session)
+
+    # Verify the webhook belongs to this business
+    wh_result = await session.execute(
+        select(WebhookModel).where(
+            WebhookModel.id == webhook_id,
+            WebhookModel.business_id == business_id,
+        )
+    )
+    if not wh_result.scalars().first():
+        raise HTTPException(status_code=404, detail="Webhook not found")
+
+    result = await session.execute(
+        select(WebhookDeliveryModel)
+        .where(WebhookDeliveryModel.webhook_id == webhook_id)
+        .order_by(WebhookDeliveryModel.delivered_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    deliveries = result.scalars().all()
+
+    return {
+        "deliveries": [
+            {
+                "id": str(d.id),
+                "event_name": d.event_name,
+                "delivery_id": d.delivery_id,
+                "status_code": d.status_code,
+                "success": d.success,
+                "error_message": d.error_message,
+                "delivered_at": d.delivered_at.isoformat(),
+            }
+            for d in deliveries
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
