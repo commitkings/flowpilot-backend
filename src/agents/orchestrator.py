@@ -698,15 +698,21 @@ class RunOrchestrator:
                     try:
                         import asyncio as _asyncio
                         from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                        from src.config.settings import Settings as _Settings
                         business_uuid_wh = uuid.UUID(str(business_id_str))
                         for c in flagged:
                             _asyncio.create_task(_dispatch(business_uuid_wh, "candidate.flagged", {
                                 "run_id": str(run_id),
+                                "objective": state.get("objective"),
                                 "candidate_id": c.get("candidate_id"),
                                 "beneficiary_name": c.get("beneficiary_name"),
+                                "account_number": c.get("account_number"),
+                                "institution_code": c.get("institution_code"),
                                 "amount": c.get("amount"),
-                                "risk_score": c.get("risk_score"),
+                                "risk_score": float(c.get("risk_score", 0)),
+                                "risk_decision": c.get("risk_decision", "block"),
                                 "risk_reasons": c.get("risk_reasons", []),
+                                "run_url": f"{_Settings.FRONTEND_URL}/runs/{run_id}",
                             }))
                     except Exception as _wh_exc:
                         logger.warning(f"Run {run_id}: candidate.flagged webhook failed: {_wh_exc}")
@@ -845,20 +851,36 @@ class RunOrchestrator:
             try:
                 import asyncio as _asyncio
                 from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                # Build lookup for beneficiary details from scored_candidates
+                _candidate_meta = {
+                    c.get("candidate_id"): c
+                    for c in state.get("scored_candidates", [])
+                }
                 business_uuid_wh = uuid.UUID(str(business_id_str))
+                _objective = state.get("objective")
                 for er in state.get("candidate_execution_results", []):
                     exec_status = er.get("execution_status", "pending")
+                    _cid = er.get("candidate_id")
+                    _meta = _candidate_meta.get(_cid, {})
                     if exec_status == "success":
                         _asyncio.create_task(_dispatch(business_uuid_wh, "payout.succeeded", {
                             "run_id": str(run_id),
-                            "candidate_id": er.get("candidate_id"),
+                            "objective": _objective,
+                            "candidate_id": _cid,
+                            "beneficiary_name": _meta.get("beneficiary_name"),
+                            "account_number": _meta.get("account_number"),
+                            "institution_code": _meta.get("institution_code"),
                             "amount": er.get("amount"),
                             "provider_reference": er.get("provider_reference"),
                         }))
                     elif exec_status == "failed":
                         _asyncio.create_task(_dispatch(business_uuid_wh, "payout.failed", {
                             "run_id": str(run_id),
-                            "candidate_id": er.get("candidate_id"),
+                            "objective": _objective,
+                            "candidate_id": _cid,
+                            "beneficiary_name": _meta.get("beneficiary_name"),
+                            "account_number": _meta.get("account_number"),
+                            "institution_code": _meta.get("institution_code"),
                             "amount": er.get("amount"),
                             "reason": er.get("response_message") or "execution_failed",
                         }))

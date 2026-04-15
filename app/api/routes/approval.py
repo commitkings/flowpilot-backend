@@ -394,11 +394,27 @@ async def approve_candidates(
         try:
             import asyncio as _asyncio
             from src.services.webhook_dispatcher import dispatch_event as _dispatch
+            _exec_results = state.get("candidate_execution_results", [])
+            _succeeded = [e for e in _exec_results if e.get("execution_status") == "success"]
+            _failed_exec = [e for e in _exec_results if e.get("execution_status") == "failed"]
+            _total_paid = sum(float(e.get("amount", 0)) for e in _succeeded)
             webhook_payload = {
                 "run_id": run_id,
                 "objective": run.objective,
+                "action": "approved",
                 "status": final_status,
                 "approved_count": approved_count,
+                "rejected_count": len(state.get("rejected_candidate_ids", [])),
+                "succeeded_count": len(_succeeded),
+                "failed_count": len(_failed_exec),
+                "total_payout_amount": _total_paid,
+                "currency": "NGN",
+                "date_range": {
+                    "from": state.get("date_from"),
+                    "to": state.get("date_to"),
+                },
+                "error": state.get("error"),
+                "run_url": f"{Settings.FRONTEND_URL}/runs/{run_id}",
             }
             _asyncio.create_task(_dispatch(run.business_id, "approval.completed", webhook_payload))
             run_event = "run.completed" if final_status == "completed" else "run.failed"
@@ -541,11 +557,15 @@ async def reject_candidates(
     try:
         import asyncio as _asyncio
         from src.services.webhook_dispatcher import dispatch_event as _dispatch
+        _total_candidates = len(state.get("scored_candidates", [])) if state is not None else None
         _asyncio.create_task(_dispatch(run.business_id, "approval.completed", {
             "run_id": run_id,
             "objective": run.objective,
             "action": "rejected",
             "rejected_count": rejected_count,
+            "remaining_approved": remaining_approved,
+            "total_candidate_count": _total_candidates,
+            "run_url": f"{Settings.FRONTEND_URL}/runs/{run_id}",
         }))
     except Exception as _wh_exc:
         logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
