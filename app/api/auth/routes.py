@@ -377,20 +377,17 @@ async def register_via_invite(
     except Exception as _exc:
         logger.warning("Failed to notify owner of new team member: %s", _exc)
 
-    # Check if org requires 2FA for all members
+    # Check if org requires 2FA for all members.
+    # New members joining after enforcement must set up 2FA immediately — no grace period.
+    # (Grace periods are only for existing members who were already in the org when enforcement was toggled on.)
     from src.infrastructure.database.flowpilot_models import BusinessConfigModel
-    from datetime import timedelta
     config_result = await session.execute(
         _select(BusinessConfigModel).where(
             BusinessConfigModel.business_id == invite.business_id
         )
     )
     biz_config = config_result.scalars().first()
-    requires_2fa_setup = False
-    if biz_config and biz_config.require_2fa:
-        # Give new member a 48-hour grace period to set up 2FA
-        new_user.totp_grace_until = datetime.now(tz.utc) + timedelta(hours=48)
-        requires_2fa_setup = True
+    requires_2fa_setup = bool(biz_config and biz_config.require_2fa)
 
     token = create_access_token(new_user.id, new_user.email)
     await session.commit()

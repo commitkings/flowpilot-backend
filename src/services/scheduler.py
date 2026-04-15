@@ -442,9 +442,88 @@ async def _check_scheduled_reminders() -> None:
             await asyncio.sleep(60)
 
 
+_2fa_reminder_task: Optional[asyncio.Task] = None
+
+# Send the warning when grace_until is within this many minutes of expiry.
+_2FA_WARN_MINUTES = 20
+# Poll every 5 minutes so we don't miss the window.
+_2FA_POLL_SECONDS = 300
+
+
+async def _check_2fa_grace_expiry() -> None:
+    """Polls every 5 minutes for members whose 2FA grace period expires within 20 minutes.
+
+    Sends a single reminder email per user (tracked via a set of already-notified IDs
+    in memory — the process only sends once per restart, which is fine since the email
+    is only useful during the window).
+    """
+    from src.infrastructure.database.connection import get_session_factory
+    from src.infrastructure.database.flowpilot_models import UserModel
+    from sqlalchemy import select
+
+    logger.info("[Scheduler] 2FA grace-expiry reminder loop started")
+    already_notified: set = set()
+
+    while True:
+        try:
+            await asyncio.sleep(_2FA_POLL_SECONDS)
+            now = datetime.now(timezone.utc)
+            warn_before = now + timedelta(minutes=_2FA_WARN_MINUTES)
+
+            async with get_session_factory()() as session:
+                # Find users who haven't set up 2FA, have a grace deadline,
+                # and that deadline falls within the next 20 minutes.
+                result = await session.execute(
+                    select(UserModel).where(
+                        UserModel.totp_enabled_at.is_(None),
+                        UserModel.totp_grace_until.isnot(None),
+                        UserModel.totp_grace_until > now,       # not yet expired
+                        UserModel.totp_grace_until <= warn_before,  # expiring soon
+                        UserModel.is_active.is_(True),
+                    )
+                )
+                users = result.scalars().all()
+
+                for user in users:
+                    if user.id in already_notified:
+                        continue
+
+                    minutes_left = max(
+                        1,
+                        int((user.totp_grace_until - now).total_seconds() / 60),
+                    )
+
+                    from src.services.email_service import send_2fa_grace_expiring_email
+                    sent = await send_2fa_grace_expiring_email(
+                        to=user.email,
+                        display_name=user.display_name or user.email,
+                        minutes_left=minutes_left,
+                    )
+
+                    if sent:
+                        already_notified.add(user.id)
+                        logger.info(
+                            "[Scheduler] Sent 2FA expiry warning to %s (%d min left)",
+                            user.email,
+                            minutes_left,
+                        )
+                    else:
+                        logger.warning(
+                            "[Scheduler] Failed to send 2FA expiry warning to %s",
+                            user.email,
+                        )
+
+        except asyncio.CancelledError:
+            logger.info("[Scheduler] 2FA grace-expiry reminder loop cancelled")
+            break
+        except Exception as exc:
+            logger.exception("[Scheduler] Error in 2FA grace-expiry check: %s", exc)
+            await asyncio.sleep(60)
+
+
 def start_scheduler() -> None:
     """Start the background dispatch loop. Call once from app lifespan."""
-    global _task, _expiry_task, _reminder_task
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task
     if _task is None or _task.done():
         _task = asyncio.create_task(_dispatch_loop())
         logger.info("[Scheduler] Background task created")
@@ -454,11 +533,14 @@ def start_scheduler() -> None:
     if _reminder_task is None or _reminder_task.done():
         _reminder_task = asyncio.create_task(_check_scheduled_reminders())
         logger.info("[Scheduler] Day-before reminder task created")
+    if _2fa_reminder_task is None or _2fa_reminder_task.done():
+        _2fa_reminder_task = asyncio.create_task(_check_2fa_grace_expiry())
+        logger.info("[Scheduler] 2FA grace-expiry reminder task created")
 
 
 def stop_scheduler() -> None:
     """Cancel the background dispatch loop. Call from app shutdown."""
-    global _task, _expiry_task, _reminder_task
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task
     if _task and not _task.done():
         _task.cancel()
         logger.info("[Scheduler] Background task cancelled")
@@ -468,3 +550,6 @@ def stop_scheduler() -> None:
     if _reminder_task and not _reminder_task.done():
         _reminder_task.cancel()
         logger.info("[Scheduler] Day-before reminder task cancelled")
+    if _2fa_reminder_task and not _2fa_reminder_task.done():
+        _2fa_reminder_task.cancel()
+        logger.info("[Scheduler] 2FA grace-expiry reminder task cancelled")

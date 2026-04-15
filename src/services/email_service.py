@@ -491,6 +491,31 @@ async def send_2fa_enforced_email(
     )
 
 
+async def send_2fa_grace_expiring_email(
+    to: str,
+    display_name: str,
+    minutes_left: int = 20,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Remind a team member that their 2FA grace period is about to expire."""
+    base = frontend_url or Settings.FRONTEND_URL
+    setup_url = f"{base}/dashboard/settings?tab=security"
+    html = _render(
+        "2fa_enforced.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        grace_hours=None,
+        grace_minutes=minutes_left,
+        setup_url=setup_url,
+    )
+    return await _send(
+        to=to,
+        subject=f"⚠️ {minutes_left} minutes left to set up 2FA — FlowPilot",
+        html=html,
+    )
+
+
 async def send_api_key_expiry_warning(
     to: str,
     display_name: str,
