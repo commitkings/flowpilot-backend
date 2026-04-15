@@ -8,6 +8,7 @@ from typing import Any
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
 from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
+from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +179,15 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
             f"- This run was created for {objective}, but there were no recipients in the summary bundle."
         ]
         if payout_mode == "simulated":
-            sections.append("Outcome:\n- This was a test run, so no real money was sent.")
+            sections.append(
+                "Outcome:\n- This was a test run, so no real money was sent."
+            )
         return "\n\n".join(sections)
 
-    named_people = [str(detail.get("name") or "Unknown recipient") for detail in candidate_details[:5]]
+    named_people = [
+        str(detail.get("name") or "Unknown recipient")
+        for detail in candidate_details[:5]
+    ]
     if total_candidates <= 5:
         people_phrase = f"{total_candidates} recipient(s): {_join_plain(named_people)}"
     else:
@@ -194,15 +200,20 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
             score_list.append(f"{float(score):.2f}")
 
     review_count = sum(
-        1 for detail in candidate_details if str(detail.get("risk_decision", "")).lower() == "review"
+        1
+        for detail in candidate_details
+        if str(detail.get("risk_decision", "")).lower() == "review"
     )
     block_count = sum(
-        1 for detail in candidate_details if str(detail.get("risk_decision", "")).lower() == "block"
+        1
+        for detail in candidate_details
+        if str(detail.get("risk_decision", "")).lower() == "block"
     )
     lookup_failed_count = sum(
         1
         for detail in candidate_details
-        if str(detail.get("lookup_status", "")).lower() in {"failed", "mismatch", "name_mismatch"}
+        if str(detail.get("lookup_status", "")).lower()
+        in {"failed", "mismatch", "name_mismatch"}
     )
     overview_lines = [
         "Overview:",
@@ -286,7 +297,9 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
             f"{approved_count or total_candidates} approved payout(s) reached a successful finish."
         )
     else:
-        outcome_lines.append("- The run finished cleanly with no unresolved payout issues.")
+        outcome_lines.append(
+            "- The run finished cleanly with no unresolved payout issues."
+        )
 
     if payout_mode == "simulated":
         outcome_lines.append("- This was a test run, so no real money was sent.")
@@ -308,8 +321,12 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
     transactions = state.get("transactions") or []
     risk_tolerance = state.get("risk_tolerance") or 0.35
     batch_details = state.get("batch_details") or {}
-    approved_ids = {str(candidate_id) for candidate_id in state.get("approved_candidate_ids", [])}
-    rejected_ids = {str(candidate_id) for candidate_id in state.get("rejected_candidate_ids", [])}
+    approved_ids = {
+        str(candidate_id) for candidate_id in state.get("approved_candidate_ids", [])
+    }
+    rejected_ids = {
+        str(candidate_id) for candidate_id in state.get("rejected_candidate_ids", [])
+    }
 
     success_exec = sum(
         1 for er in exec_results if er.get("execution_status") == "success"
@@ -390,7 +407,9 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
                 "name": name,
                 "amount": amount,
                 "institution": institution,
-                "account_masked": f"***{account[-3:]}" if len(account) >= 3 else account,
+                "account_masked": f"***{account[-3:]}"
+                if len(account) >= 3
+                else account,
                 "risk_score": round(score_f, 2) if score_f is not None else score,
                 "risk_tolerance": risk_tolerance,
                 "risk_decision": decision,
@@ -413,7 +432,9 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
         )
 
     payout_mode = (
-        "simulated" if batch_details.get("batch_reference", "").startswith("FP_") else "live"
+        "simulated"
+        if batch_details.get("batch_reference", "").startswith("FP_")
+        else "live"
     )
     dq_flags = state.get("data_quality_flags") or []
     recon_degraded = any(
@@ -1309,6 +1330,7 @@ Then produce the final audit report JSON with all findings, costs, compliance st
             response = await self.reason_and_act_json(
                 system_prompt=AUDIT_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL_AUDIT,
             )
 
             try:

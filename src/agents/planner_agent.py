@@ -6,6 +6,7 @@ from typing import Any
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
 from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
+from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -254,13 +255,13 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
     async def get_historical_run_stats(lookback_days: int = 30) -> dict[str, Any]:
         """
         Get comprehensive historical run statistics for this business from the memory system.
-        
+
         Queries run_outcome_memory and business_pattern_profile to provide:
         - Run counts and success rates
         - Typical amounts (mean, percentiles, std dev)
         - Common failure reasons
         - Recurring beneficiary patterns
-        
+
         Use this to inform planning decisions and identify anomalies.
         """
         if db_session is None:
@@ -293,7 +294,7 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
 
             # Get recent run stats from outcomes
             stats = await outcome_repo.get_business_stats(bid, lookback_days)
-            
+
             # Get pattern profile
             pattern = await pattern_repo.get_profile(bid)
 
@@ -304,28 +305,60 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
                 # From outcome aggregation
                 "total_runs": stats.get("total_runs", 0) if stats else 0,
                 "total_candidates": stats.get("total_candidates", 0) if stats else 0,
-                "overall_success_rate": stats.get("success_rate", 0.0) if stats else 0.0,
-                "common_failure_reasons": stats.get("failure_breakdown", {}) if stats else {},
+                "overall_success_rate": stats.get("success_rate", 0.0)
+                if stats
+                else 0.0,
+                "common_failure_reasons": stats.get("failure_breakdown", {})
+                if stats
+                else {},
             }
 
             if pattern:
-                result.update({
-                    "pattern_profile": {
-                        "avg_candidates_per_run": float(pattern.avg_candidates_per_run) if pattern.avg_candidates_per_run else None,
-                        "avg_amount_per_candidate": float(pattern.avg_amount_per_candidate) if pattern.avg_amount_per_candidate else None,
-                        "amount_std_dev": float(pattern.amount_std_dev) if pattern.amount_std_dev else None,
-                        "typical_amount_range": {
-                            "p25": float(pattern.amount_p25) if pattern.amount_p25 else None,
-                            "p50": float(pattern.amount_p50) if pattern.amount_p50 else None,
-                            "p75": float(pattern.amount_p75) if pattern.amount_p75 else None,
-                            "p95": float(pattern.amount_p95) if pattern.amount_p95 else None,
-                        },
-                        "recurring_beneficiary_rate": float(pattern.recurring_beneficiary_rate) if pattern.recurring_beneficiary_rate else None,
-                        "total_payouts": pattern.total_payouts,
-                        "total_amount_paid": float(pattern.total_amount_paid) if pattern.total_amount_paid else 0.0,
-                        "last_run_at": pattern.last_run_at.isoformat() if pattern.last_run_at else None,
+                result.update(
+                    {
+                        "pattern_profile": {
+                            "avg_candidates_per_run": float(
+                                pattern.avg_candidates_per_run
+                            )
+                            if pattern.avg_candidates_per_run
+                            else None,
+                            "avg_amount_per_candidate": float(
+                                pattern.avg_amount_per_candidate
+                            )
+                            if pattern.avg_amount_per_candidate
+                            else None,
+                            "amount_std_dev": float(pattern.amount_std_dev)
+                            if pattern.amount_std_dev
+                            else None,
+                            "typical_amount_range": {
+                                "p25": float(pattern.amount_p25)
+                                if pattern.amount_p25
+                                else None,
+                                "p50": float(pattern.amount_p50)
+                                if pattern.amount_p50
+                                else None,
+                                "p75": float(pattern.amount_p75)
+                                if pattern.amount_p75
+                                else None,
+                                "p95": float(pattern.amount_p95)
+                                if pattern.amount_p95
+                                else None,
+                            },
+                            "recurring_beneficiary_rate": float(
+                                pattern.recurring_beneficiary_rate
+                            )
+                            if pattern.recurring_beneficiary_rate
+                            else None,
+                            "total_payouts": pattern.total_payouts,
+                            "total_amount_paid": float(pattern.total_amount_paid)
+                            if pattern.total_amount_paid
+                            else 0.0,
+                            "last_run_at": pattern.last_run_at.isoformat()
+                            if pattern.last_run_at
+                            else None,
+                        }
                     }
-                })
+                )
             else:
                 result["pattern_profile"] = {
                     "note": "No historical pattern profile for this business yet"
@@ -429,6 +462,7 @@ Use your tools to gather the information you need, then produce the execution pl
             response = await self.reason_and_act_json(
                 system_prompt=PLANNER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL_PLANNER,
             )
             plan = json.loads(response)
             steps = plan.get("plan_steps", [])

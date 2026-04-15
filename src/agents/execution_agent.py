@@ -278,9 +278,9 @@ def _build_execution_tools(
                     "source_account_id": Settings.INTERSWITCH_WALLET_ID or "",
                     "total_amount": float(candidate["amount"]),
                     "item_count": 1,
-                "submission_status": submission_status,
-                "accepted_count": accepted,
-                "rejected_count": rejected,
+                    "submission_status": submission_status,
+                    "accepted_count": accepted,
+                    "rejected_count": rejected,
                 }
             else:
                 bd = shared_data["batch_details"]
@@ -477,6 +477,7 @@ Steps:
             response = await self.reason_and_act_json(
                 system_prompt=EXECUTION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL_EXECUTION,
                 max_iterations=MAX_EXEC_ITERATIONS,
             )
 

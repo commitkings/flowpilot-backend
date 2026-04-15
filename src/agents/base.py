@@ -1,14 +1,19 @@
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 from uuid import UUID
 
 from groq import AsyncGroq
 
-from src.agents.tools import ToolRegistry, ToolCall, ToolResult, parse_tool_calls_from_response
+from src.agents.tools import (
+    ToolRegistry,
+    ToolCall,
+    ToolResult,
+    parse_tool_calls_from_response,
+)
 from src.config.settings import Settings
 from src.utilities.logging_config import (
     get_logger,
@@ -60,7 +65,9 @@ class JsonSchemaValidator:
         # Strip markdown fences if present
         stripped = output.strip()
         if stripped.startswith("```"):
-            fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
+            fence_match = re.search(
+                r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL
+            )
             if fence_match:
                 stripped = fence_match.group(1).strip()
 
@@ -99,7 +106,6 @@ If a tool call fails, reason about why and try an alternative approach.
 
 
 class BaseAgent:
-
     def __init__(self, name: str) -> None:
         self.name = name
         self._agent_type_key = _normalize_agent_type(name)
@@ -123,6 +129,115 @@ class BaseAgent:
             self._client = AsyncGroq(api_key=api_key)
         return self._client
 
+    def _resolve_default_model(self) -> str:
+        agent_model_map = {
+            "planner": Settings.GROQ_LLM_MODEL_PLANNER,
+            "reconciliation": Settings.GROQ_LLM_MODEL_RECONCILIATION,
+            "risk": Settings.GROQ_LLM_MODEL_RISK,
+            "execution": Settings.GROQ_LLM_MODEL_EXECUTION,
+            "audit": Settings.GROQ_LLM_MODEL_AUDIT,
+        }
+        return (
+            agent_model_map.get(self._agent_type_key)
+            or Settings.GROQ_LLM_MODEL_REASONING
+            or Settings.GROQ_LLM_MODEL
+        )
+
+    @staticmethod
+    def _build_model_chain(primary_model: str) -> list[str]:
+        candidates = [
+            primary_model,
+            Settings.GROQ_LLM_MODEL_FALLBACK_PRIMARY,
+            Settings.GROQ_LLM_MODEL_FALLBACK_SECONDARY,
+            Settings.GROQ_LLM_MODEL_REASONING,
+            Settings.GROQ_LLM_MODEL,
+        ]
+        chain: list[str] = []
+        for model in candidates:
+            if model and model not in chain:
+                chain.append(model)
+        return chain
+
+    @staticmethod
+    def _is_retryable_llm_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+
+        message = str(exc).lower()
+        model_unavailable_hints = (
+            "model",
+            "not found",
+            "not available",
+            "unsupported",
+            "deprecated",
+            "permission",
+            "does not exist",
+        )
+        if "model" in message and any(
+            h in message for h in model_unavailable_hints[1:]
+        ):
+            return True
+
+        if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+
+        retry_hints = (
+            "rate limit",
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "service unavailable",
+            "overloaded",
+            "too many requests",
+            "try again",
+        )
+        return any(hint in message for hint in retry_hints)
+
+    async def _chat_completion_with_fallback(
+        self,
+        kwargs: dict[str, Any],
+        model_chain: list[str],
+        *,
+        iteration: int | None = None,
+    ) -> tuple[Any, str]:
+        if not model_chain:
+            raise ValueError("No models configured for LLM call")
+
+        last_error: Exception | None = None
+        for attempt, model_name in enumerate(model_chain, start=1):
+            try:
+                call_kwargs = dict(kwargs)
+                call_kwargs["model"] = model_name
+                response = await self.llm_client.chat.completions.create(**call_kwargs)
+
+                if attempt > 1:
+                    log_agent_event(
+                        self.name,
+                        "llm_fallback_success",
+                        {
+                            "from_model": model_chain[0],
+                            "to_model": model_name,
+                            "attempt": attempt,
+                            "iteration": iteration,
+                        },
+                    )
+                return response, model_name
+            except Exception as exc:
+                last_error = exc
+                retryable = self._is_retryable_llm_error(exc)
+                logger.warning(
+                    f"[{self.name}] LLM call failed on model={model_name} "
+                    f"attempt={attempt}/{len(model_chain)} retryable={retryable}: {exc}"
+                )
+                if (not retryable) or attempt >= len(model_chain):
+                    raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("LLM call failed without exception")
+
     async def reason_and_act(
         self,
         system_prompt: str,
@@ -133,7 +248,9 @@ class BaseAgent:
         max_iterations: int = MAX_REACT_ITERATIONS,
         output_validator: Optional[OutputValidator] = None,
     ) -> str:
-        model = model or Settings.GROQ_LLM_MODEL
+        primary_model = model or self._resolve_default_model()
+        model_chain = self._build_model_chain(primary_model)
+        active_model = primary_model
         full_system = system_prompt + REACT_SYSTEM_SUFFIX
 
         messages: list[dict[str, Any]] = [
@@ -145,20 +262,24 @@ class BaseAgent:
         iteration = 0
         validation_retries = 0
 
-        log_agent_event(self.name, "react_start", {
-            "model": model,
-            "max_iterations": max_iterations,
-            "tools_count": len(self.registry.tools) if self.registry.tools else 0,
-            "prompt_preview": user_prompt[:200],
-            "has_validator": output_validator is not None,
-        })
+        log_agent_event(
+            self.name,
+            "react_start",
+            {
+                "model": primary_model,
+                "model_chain": model_chain,
+                "max_iterations": max_iterations,
+                "tools_count": len(self.registry.tools) if self.registry.tools else 0,
+                "prompt_preview": user_prompt[:200],
+                "has_validator": output_validator is not None,
+            },
+        )
 
         while iteration < max_iterations:
             iteration += 1
             logger.info(f"[{self.name}] ReAct iteration {iteration}/{max_iterations}")
 
             kwargs: dict[str, Any] = dict(
-                model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -168,8 +289,13 @@ class BaseAgent:
                 kwargs["tool_choice"] = "auto"
 
             t0 = time.monotonic()
-            response = await self.llm_client.chat.completions.create(**kwargs)
+            response, used_model = await self._chat_completion_with_fallback(
+                kwargs,
+                self._build_model_chain(active_model),
+                iteration=iteration,
+            )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
+            active_model = used_model
 
             msg = response.choices[0].message
             usage = response.usage
@@ -177,7 +303,7 @@ class BaseAgent:
             completion_tokens = usage.completion_tokens if usage else 0
 
             log_llm_call(
-                model=model,
+                model=used_model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 duration_ms=elapsed_ms,
@@ -186,8 +312,10 @@ class BaseAgent:
             )
 
             self._record_reasoning(
-                thinking=msg.content[:500] if msg.content else f"[tool_calls: {len(msg.tool_calls or [])}]",
-                model=model,
+                thinking=msg.content[:500]
+                if msg.content
+                else f"[tool_calls: {len(msg.tool_calls or [])}]",
+                model=used_model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 duration_ms=elapsed_ms,
@@ -203,34 +331,46 @@ class BaseAgent:
                     is_valid, error_msg = output_validator.validate(final_content)
                     if not is_valid:
                         validation_retries += 1
-                        log_agent_event(self.name, "react_validation_failed", {
-                            "retry": validation_retries,
-                            "max_retries": MAX_VALIDATION_RETRIES,
-                            "error": error_msg,
-                            "output_preview": final_content[:200],
-                        })
+                        log_agent_event(
+                            self.name,
+                            "react_validation_failed",
+                            {
+                                "retry": validation_retries,
+                                "max_retries": MAX_VALIDATION_RETRIES,
+                                "error": error_msg,
+                                "output_preview": final_content[:200],
+                            },
+                        )
                         logger.warning(
                             f"[{self.name}] Output validation failed (retry {validation_retries}/{MAX_VALIDATION_RETRIES}): {error_msg}"
                         )
                         # Inject correction feedback and let the loop continue
                         messages.append({"role": "assistant", "content": final_content})
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"Your output is INVALID and was rejected by the validation system.\n"
-                                f"Error: {error_msg}\n\n"
-                                f"Please fix your response and try again. "
-                                f"Respond with ONLY the corrected output."
-                            ),
-                        })
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Your output is INVALID and was rejected by the validation system.\n"
+                                    f"Error: {error_msg}\n\n"
+                                    f"Please fix your response and try again. "
+                                    f"Respond with ONLY the corrected output."
+                                ),
+                            }
+                        )
                         continue  # Re-enter the ReAct loop
 
-                log_agent_event(self.name, "react_complete", {
-                    "iterations": iteration,
-                    "result_length": len(final_content),
-                    "validation_retries": validation_retries,
-                })
-                logger.info(f"[{self.name}] ReAct concluded after {iteration} iteration(s)")
+                log_agent_event(
+                    self.name,
+                    "react_complete",
+                    {
+                        "iterations": iteration,
+                        "result_length": len(final_content),
+                        "validation_retries": validation_retries,
+                    },
+                )
+                logger.info(
+                    f"[{self.name}] ReAct concluded after {iteration} iteration(s)"
+                )
                 return final_content
 
             messages.append(self._assistant_message_from_response(msg))
@@ -240,35 +380,46 @@ class BaseAgent:
                 t_start = time.monotonic()
                 result = await self.registry.execute(tc)
                 tool_duration = int((time.monotonic() - t_start) * 1000)
-                
+
                 log_tool_call(
                     tool_name=tc.tool_name,
                     arguments=tc.arguments,
                     success=result.success,
                     duration_ms=tool_duration,
-                    result_preview=str(result.data)[:200] if result.data else result.error,
+                    result_preview=str(result.data)[:200]
+                    if result.data
+                    else result.error,
                     agent=self.name,
                 )
-                
+
                 await self._emit_tool_result_event(tc, result)
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": result.to_message_content(),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.call_id,
+                        "content": result.to_message_content(),
+                    }
+                )
 
-        log_agent_event(self.name, "react_max_iterations", {
-            "iterations": max_iterations,
-            "validation_retries": validation_retries,
-        })
+        log_agent_event(
+            self.name,
+            "react_max_iterations",
+            {
+                "iterations": max_iterations,
+                "validation_retries": validation_retries,
+            },
+        )
         logger.warning(f"[{self.name}] ReAct hit max iterations ({max_iterations})")
         last_content = ""
         for m in reversed(messages):
             if m.get("role") == "assistant" and m.get("content"):
                 last_content = m["content"]
                 break
-        return last_content or '{"error": "Agent reached maximum reasoning iterations without a final answer"}'
+        return (
+            last_content
+            or '{"error": "Agent reached maximum reasoning iterations without a final answer"}'
+        )
 
     async def reason_and_act_json(
         self,
@@ -305,8 +456,11 @@ class BaseAgent:
         max_tokens: int = 4096,
     ) -> str:
         result = await self._llm_call_with_reasoning(
-            system_prompt, user_prompt, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            system_prompt,
+            user_prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         return result.content
 
@@ -318,8 +472,11 @@ class BaseAgent:
         temperature: float = 0.0,
     ) -> str:
         result = await self._llm_call_with_reasoning(
-            system_prompt, user_prompt, model=model,
-            temperature=temperature, max_tokens=4096,
+            system_prompt,
+            user_prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=4096,
             json_mode=True,
         )
         return result.content
@@ -334,11 +491,11 @@ class BaseAgent:
         max_tokens: int = 4096,
         json_mode: bool = False,
     ) -> LLMCallResult:
-        model = model or Settings.GROQ_LLM_MODEL
-        logger.info(f"[{self.name}] LLM call: model={model}")
+        primary_model = model or self._resolve_default_model()
+        model_chain = self._build_model_chain(primary_model)
+        logger.info(f"[{self.name}] LLM call: model={primary_model}")
 
         kwargs: dict = dict(
-            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -350,7 +507,9 @@ class BaseAgent:
             kwargs["response_format"] = {"type": "json_object"}
 
         t0 = time.monotonic()
-        response = await self.llm_client.chat.completions.create(**kwargs)
+        response, used_model = await self._chat_completion_with_fallback(
+            kwargs, model_chain
+        )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         content = response.choices[0].message.content or ("" if not json_mode else "{}")
@@ -362,7 +521,7 @@ class BaseAgent:
 
         result = LLMCallResult(
             content=content,
-            model=model,
+            model=used_model,
             prompt_summary=prompt_summary,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -376,7 +535,7 @@ class BaseAgent:
 
         self._record_reasoning(
             thinking=content[:500],
-            model=model,
+            model=used_model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             duration_ms=elapsed_ms,
@@ -388,11 +547,15 @@ class BaseAgent:
         if self._event_publisher:
             try:
                 await self._event_publisher.step_progress(
-                    self._agent_type_key, message, detail=metadata,
+                    self._agent_type_key,
+                    message,
+                    detail=metadata,
                     step_id=self._current_step_id,
                 )
             except Exception:
-                logger.debug(f"[{self.name}] Failed to emit progress event", exc_info=True)
+                logger.debug(
+                    f"[{self.name}] Failed to emit progress event", exc_info=True
+                )
 
     def _record_reasoning(
         self,
@@ -421,15 +584,22 @@ class BaseAgent:
         if self._event_publisher:
             try:
                 import asyncio
-                asyncio.ensure_future(self._event_publisher.reasoning(
-                    agent_type=self._agent_type_key,
-                    thinking=thinking,
-                    prompt_summary=f"ReAct iteration {iteration}" if iteration else None,
-                    token_usage=entry["token_usage"],
-                    step_id=self._current_step_id,
-                ))
+
+                asyncio.ensure_future(
+                    self._event_publisher.reasoning(
+                        agent_type=self._agent_type_key,
+                        thinking=thinking,
+                        prompt_summary=f"ReAct iteration {iteration}"
+                        if iteration
+                        else None,
+                        token_usage=entry["token_usage"],
+                        step_id=self._current_step_id,
+                    )
+                )
             except Exception:
-                logger.debug(f"[{self.name}] Failed to emit reasoning event", exc_info=True)
+                logger.debug(
+                    f"[{self.name}] Failed to emit reasoning event", exc_info=True
+                )
 
     async def _emit_tool_call_event(self, call: ToolCall) -> None:
         if self._event_publisher:
@@ -441,7 +611,9 @@ class BaseAgent:
                     step_id=self._current_step_id,
                 )
             except Exception:
-                logger.debug(f"[{self.name}] Failed to emit tool call event", exc_info=True)
+                logger.debug(
+                    f"[{self.name}] Failed to emit tool call event", exc_info=True
+                )
 
     async def _emit_tool_result_event(self, call: ToolCall, result: ToolResult) -> None:
         if self._event_publisher:
@@ -455,11 +627,15 @@ class BaseAgent:
                     detail["error"] = result.error
                 msg = f"Tool {call.tool_name}: {'OK' if result.success else 'FAILED'} ({result.duration_ms}ms)"
                 await self._event_publisher.step_progress(
-                    self._agent_type_key, msg, detail=detail,
+                    self._agent_type_key,
+                    msg,
+                    detail=detail,
                     step_id=self._current_step_id,
                 )
             except Exception:
-                logger.debug(f"[{self.name}] Failed to emit tool result event", exc_info=True)
+                logger.debug(
+                    f"[{self.name}] Failed to emit tool result event", exc_info=True
+                )
 
     @staticmethod
     def _assistant_message_from_response(msg) -> dict[str, Any]:
@@ -486,7 +662,9 @@ class BaseAgent:
         if stripped.startswith("{") or stripped.startswith("["):
             return stripped
 
-        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
+        fence_match = re.search(
+            r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL
+        )
         if fence_match:
             return fence_match.group(1).strip()
 

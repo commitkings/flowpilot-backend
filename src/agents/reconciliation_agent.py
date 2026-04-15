@@ -867,6 +867,7 @@ Steps:
             response = await self.reason_and_act_json(
                 system_prompt=RECONCILIATION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL_RECONCILIATION,
             )
 
             try:
@@ -911,26 +912,30 @@ Steps:
             # ── Write data quality flags for downstream agents ──
             dq_flags = list(state.get("data_quality_flags", []))
             if not transactions:
-                dq_flags.append({
-                    "source": "reconciliation",
-                    "flag": "transaction_data_unavailable",
-                    "detail": (
-                        "Transaction Search returned 0 transactions. "
-                        "This may be due to API auth errors (401/408), "
-                        "simulated mode, or genuinely no activity in the period."
-                    ),
-                    "severity": "high",
-                })
+                dq_flags.append(
+                    {
+                        "source": "reconciliation",
+                        "flag": "transaction_data_unavailable",
+                        "detail": (
+                            "Transaction Search returned 0 transactions. "
+                            "This may be due to API auth errors (401/408), "
+                            "simulated mode, or genuinely no activity in the period."
+                        ),
+                        "severity": "high",
+                    }
+                )
             elif Settings.is_reconciliation_simulated():
-                dq_flags.append({
-                    "source": "reconciliation",
-                    "flag": "reconciliation_simulated",
-                    "detail": (
-                        "Reconciliation ran in simulated mode. "
-                        "Transaction data is synthetic and should not be used for risk decisions."
-                    ),
-                    "severity": "medium",
-                })
+                dq_flags.append(
+                    {
+                        "source": "reconciliation",
+                        "flag": "reconciliation_simulated",
+                        "detail": (
+                            "Reconciliation ran in simulated mode. "
+                            "Transaction data is synthetic and should not be used for risk decisions."
+                        ),
+                        "severity": "medium",
+                    }
+                )
 
             await self.emit_progress(
                 f"Reconciliation complete — {len(transactions)} txns, "

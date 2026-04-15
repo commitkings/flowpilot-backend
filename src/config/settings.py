@@ -22,11 +22,16 @@ def _fetch_secret_from_arn(secret_arn: str) -> Optional[dict]:
     """Fetch secret value from AWS Secrets Manager."""
     try:
         import boto3
+
         logger.info(f"Fetching secret from ARN: {secret_arn[:60]}...")
-        client = boto3.client("secretsmanager", region_name=os.getenv("AWS_REGION", "us-east-1"))
+        client = boto3.client(
+            "secretsmanager", region_name=os.getenv("AWS_REGION", "us-east-1")
+        )
         response = client.get_secret_value(SecretId=secret_arn)
         secret_data = json.loads(response["SecretString"])
-        logger.info(f"✅ Successfully loaded {len(secret_data)} keys from Secrets Manager")
+        logger.info(
+            f"✅ Successfully loaded {len(secret_data)} keys from Secrets Manager"
+        )
         return secret_data
     except Exception as e:
         logger.error(f"Failed to fetch secret {secret_arn}: {type(e).__name__}: {e}")
@@ -70,6 +75,7 @@ def get_database_url() -> Optional[str]:
         _cached_database_url = _get_database_url()
     return _cached_database_url
 
+
 def _get_api_secrets() -> dict:
     secret_arn = os.getenv("API_SECRETS_ARN")
     if not secret_arn:
@@ -79,7 +85,6 @@ def _get_api_secrets() -> dict:
 
 
 class Settings:
-
     _api_secrets: dict = {}
 
     @classmethod
@@ -89,9 +94,13 @@ class Settings:
             if secret_arn:
                 logger.info("Initializing API secrets from Secrets Manager...")
                 cls._api_secrets = _get_api_secrets()
-                logger.info(f"Loaded {len(cls._api_secrets)} API secrets from Secrets Manager")
+                logger.info(
+                    f"Loaded {len(cls._api_secrets)} API secrets from Secrets Manager"
+                )
             else:
-                logger.debug("API_SECRETS_ARN not set - using environment variables for secrets")
+                logger.debug(
+                    "API_SECRETS_ARN not set - using environment variables for secrets"
+                )
 
     @classmethod
     def _get_secret(cls, env_key: str, secret_key: str) -> Optional[str]:
@@ -139,7 +148,9 @@ class Settings:
     # ------------------------------------------------------------------
     # Interswitch API
     # ------------------------------------------------------------------
-    INTERSWITCH_BASE_URL: str = os.getenv("INTERSWITCH_BASE_URL", "https://qa.interswitchng.com")
+    INTERSWITCH_BASE_URL: str = os.getenv(
+        "INTERSWITCH_BASE_URL", "https://qa.interswitchng.com"
+    )
     INTERSWITCH_PAYOUTS_BASE_URL: str = os.getenv(
         "INTERSWITCH_PAYOUTS_BASE_URL", "https://api.interswitchng.com"
     )
@@ -185,7 +196,9 @@ class Settings:
     @classmethod
     def is_payout_configured(cls) -> bool:
         """Check if wallet-based payout credentials are set."""
-        return cls.is_interswitch_configured() and bool(cls.INTERSWITCH_WALLET_ID and cls.INTERSWITCH_WALLET_PIN)
+        return cls.is_interswitch_configured() and bool(
+            cls.INTERSWITCH_WALLET_ID and cls.INTERSWITCH_WALLET_PIN
+        )
 
     @classmethod
     def is_payout_simulated(cls) -> bool:
@@ -217,7 +230,9 @@ class Settings:
             base = cls.INTERSWITCH_BASE_URL.lower()
             payouts_base = cls.INTERSWITCH_PAYOUTS_BASE_URL.lower()
             base_is_qa = "qa.interswitchng" in base
-            payouts_is_prod = "api.interswitchng" in payouts_base and "qa" not in payouts_base
+            payouts_is_prod = (
+                "api.interswitchng" in payouts_base and "qa" not in payouts_base
+            )
             if base_is_qa and payouts_is_prod:
                 warnings.append(
                     "Environment mismatch: INTERSWITCH_BASE_URL points to QA "
@@ -243,9 +258,47 @@ class Settings:
     # Groq API (LLM)
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
-    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL")
-    # Fast/cheap model for simple tasks (intent classification, slot extraction, response generation)
+    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+    # Fast/cheap model for simple tasks (intent classification, slot extraction)
     GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant")
+    # High-reliability model for multi-step reasoning + tool orchestration.
+    GROQ_LLM_MODEL_REASONING: str = os.getenv(
+        "GROQ_LLM_MODEL_REASONING", "llama-3.3-70b-versatile"
+    )
+    # Model with high completion ceiling for long summaries/reports.
+    GROQ_LLM_MODEL_LONG_CONTEXT: str = os.getenv(
+        "GROQ_LLM_MODEL_LONG_CONTEXT", "openai/gpt-oss-120b"
+    )
+    # Per-agent model overrides (defaults follow current routing strategy).
+    GROQ_LLM_MODEL_PLANNER: str = os.getenv(
+        "GROQ_LLM_MODEL_PLANNER", GROQ_LLM_MODEL_REASONING
+    )
+    GROQ_LLM_MODEL_RECONCILIATION: str = os.getenv(
+        "GROQ_LLM_MODEL_RECONCILIATION", GROQ_LLM_MODEL_LONG_CONTEXT
+    )
+    GROQ_LLM_MODEL_RISK: str = os.getenv(
+        "GROQ_LLM_MODEL_RISK", GROQ_LLM_MODEL_REASONING
+    )
+    GROQ_LLM_MODEL_EXECUTION: str = os.getenv(
+        "GROQ_LLM_MODEL_EXECUTION", GROQ_LLM_MODEL_REASONING
+    )
+    GROQ_LLM_MODEL_AUDIT: str = os.getenv(
+        "GROQ_LLM_MODEL_AUDIT", GROQ_LLM_MODEL_LONG_CONTEXT
+    )
+    # Safety / vision defaults aligned with active Groq model set.
+    GROQ_LLM_MODEL_SAFETY: str = os.getenv(
+        "GROQ_LLM_MODEL_SAFETY", "openai/gpt-oss-safeguard-20b"
+    )
+    GROQ_LLM_MODEL_VISION: str = os.getenv(
+        "GROQ_LLM_MODEL_VISION", "meta-llama/llama-4-scout-17b-16e-instruct"
+    )
+    # Fallback chain used when primary model is unavailable / rate limited.
+    GROQ_LLM_MODEL_FALLBACK_PRIMARY: str = os.getenv(
+        "GROQ_LLM_MODEL_FALLBACK_PRIMARY", "openai/gpt-oss-120b"
+    )
+    GROQ_LLM_MODEL_FALLBACK_SECONDARY: str = os.getenv(
+        "GROQ_LLM_MODEL_FALLBACK_SECONDARY", "openai/gpt-oss-20b"
+    )
 
     @property
     def groq_api_key(self) -> Optional[str]:
@@ -268,9 +321,7 @@ class Settings:
     JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3001")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
-    PASSWORD_HASH_ITERATIONS: int = int(
-        os.getenv("PASSWORD_HASH_ITERATIONS", "600000")
-    )
+    PASSWORD_HASH_ITERATIONS: int = int(os.getenv("PASSWORD_HASH_ITERATIONS", "600000"))
     PASSWORD_RESET_TOKEN_EXPIRY_MINUTES: int = int(
         os.getenv("PASSWORD_RESET_TOKEN_EXPIRY_MINUTES", "30")
     )

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Intent Taxonomy
 # ─────────────────────────────────────────────────────────────────────
 
+
 class FlowPilotIntent(str, Enum):
     """All recognized user intents for FlowPilot."""
 
@@ -52,14 +53,14 @@ class FlowPilotIntent(str, Enum):
 _INTENT_TO_LEGACY: dict[FlowPilotIntent, str] = {
     FlowPilotIntent.CREATE_PAYOUT_RUN: "create_payout_run",
     FlowPilotIntent.CHECK_RUN_STATUS: "check_run_status",
-    FlowPilotIntent.REVIEW_CANDIDATES: "check_run_status",   # routes to status for now
-    FlowPilotIntent.APPROVE_REJECT: "create_payout_run",     # approval context
+    FlowPilotIntent.REVIEW_CANDIDATES: "check_run_status",  # routes to status for now
+    FlowPilotIntent.APPROVE_REJECT: "create_payout_run",  # approval context
     FlowPilotIntent.EXPLAIN_SYSTEM: "explain_system",
-    FlowPilotIntent.VIEW_AUDIT: "check_run_status",          # status-adjacent
+    FlowPilotIntent.VIEW_AUDIT: "check_run_status",  # status-adjacent
     FlowPilotIntent.MODIFY_CONFIG: "modify_config",
     FlowPilotIntent.GREETING: "greeting",
     FlowPilotIntent.FAREWELL: "farewell",
-    FlowPilotIntent.ACKNOWLEDGEMENT: "greeting",             # respond warmly
+    FlowPilotIntent.ACKNOWLEDGEMENT: "greeting",  # respond warmly
     FlowPilotIntent.UNCLEAR: "unclear",
 }
 
@@ -71,7 +72,7 @@ class IntentResult:
     intent: FlowPilotIntent
     confidence: float
     reasoning: str = ""
-    tier: int = 0          # 1 = regex, 2 = keyword-filter, 3 = LLM
+    tier: int = 0  # 1 = regex, 2 = keyword-filter, 3 = LLM
     raw_response: Optional[str] = None
 
     @property
@@ -90,16 +91,51 @@ class IntentResult:
 # ─────────────────────────────────────────────────────────────────────
 
 _GREETING_PATTERNS: set[str] = {
-    "hi", "hello", "hey", "howdy", "greetings", "yo", "sup", "wassup",
-    "good morning", "good afternoon", "good evening", "good night",
-    "hi there", "hey there", "hello there", "morning", "afternoon",
-    "how are you", "how you dey", "how far", "e kaaro", "e kaasan",
-    "sannu", "nnoo", "kedu", "whats up", "hiya",
-    "hey dude", "hey man", "hey bro", "hey fam", "hey boss",
-    "hi dude", "hi man", "hi bro", "hi fam", "hi boss",
-    "hello there friend", "hello fam",
-    "how are you doing", "how you doing", "hows it going", "how is it going",
-    "how goes it", "how do you do",
+    "hi",
+    "hello",
+    "hey",
+    "howdy",
+    "greetings",
+    "yo",
+    "sup",
+    "wassup",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good night",
+    "hi there",
+    "hey there",
+    "hello there",
+    "morning",
+    "afternoon",
+    "how are you",
+    "how you dey",
+    "how far",
+    "e kaaro",
+    "e kaasan",
+    "sannu",
+    "nnoo",
+    "kedu",
+    "whats up",
+    "hiya",
+    "hey dude",
+    "hey man",
+    "hey bro",
+    "hey fam",
+    "hey boss",
+    "hi dude",
+    "hi man",
+    "hi bro",
+    "hi fam",
+    "hi boss",
+    "hello there friend",
+    "hello fam",
+    "how are you doing",
+    "how you doing",
+    "hows it going",
+    "how is it going",
+    "how goes it",
+    "how do you do",
 }
 
 _GREETING_PREFIXES: tuple[str, ...] = (
@@ -122,32 +158,120 @@ _GREETING_PREFIXES: tuple[str, ...] = (
 )
 
 _FAREWELL_PATTERNS: set[str] = {
-    "bye", "goodbye", "good bye", "see you", "later", "gotta go",
-    "take care", "ciao", "cheers", "peace", "adios", "see ya",
-    "talk later", "catch you later", "i'm done", "that's all",
-    "thanks bye", "thank you bye", "bye bye", "ok bye",
+    "bye",
+    "goodbye",
+    "good bye",
+    "see you",
+    "later",
+    "gotta go",
+    "take care",
+    "ciao",
+    "cheers",
+    "peace",
+    "adios",
+    "see ya",
+    "talk later",
+    "catch you later",
+    "i'm done",
+    "that's all",
+    "thanks bye",
+    "thank you bye",
+    "bye bye",
+    "ok bye",
 }
 
 _ACKNOWLEDGEMENT_PATTERNS: set[str] = {
     # English
-    "ok", "okay", "alright", "got it", "i see", "hmm", "hmm i see",
-    "thanks", "thank you", "cool", "nice", "great", "good", "understood",
-    "makes sense", "i understand", "noted", "sure", "right", "yes", "yep",
-    "ah", "ah ok", "ah i see", "oh", "oh ok", "oh i see", "interesting",
-    "perfect", "exactly", "indeed", "true", "fair enough", "yeah", "yea",
-    "fine", "wonderful", "awesome", "incredible", "brilliant",
+    "ok",
+    "okay",
+    "alright",
+    "got it",
+    "i see",
+    "hmm",
+    "hmm i see",
+    "thanks",
+    "thank you",
+    "cool",
+    "nice",
+    "great",
+    "good",
+    "understood",
+    "makes sense",
+    "i understand",
+    "noted",
+    "sure",
+    "right",
+    "yes",
+    "yep",
+    "ah",
+    "ah ok",
+    "ah i see",
+    "oh",
+    "oh ok",
+    "oh i see",
+    "interesting",
+    "perfect",
+    "exactly",
+    "indeed",
+    "true",
+    "fair enough",
+    "yeah",
+    "yea",
+    "fine",
+    "wonderful",
+    "awesome",
+    "incredible",
+    "brilliant",
     # Nigerian Pidgin
-    "oya", "oya nah", "na so", "e clear", "i don hear", "i understand am",
-    "e good", "na true", "correct", "sharp", "sharp sharp", "no wahala",
-    "okay na", "alright na", "na him be dat",
+    "oya",
+    "oya nah",
+    "na so",
+    "e clear",
+    "i don hear",
+    "i understand am",
+    "e good",
+    "na true",
+    "correct",
+    "sharp",
+    "sharp sharp",
+    "no wahala",
+    "okay na",
+    "alright na",
+    "na him be dat",
 }
 
 # First-word triggers for short acknowledgement detection (≤4 words)
 _ACK_FIRST_WORDS: set[str] = {
-    "ok", "okay", "hmm", "ah", "oh", "thanks", "cool", "nice", "great",
-    "good", "yes", "yep", "right", "oya", "sharp", "correct", "noted",
-    "alright", "sure", "perfect", "exactly", "indeed", "true", "fine",
-    "awesome", "brilliant", "wonderful", "yeah", "yea", "fair",
+    "ok",
+    "okay",
+    "hmm",
+    "ah",
+    "oh",
+    "thanks",
+    "cool",
+    "nice",
+    "great",
+    "good",
+    "yes",
+    "yep",
+    "right",
+    "oya",
+    "sharp",
+    "correct",
+    "noted",
+    "alright",
+    "sure",
+    "perfect",
+    "exactly",
+    "indeed",
+    "true",
+    "fine",
+    "awesome",
+    "brilliant",
+    "wonderful",
+    "yeah",
+    "yea",
+    "fair",
 }
 
 
@@ -256,11 +380,33 @@ _NAME_PATTERN = re.compile(
 
 # Bank/institution mention
 _BANK_KEYWORDS = {
-    "bank", "gtbank", "gtb", "access", "zenith", "uba", "firstbank",
-    "first bank", "fidelity", "sterling", "wema", "stanbic", "polaris",
-    "keystone", "fcmb", "union", "ecobank", "heritage", "jaiz",
-    "providus", "titan", "globus", "suntrust", "citi", "standard",
-    "guaranty", "guarantee",
+    "bank",
+    "gtbank",
+    "gtb",
+    "access",
+    "zenith",
+    "uba",
+    "firstbank",
+    "first bank",
+    "fidelity",
+    "sterling",
+    "wema",
+    "stanbic",
+    "polaris",
+    "keystone",
+    "fcmb",
+    "union",
+    "ecobank",
+    "heritage",
+    "jaiz",
+    "providus",
+    "titan",
+    "globus",
+    "suntrust",
+    "citi",
+    "standard",
+    "guaranty",
+    "guarantee",
 }
 
 # Risk tolerance pattern: "0.35", "use 0.45", "set it to 0.5"
@@ -270,9 +416,7 @@ _RISK_TOLERANCE_PATTERN = re.compile(
 )
 
 # Account number pattern: exactly 10 digits possibly with leading text
-_ACCOUNT_NUMBER_PATTERN = re.compile(
-    r"(?:^|\s)\d{10}(?:\s|$)"
-)
+_ACCOUNT_NUMBER_PATTERN = re.compile(r"(?:^|\s)\d{10}(?:\s|$)")
 
 # "No budget cap" or similar negation
 _NO_BUDGET_PATTERN = re.compile(
@@ -391,11 +535,26 @@ def _tier0_slot_fill_detect(message: str) -> Optional[IntentResult]:
     if 1 <= len(words) <= 6:
         lower_words = {w.lower() for w in words}
         objective_keywords = {
-            "salary", "salaries", "payroll", "vendor", "vendors",
-            "contractor", "contractors", "payment", "payments",
-            "settlement", "settlements", "commission", "commissions",
-            "bonus", "bonuses", "stipend", "stipends", "wages",
-            "reimbursement", "disbursement",
+            "salary",
+            "salaries",
+            "payroll",
+            "vendor",
+            "vendors",
+            "contractor",
+            "contractors",
+            "payment",
+            "payments",
+            "settlement",
+            "settlements",
+            "commission",
+            "commissions",
+            "bonus",
+            "bonuses",
+            "stipend",
+            "stipends",
+            "wages",
+            "reimbursement",
+            "disbursement",
         }
         if lower_words & objective_keywords:
             return IntentResult(
@@ -414,30 +573,121 @@ def _tier0_slot_fill_detect(message: str) -> Optional[IntentResult]:
 
 _FINANCIAL_KEYWORDS: set[str] = {
     # Payout/payment
-    "pay", "payout", "payouts", "payment", "salary", "salaries",
-    "disburse", "disbursement", "transfer", "remit", "remittance",
-    "vendor", "beneficiary", "beneficiaries", "candidate", "candidates",
-    "execute", "settlement", "commission", "bonus", "wage", "wages",
-    "invoice", "refund", "reimbursement", "stipend",
+    "pay",
+    "payout",
+    "payouts",
+    "payment",
+    "salary",
+    "salaries",
+    "disburse",
+    "disbursement",
+    "transfer",
+    "remit",
+    "remittance",
+    "vendor",
+    "beneficiary",
+    "beneficiaries",
+    "candidate",
+    "candidates",
+    "execute",
+    "settlement",
+    "commission",
+    "bonus",
+    "wage",
+    "wages",
+    "invoice",
+    "refund",
+    "reimbursement",
+    "stipend",
     # Run management
-    "run", "runs", "pipeline", "status", "approve", "reject", "approval",
-    "review", "score", "risk", "audit", "reconcile", "reconciliation",
-    "execute", "execution", "batch",
+    "run",
+    "runs",
+    "pipeline",
+    "status",
+    "approve",
+    "reject",
+    "approval",
+    "review",
+    "score",
+    "risk",
+    "audit",
+    "reconcile",
+    "reconciliation",
+    "execute",
+    "execution",
+    "batch",
     # System
-    "flowpilot", "flow pilot", "how does", "what is", "explain", "help",
-    "configure", "config", "setting", "settings", "threshold", "tolerance",
-    "budget", "cap", "limit", "merchant",
+    "flowpilot",
+    "flow pilot",
+    "how does",
+    "what is",
+    "explain",
+    "help",
+    "configure",
+    "config",
+    "setting",
+    "settings",
+    "threshold",
+    "tolerance",
+    "budget",
+    "cap",
+    "limit",
+    "merchant",
     # Financial
-    "account", "bank", "institution", "interswitch", "transaction",
-    "transactions", "amount", "naira", "ngn", "balance", "wallet",
-    "ledger", "anomaly", "fraud", "duplicate",
+    "account",
+    "bank",
+    "institution",
+    "interswitch",
+    "transaction",
+    "transactions",
+    "amount",
+    "naira",
+    "ngn",
+    "balance",
+    "wallet",
+    "ledger",
+    "anomaly",
+    "fraud",
+    "duplicate",
     # Date/time words (so date replies don't get rejected by T2)
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
-    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    "date", "start", "end", "from", "to", "period", "month", "year",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+    "date",
+    "start",
+    "end",
+    "from",
+    "to",
+    "period",
+    "month",
+    "year",
     # Confirmation/flow words
-    "default", "proceed", "yes", "no", "none", "skip",
+    "default",
+    "proceed",
+    "yes",
+    "no",
+    "none",
+    "skip",
 }
 
 
@@ -554,6 +804,7 @@ Respond with ONLY valid JSON:
 # Intent Service
 # ─────────────────────────────────────────────────────────────────────
 
+
 class IntentService:
     """
     World-class multi-layered intent classification for FlowPilot.
@@ -637,9 +888,7 @@ class IntentService:
                 reasoning="No financial/system keywords detected — skipping LLM",
                 tier=2,
             )
-            logger.info(
-                f"Intent [T2]: unclear (no keywords) for: '{message[:50]}'"
-            )
+            logger.info(f"Intent [T2]: unclear (no keywords) for: '{message[:50]}'")
             return result
 
         # ── Tier 3: LLM classification ──
@@ -668,7 +917,7 @@ class IntentService:
         try:
             client = self._get_client()
             response = await client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=Settings.GROQ_LLM_MODEL_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=80,
@@ -732,7 +981,9 @@ class IntentService:
             )
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"Failed to parse LLM intent response: {e}, raw: {raw[:200]}")
+            logger.warning(
+                f"Failed to parse LLM intent response: {e}, raw: {raw[:200]}"
+            )
             return IntentResult(
                 intent=FlowPilotIntent.UNCLEAR,
                 confidence=0.5,
