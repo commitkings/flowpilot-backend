@@ -577,6 +577,36 @@ async def send_kyc_verified_email(
     )
 
 
+async def send_scheduled_run_created_email(
+    to: str,
+    display_name: str,
+    schedule_name: str,
+    objective: str,
+    frequency_label: str,
+    next_run_at: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Confirm to the owner that a new scheduled run was created."""
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "scheduled_run_created.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        schedule_name=schedule_name,
+        objective=objective,
+        frequency_label=frequency_label,
+        next_run_at=next_run_at,
+        schedules_url=f"{base}/dashboard/runs?tab=scheduled",
+    )
+    return await _send(
+        to=to,
+        subject=f"Scheduled run created: \"{schedule_name}\" — FlowPilot",
+        html=html,
+    )
+
+
 async def send_scheduled_run_reminder_email(
     to: str,
     display_name: str,

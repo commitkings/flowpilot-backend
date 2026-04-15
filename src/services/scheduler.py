@@ -278,6 +278,24 @@ async def _check_api_key_expiry() -> None:
                         owner.display_name or owner.email.split("@")[0]
                     )
 
+                    # In-app notification
+                    from src.infrastructure.database.repositories.notification_repository import NotificationRepository as _NR
+                    _notif_repo = _NR(session)
+                    await _notif_repo.create(
+                        user_id=owner.id,
+                        business_id=key.business_id,
+                        title=f"API key expiring in {days_left} day{'s' if days_left != 1 else ''}",
+                        message=(
+                            f'Your API key "{key.name}" ({key.key_prefix}…) expires in {days_left} day{"s" if days_left != 1 else ""}. '
+                            "Rotate it in Developer Tools to avoid service disruption."
+                        ),
+                        type="warning",
+                        resource_type="api_key",
+                        resource_id=str(key.id),
+                    )
+                    await session.commit()
+
+                    # Email
                     from src.services.email_service import send_api_key_expiry_warning
                     await send_api_key_expiry_warning(
                         to=owner.email,

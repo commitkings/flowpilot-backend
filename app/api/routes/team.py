@@ -499,6 +499,131 @@ async def toggle_member_status(
     return {"status": "updated", "member": _serialize_member(target, target.user)}
 
 
+@router.delete("/team/invitations/{invite_id}")
+async def revoke_invitation(
+    invite_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Revoke a pending invitation. Owner only."""
+    caller = await _get_caller_membership(session, current_user.id)
+    _require_owner(caller)
+
+    try:
+        iid = uuid.UUID(invite_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid invitation ID")
+
+    invite_repo = InvitationRepository(session)
+    invite = await invite_repo.get_by_id(iid)
+
+    if not invite or str(invite.business_id) != str(caller.business_id):
+        raise HTTPException(status_code=404, detail="Invitation not found")
+
+    if invite.status != "pending":
+        raise HTTPException(status_code=400, detail="Invitation is not pending")
+
+    await invite_repo.mark_revoked(invite)
+    await session.commit()
+    return {"status": "revoked"}
+
+
+@router.post("/team/invitations/{invite_id}/resend")
+async def resend_invitation(
+    invite_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Resend a pending (or recently expired) invitation. Owner only."""
+    caller = await _get_caller_membership(session, current_user.id)
+    _require_owner(caller)
+
+    try:
+        iid = uuid.UUID(invite_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid invitation ID")
+
+    invite_repo = InvitationRepository(session)
+    invite = await invite_repo.get_by_id(iid)
+
+    if not invite or str(invite.business_id) != str(caller.business_id):
+        raise HTTPException(status_code=404, detail="Invitation not found")
+
+    if invite.status == "accepted":
+        raise HTTPException(status_code=400, detail="Invitation has already been accepted")
+
+    if invite.status == "revoked":
+        raise HTTPException(status_code=400, detail="Invitation has been revoked")
+
+    new_token = await invite_repo.refresh_token_and_expiry(invite)
+    await session.commit()
+
+    business_name = caller.business.business_name if caller.business else "your organisation"
+    inviter_name = current_user.display_name or current_user.email
+    accept_url = f"{Settings.FRONTEND_URL}{Settings.ACCEPT_INVITE_PATH}?token={new_token}"
+
+    await send_team_invite_email(
+        to=invite.invited_email,
+        business_name=business_name,
+        inviter_name=inviter_name,
+        role=invite.role,
+        accept_url=accept_url,
+        frontend_url=Settings.FRONTEND_URL,
+    )
+
+    return {"status": "resent", "invited_email": invite.invited_email}
+
+
+@router.delete("/team/members/{member_id}/delete-user")
+async def delete_member_user(
+    member_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Permanently delete a user from the platform. Owner only.
+
+    Removes their team membership and deactivates their user account.
+    Their historical activity (runs, transactions, audit logs) is preserved.
+    """
+    caller = await _get_caller_membership(session, current_user.id)
+    _require_owner(caller)
+
+    try:
+        mid = uuid.UUID(member_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid member ID")
+
+    target = (
+        await session.execute(
+            select(BusinessMemberModel)
+            .options(selectinload(BusinessMemberModel.user))
+            .where(
+                BusinessMemberModel.id == mid,
+                BusinessMemberModel.business_id == caller.business_id,
+            )
+        )
+    ).scalars().first()
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Team member not found")
+
+    if target.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account from here")
+
+    if target.role == "owner":
+        raise HTTPException(status_code=400, detail="Cannot delete another owner")
+
+    # Deactivate the user account (keeps their data for audit trail)
+    if target.user:
+        target.user.is_active = False
+
+    # Remove team membership
+    await session.delete(target)
+    await session.commit()
+
+    return {"status": "deleted", "message": "User account deactivated and removed from team"}
+
+
 @router.delete("/team/members/{member_id}")
 async def remove_member(
     member_id: str,

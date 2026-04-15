@@ -24,8 +24,11 @@ from app.api.auth.role_deps import require_role
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
+    BusinessModel,
     ScheduledRunModel,
+    UserModel,
 )
+from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 
 router = APIRouter(tags=["scheduled-runs"])
 
@@ -111,6 +114,19 @@ async def create_scheduled_run(
     next_run = _next_run_from_cron(body.cron_expression)
 
     business_id = await _get_business_id(current_user, session)
+
+    # KYC gate: business must be verified before scheduling runs
+    biz_result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == business_id)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if biz and biz.kyc_status != "verified":
+        detail = (
+            "Your business is pending KYC verification. Scheduled runs will be available once verified."
+            if biz.kyc_status == "pending"
+            else "Business verification (KYC) is required before creating scheduled runs. Please complete your KYC."
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
     scheduled = ScheduledRunModel(
         business_id=business_id,
         created_by=current_user.id,
@@ -124,6 +140,59 @@ async def create_scheduled_run(
     session.add(scheduled)
     await session.commit()
     await session.refresh(scheduled)
+
+    # Notify the owner — in-app + email (best-effort, non-blocking)
+    try:
+        owner_result = await session.execute(
+            select(BusinessMemberModel, UserModel)
+            .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+            .where(
+                BusinessMemberModel.business_id == business_id,
+                BusinessMemberModel.role == "owner",
+                BusinessMemberModel.is_active.is_(True),
+            )
+            .limit(1)
+        )
+        owner_row = owner_result.first()
+        if owner_row:
+            _, owner_user = owner_row
+            next_run_str = (
+                scheduled.next_run_at.strftime("%A, %d %B %Y at %I:%M %p UTC")
+                if scheduled.next_run_at else "—"
+            )
+
+            # In-app notification
+            notif_repo = NotificationRepository(session)
+            await notif_repo.create(
+                user_id=owner_user.id,
+                business_id=business_id,
+                title="Scheduled run created",
+                message=(
+                    f'"{scheduled.name}" ({scheduled.frequency_label}) has been set up. '
+                    f"First run: {next_run_str}."
+                ),
+                type="success",
+                resource_type="scheduled_run",
+                resource_id=str(scheduled.id),
+            )
+            await session.commit()
+
+            # Email (fire-and-forget)
+            import asyncio as _asyncio
+            from src.services.email_service import send_scheduled_run_created_email
+            _asyncio.create_task(
+                send_scheduled_run_created_email(
+                    to=owner_user.email,
+                    display_name=owner_user.display_name or owner_user.email,
+                    schedule_name=scheduled.name,
+                    objective=scheduled.objective,
+                    frequency_label=scheduled.frequency_label,
+                    next_run_at=next_run_str,
+                )
+            )
+    except Exception as _exc:
+        logger.warning("[ScheduledRun] Could not send creation notification: %s", _exc)
+
     return _serialize(scheduled)
 
 

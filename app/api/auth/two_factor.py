@@ -199,7 +199,18 @@ async def enable_2fa(
 
     await session.commit()
 
-    # Fire-and-forget security notification email
+    # In-app notification
+    _notif_repo = NotificationRepository(session)
+    await _notif_repo.create(
+        user_id=current_user.id,
+        title="Two-factor authentication enabled",
+        message="Your account is now protected with 2FA. Keep your backup codes somewhere safe.",
+        type="success",
+        resource_type="security",
+    )
+    await session.commit()
+
+    # Security notification email
     await send_2fa_enabled_email(
         to=current_user.email,
         display_name=current_user.display_name,
@@ -234,6 +245,17 @@ async def disable_2fa(
     current_user.totp_secret = None
     current_user.totp_enabled_at = None
     current_user.backup_codes_hash = None
+    await session.commit()
+
+    # In-app notification
+    _notif_repo = NotificationRepository(session)
+    await _notif_repo.create(
+        user_id=current_user.id,
+        title="Two-factor authentication disabled",
+        message="2FA has been turned off. Re-enable it in Settings → Security to keep your account protected.",
+        type="warning",
+        resource_type="security",
+    )
     await session.commit()
 
     await send_2fa_disabled_email(

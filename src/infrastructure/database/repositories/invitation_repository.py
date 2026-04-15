@@ -93,3 +93,22 @@ class InvitationRepository:
     async def mark_expired(self, invite: InvitationModel) -> None:
         invite.status = "expired"
         await self._session.flush()
+
+    async def mark_revoked(self, invite: InvitationModel) -> None:
+        invite.status = "revoked"
+        await self._session.flush()
+
+    async def get_by_id(self, invite_id: uuid.UUID) -> Optional[InvitationModel]:
+        result = await self._session.execute(
+            select(InvitationModel).where(InvitationModel.id == invite_id)
+        )
+        return result.scalars().first()
+
+    async def refresh_token_and_expiry(self, invite: InvitationModel) -> str:
+        """Generate a new token and reset the expiry. Returns the new token."""
+        new_token = _generate_invite_token()
+        invite.token = new_token
+        invite.expires_at = _invite_expires_at()
+        invite.status = "pending"
+        await self._session.flush()
+        return new_token

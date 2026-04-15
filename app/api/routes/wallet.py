@@ -174,12 +174,30 @@ async def topup_wallet(
 
     new_balance = float(tx.balance_after)
 
-    # Fire top-up confirmation email (best-effort, non-blocking)
+    # Fire top-up confirmation email + in-app notification (best-effort, non-blocking)
     if created:
         try:
             owner_row = await _get_owner(session, business_uuid)
             if owner_row:
                 _, owner_user = owner_row
+
+                # In-app notification
+                from src.infrastructure.database.repositories.notification_repository import NotificationRepository
+                notif_repo = NotificationRepository(session)
+                await notif_repo.create(
+                    user_id=owner_user.id,
+                    business_id=business_uuid,
+                    title="Wallet top-up successful",
+                    message=(
+                        f"₦{float(amount):,.2f} has been credited to your wallet. "
+                        f"New balance: ₦{new_balance:,.2f}."
+                    ),
+                    type="success",
+                    resource_type="wallet",
+                )
+                await session.commit()
+
+                # Email
                 from src.services.email_service import send_wallet_topup_email
                 import asyncio as _asyncio
                 _asyncio.create_task(
@@ -192,7 +210,7 @@ async def topup_wallet(
                     )
                 )
         except Exception as exc:
-            logger.warning("[Wallet] Could not send top-up email: %s", exc)
+            logger.warning("[Wallet] Could not send top-up notification: %s", exc)
 
     return TopUpResponse(
         balance=new_balance,

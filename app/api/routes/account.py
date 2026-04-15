@@ -1,6 +1,5 @@
 """
-Account actions — data export and account deletion.
-Both actions are restricted to the business owner.
+Account actions — data export, import, and account/org deletion.
 """
 
 import json
@@ -8,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pyotp
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -223,14 +222,12 @@ async def request_delete_code(
     current_user=Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Send a 6-digit deletion confirmation code to the owner's email.
+    """Send a 6-digit deletion confirmation code to the caller's email.
 
-    Only applicable when the owner does not have 2FA enabled.
-    If 2FA is enabled, the client should use the TOTP code instead.
-    Owner only.
+    Works for both owners (organisation deletion) and non-owners (self-deletion).
+    Only applicable when the caller does not have 2FA enabled — if they do,
+    they should use their TOTP code instead.
     """
-    await _require_owner(session, current_user.id)
-
     if getattr(current_user, "totp_enabled_at", None) is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -314,3 +311,243 @@ async def delete_account(
 
     await session.commit()
     return {"status": "deleted", "message": "Account and workspace have been deactivated."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-deletion for non-owners
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.delete("/delete-self")
+async def delete_self(
+    body: DeleteAccountRequest = Body(default_factory=DeleteAccountRequest),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Allow a non-owner member to delete their own account.
+
+    Requires identity verification:
+    - If 2FA is enabled: provide a valid TOTP code via `totp_code`
+    - If 2FA is not enabled: provide the email code sent via /account/request-delete-code
+
+    Removes their business membership and deactivates their user account.
+    Historical activity (runs, audit logs) is preserved.
+    Owners cannot use this endpoint — they must delete the organisation instead.
+    """
+    # Check if caller is an owner — owners must use the /delete endpoint
+    membership = (
+        await session.execute(
+            select(BusinessMemberModel).where(
+                BusinessMemberModel.user_id == current_user.id
+            )
+        )
+    ).scalars().first()
+
+    if membership and membership.role == "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="As an organisation owner, you must delete the organisation instead of your individual account.",
+        )
+
+    # ── Verify identity ───────────────────────────────────────────────────────
+    if getattr(current_user, "totp_enabled_at", None) is not None:
+        if not body.totp_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Two-factor authentication code required",
+            )
+        totp = pyotp.TOTP(current_user.totp_secret)
+        if not totp.verify(body.totp_code, valid_window=1):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authentication code",
+            )
+    else:
+        if not body.delete_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email verification code required",
+            )
+        ok = await account_delete_store.verify(str(current_user.id), body.delete_code)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired verification code",
+            )
+
+    # Remove the membership record
+    if membership:
+        await session.delete(membership)
+
+    # Deactivate the user
+    current_user.is_active = False
+
+    await session.commit()
+    return {"status": "deleted", "message": "Your account has been deactivated."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data import
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/import")
+async def import_account_data(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Import a previously exported workspace JSON to restore business and profile data.
+
+    Restores:
+    - Business profile (name, type, city, state, country, phone, website)
+    - Owner's personal profile (display_name, first_name, last_name, job_title, phone, timezone, department)
+    - Team members (non-owner members are re-invited if not already in the org)
+
+    Runs, transactions and audit logs are NOT imported (operational data).
+    Owner only.
+    """
+    membership = await _require_owner(session, current_user.id)
+    business_id = membership.business_id
+
+    if file.content_type not in ("application/json", "text/plain", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="File must be a JSON export from FlowPilot")
+
+    content = await file.read()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+
+    if "exported_at" not in data or "business" not in data:
+        raise HTTPException(
+            status_code=400,
+            detail="This does not appear to be a valid FlowPilot export file",
+        )
+
+    restored: list[str] = []
+
+    # ── Restore business profile ──────────────────────────────────────────────
+    biz_data = data.get("business") or {}
+    if biz_data:
+        biz = (
+            await session.execute(
+                select(BusinessModel).where(BusinessModel.id == business_id)
+            )
+        ).scalars().first()
+
+        if biz:
+            for field in ("business_name", "business_type", "rc_number", "tax_id", "city", "state", "country", "phone", "website"):
+                val = biz_data.get(field)
+                if val and not getattr(biz, field, None):
+                    setattr(biz, field, val)
+            restored.append("business_profile")
+
+    # ── Restore owner profile ─────────────────────────────────────────────────
+    user_data = data.get("user") or {}
+    if user_data:
+        for field in ("display_name", "first_name", "last_name", "job_title", "phone", "timezone", "department"):
+            val = user_data.get(field)
+            if val and not getattr(current_user, field, None):
+                setattr(current_user, field, val)
+        restored.append("owner_profile")
+
+    # ── Re-invite team members ────────────────────────────────────────────────
+    team_members = data.get("team_members") or []
+    invited_count = 0
+    skipped_count = 0
+
+    if team_members:
+        from src.infrastructure.database.repositories.invitation_repository import InvitationRepository
+        from src.infrastructure.database.repositories.user_repository import UserRepository as _UR
+        from src.services.email_service import send_team_invite_email, send_team_added_email
+        from app.api.auth.passwords import normalize_email
+
+        invite_repo = InvitationRepository(session)
+        user_repo = _UR(session)
+        business_name = biz_data.get("business_name") or "your organisation"
+        inviter_name = current_user.display_name or current_user.email
+        dashboard_url = f"{Settings.FRONTEND_URL}/dashboard"
+
+        for m in team_members:
+            email = m.get("email")
+            role = m.get("role", "analyst")
+
+            if not email or role == "owner":
+                continue
+
+            try:
+                normalized = normalize_email(email)
+            except Exception:
+                continue
+
+            if normalized == normalize_email(current_user.email):
+                continue
+
+            # Check if already a member
+            target_user = await user_repo.get_by_email(normalized)
+            if target_user:
+                from sqlalchemy import and_
+                existing = (
+                    await session.execute(
+                        select(BusinessMemberModel).where(
+                            and_(
+                                BusinessMemberModel.business_id == business_id,
+                                BusinessMemberModel.user_id == target_user.id,
+                            )
+                        )
+                    )
+                ).scalars().first()
+                if existing:
+                    skipped_count += 1
+                    continue
+
+                from src.infrastructure.database.flowpilot_models import BusinessMemberModel as _BMM
+                member = _BMM(
+                    business_id=business_id,
+                    user_id=target_user.id,
+                    role=role if role in ("approver", "analyst") else "analyst",
+                    joined_at=datetime.now(timezone.utc),
+                )
+                session.add(member)
+                await session.flush()
+                await send_team_added_email(
+                    to=target_user.email,
+                    business_name=business_name,
+                    inviter_name=inviter_name,
+                    role=role,
+                    dashboard_url=dashboard_url,
+                    frontend_url=Settings.FRONTEND_URL,
+                )
+                invited_count += 1
+            else:
+                existing_invite = await invite_repo.get_pending_for_business(business_id, normalized)
+                if existing_invite:
+                    skipped_count += 1
+                    continue
+
+                invite = await invite_repo.create(
+                    business_id=business_id,
+                    invited_email=normalized,
+                    role=role if role in ("approver", "analyst") else "analyst",
+                    invited_by_user_id=current_user.id,
+                )
+                accept_url = f"{Settings.FRONTEND_URL}{Settings.ACCEPT_INVITE_PATH}?token={invite.token}"
+                await send_team_invite_email(
+                    to=normalized,
+                    business_name=business_name,
+                    inviter_name=inviter_name,
+                    role=role,
+                    accept_url=accept_url,
+                    frontend_url=Settings.FRONTEND_URL,
+                )
+                invited_count += 1
+
+        if invited_count > 0:
+            restored.append(f"team_members ({invited_count} re-invited, {skipped_count} skipped)")
+
+    await session.commit()
+
+    return {
+        "status": "imported",
+        "restored": restored,
+        "exported_at": data.get("exported_at"),
+    }

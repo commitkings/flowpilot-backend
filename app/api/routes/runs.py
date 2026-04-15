@@ -385,7 +385,7 @@ async def create_run(
     await session.commit()
     await session.refresh(run)
 
-    # Fire low-balance email in background (after commit so balance is final)
+    # Fire low-balance alert (email + in-app) after commit so balance is final
     if _wallet_balance_after is not None:
         from src.infrastructure.database.repositories.wallet_repository import LOW_BALANCE_THRESHOLD as _LBT
         if Decimal(str(_wallet_balance_after)) < _LBT:
@@ -405,6 +405,23 @@ async def create_run(
                 _owner_row = _owner_result.first()
                 if _owner_row:
                     _, _owner_user = _owner_row
+
+                    # In-app notification
+                    _notif_repo = NotificationRepository(session)
+                    await _notif_repo.create(
+                        user_id=_owner_user.id,
+                        business_id=business_uuid,
+                        title="Wallet balance is low",
+                        message=(
+                            f"Your wallet balance (₦{_wallet_balance_after:,.2f}) is below the "
+                            f"₦{float(_LBT):,.2f} threshold. Top up to avoid disrupting payout runs."
+                        ),
+                        type="warning",
+                        resource_type="wallet",
+                    )
+                    await session.commit()
+
+                    # Email
                     _asyncio.create_task(
                         _send_lb(
                             to=_owner_user.email,
@@ -414,7 +431,7 @@ async def create_run(
                         )
                     )
             except Exception as _lb_exc:
-                logger.warning("[Wallet] Could not send low-balance email: %s", _lb_exc)
+                logger.warning("[Wallet] Could not send low-balance alert: %s", _lb_exc)
 
     run_id = str(run.id)
 
