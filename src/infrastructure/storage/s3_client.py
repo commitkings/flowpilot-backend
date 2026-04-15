@@ -2,23 +2,37 @@
 
 Uses boto3 with the configured MINIO_ENDPOINT. Falls back gracefully if
 the bucket is unreachable (e.g. local dev without a running MinIO instance).
+
+Performance notes:
+- The boto3 client is created once and reused (module-level singleton).
+- The bucket is checked for existence only once per process lifetime.
+- All blocking boto3 I/O runs in a thread pool so the asyncio event loop
+  is never blocked during uploads or presigned-URL generation.
 """
 
+import asyncio
 import logging
 import mimetypes
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio.bureau.svc.cluster.local:9000")
+# Public-facing endpoint used for generating presigned URLs that browsers can reach.
+# Defaults to the internal endpoint (works for local dev where MinIO isn't used).
+_MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", _MINIO_ENDPOINT)
 _BUCKET = os.getenv("MINIO_BUCKET", "flowpilot")
 _ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "")
 _SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 _REGION = os.getenv("AWS_S3_REGION_NAME", "us-east-1")
 
 _PRESIGNED_EXPIRY = 3600  # 1 hour for presigned URLs
+
+# Thread pool for blocking boto3 I/O (keeps the async event loop free).
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="s3_upload")
 
 # ── Magic-byte signatures for allowed file types ───────────────────────────────
 
@@ -67,31 +81,88 @@ def validate_document(data: bytes, max_bytes: int = 10 * 1024 * 1024) -> str:
     return ""
 
 
-def _get_client():
-    """Return a boto3 S3 client pointed at MinIO."""
-    import boto3
-    from botocore.config import Config
+# ── Singleton boto3 clients ────────────────────────────────────────────────────
 
-    return boto3.client(
-        "s3",
-        endpoint_url=_MINIO_ENDPOINT,
-        aws_access_key_id=_ACCESS_KEY,
-        aws_secret_access_key=_SECRET_KEY,
-        region_name=_REGION,
-        config=Config(signature_version="s3v4"),
-    )
+_upload_client = None   # client used for put_object (internal endpoint)
+_public_client = None   # client used for presigned URLs (public endpoint)
+_bucket_ready = False   # bucket existence checked at most once
 
 
-def _ensure_bucket(client) -> None:
-    """Create the bucket if it doesn't exist."""
+def _get_upload_client():
+    """Return (and lazily create) the singleton upload client."""
+    global _upload_client
+    if _upload_client is None:
+        import boto3
+        from botocore.config import Config
+        _upload_client = boto3.client(
+            "s3",
+            endpoint_url=_MINIO_ENDPOINT,
+            aws_access_key_id=_ACCESS_KEY,
+            aws_secret_access_key=_SECRET_KEY,
+            region_name=_REGION,
+            config=Config(signature_version="s3v4"),
+        )
+    return _upload_client
+
+
+def _get_public_client():
+    """Return (and lazily create) the singleton presigned-URL client.
+
+    Uses the public endpoint so generated URLs are reachable from browsers.
+    """
+    global _public_client
+    if _public_client is None:
+        import boto3
+        from botocore.config import Config
+        _public_client = boto3.client(
+            "s3",
+            endpoint_url=_MINIO_PUBLIC_ENDPOINT,
+            aws_access_key_id=_ACCESS_KEY,
+            aws_secret_access_key=_SECRET_KEY,
+            region_name=_REGION,
+            config=Config(signature_version="s3v4"),
+        )
+    return _public_client
+
+
+def _ensure_bucket_sync(client) -> None:
+    """Create the bucket if it doesn't exist. Only runs once per process."""
+    global _bucket_ready
+    if _bucket_ready:
+        return
     try:
         client.head_bucket(Bucket=_BUCKET)
+        _bucket_ready = True
     except Exception:
         try:
             client.create_bucket(Bucket=_BUCKET)
+            _bucket_ready = True
             logger.info("Created MinIO bucket: %s", _BUCKET)
         except Exception as exc:
             logger.warning("Could not create bucket %s: %s", _BUCKET, exc)
+
+
+def _upload_sync(file_bytes: bytes, object_key: str, content_type: str) -> bool:
+    """Blocking upload — runs inside the thread pool."""
+    client = _get_upload_client()
+    _ensure_bucket_sync(client)
+    client.put_object(
+        Bucket=_BUCKET,
+        Key=object_key,
+        Body=file_bytes,
+        ContentType=content_type,
+    )
+    return True
+
+
+def _presigned_sync(object_key: str, expiry: int) -> Optional[str]:
+    """Blocking presigned URL generation — runs inside the thread pool."""
+    client = _get_public_client()
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": _BUCKET, "Key": object_key},
+        ExpiresIn=expiry,
+    )
 
 
 async def upload_file(
@@ -105,6 +176,8 @@ async def upload_file(
     Returns the object key on success, None on failure.
     The caller should store the key and use get_presigned_url() to generate
     time-limited download URLs.
+
+    All blocking I/O runs in a thread pool so the asyncio event loop is free.
     """
     if not content_type:
         guessed, _ = mimetypes.guess_type(filename)
@@ -113,15 +186,9 @@ async def upload_file(
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
     object_key = f"{folder}/{uuid.uuid4().hex}.{ext}"
 
+    loop = asyncio.get_running_loop()
     try:
-        client = _get_client()
-        _ensure_bucket(client)
-        client.put_object(
-            Bucket=_BUCKET,
-            Key=object_key,
-            Body=file_bytes,
-            ContentType=content_type,
-        )
+        await loop.run_in_executor(_executor, _upload_sync, file_bytes, object_key, content_type)
         logger.info("Uploaded %s → s3://%s/%s", filename, _BUCKET, object_key)
         return object_key
     except Exception as exc:
@@ -133,15 +200,53 @@ def get_presigned_url(object_key: str, expiry: int = _PRESIGNED_EXPIRY) -> Optio
     """Generate a presigned GET URL for the given object key.
 
     Returns None if the object doesn't exist or MinIO is unreachable.
+    Note: this is a synchronous function — call from a thread if needed in async context.
     """
     try:
-        client = _get_client()
-        url = client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": _BUCKET, "Key": object_key},
-            ExpiresIn=expiry,
-        )
-        return url
+        return _presigned_sync(object_key, expiry)
     except Exception as exc:
         logger.error("Failed to generate presigned URL for %s: %s", object_key, exc)
         return None
+
+
+def make_url_public(stored_url: Optional[str], expiry: int = 30 * 24 * 3600) -> Optional[str]:
+    """Rewrite a stored avatar/logo URL to be browser-accessible.
+
+    Handles three cases:
+    - None / empty  → returned as-is.
+    - Local path (/uploads/...) → returned as-is (Next.js proxies these).
+    - MinIO internal URL → extracts the object_key and regenerates the presigned
+      URL using the public endpoint (MINIO_PUBLIC_ENDPOINT env var).
+      If MINIO_PUBLIC_ENDPOINT equals the internal endpoint (not configured),
+      the original URL is returned unchanged.
+    """
+    if not stored_url:
+        return stored_url
+    # Local file — served via Next.js /uploads rewrite.
+    if stored_url.startswith("/uploads/") or stored_url.startswith("uploads/"):
+        return stored_url
+    # Not a MinIO URL at all (e.g. already an http URL we don't own).
+    if _MINIO_ENDPOINT not in stored_url and _MINIO_PUBLIC_ENDPOINT not in stored_url:
+        return stored_url
+    # If no distinct public endpoint is configured, we can't rewrite the URL.
+    if _MINIO_PUBLIC_ENDPOINT == _MINIO_ENDPOINT:
+        logger.warning(
+            "MINIO_PUBLIC_ENDPOINT is not configured — avatar URLs will use the "
+            "internal MinIO hostname and may not be reachable from browsers. "
+            "Set MINIO_PUBLIC_ENDPOINT to the public-facing MinIO URL."
+        )
+        return stored_url
+    # Extract object_key from path: http://endpoint:port/{bucket}/{object_key}?sig...
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(stored_url)
+        path = parsed.path.lstrip("/")
+        if path.startswith(_BUCKET + "/"):
+            object_key = path[len(_BUCKET) + 1:]
+        else:
+            object_key = path
+        regenerated = get_presigned_url(object_key, expiry=expiry)
+        return regenerated or stored_url
+    except Exception as exc:
+        logger.error("Failed to rewrite MinIO URL %s: %s", stored_url, exc)
+        return stored_url

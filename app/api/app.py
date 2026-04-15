@@ -120,6 +120,10 @@ app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(two_factor_router, prefix="/api/v1/auth", tags=["2fa"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
+# IMPORTANT: scheduled_runs_router must be included BEFORE runs_router.
+# The runs router has GET /runs/{run_id} which would match /runs/scheduled
+# as run_id="scheduled" and raise a 400, shadowing the correct route.
+app.include_router(scheduled_runs_router, prefix="/api/v1", tags=["scheduled-runs"])
 app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
 app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
 app.include_router(approvals_queue_router, prefix="/api/v1", tags=["approvals-queue"])
@@ -133,7 +137,6 @@ app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
 app.include_router(dashboard_router, prefix="/api/v1", tags=["dashboard"])
 app.include_router(developer_router, prefix="/api/v1", tags=["developer"])
 app.include_router(org_config_router, prefix="/api/v1", tags=["org-config"])
-app.include_router(scheduled_runs_router, prefix="/api/v1", tags=["scheduled-runs"])
 app.include_router(public_api_router, prefix="/api/v1", tags=["public-api"])
 app.include_router(kyc_router, prefix="/api/v1", tags=["kyc"])
 app.include_router(wallet_router, prefix="/api/v1", tags=["wallet"])

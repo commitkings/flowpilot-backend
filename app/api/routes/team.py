@@ -67,6 +67,7 @@ def _require_owner(membership: BusinessMemberModel) -> None:
 
 
 def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) -> dict:
+    from src.infrastructure.storage import s3_client as _s3
     return {
         "id": str(member.id),
         "user_id": str(member.user_id),
@@ -78,7 +79,7 @@ def _serialize_member(member: BusinessMemberModel, user: Optional[UserModel]) ->
         "user": {
             "display_name": user.display_name if user else None,
             "email": user.email if user else None,
-            "avatar_url": user.avatar_url if user else None,
+            "avatar_url": _s3.make_url_public(user.avatar_url) if user else None,
         }
         if user
         else None,

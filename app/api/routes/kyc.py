@@ -168,10 +168,13 @@ async def submit_kyc(
             )
         return await s3_client.upload_file(content, upload.filename or "document", folder=folder)
 
-    cac_key = await _upload(cac_certificate, "kyc/cac")
-    tin_key = await _upload(tin_document, "kyc/tin")
-    dir_key = await _upload(director_id, "kyc/director_id")
-    poa_key = await _upload(proof_of_address, "kyc/proof_of_address")
+    # Upload all documents concurrently instead of sequentially.
+    cac_key, tin_key, dir_key, poa_key = await asyncio.gather(
+        _upload(cac_certificate, "kyc/cac"),
+        _upload(tin_document, "kyc/tin"),
+        _upload(director_id, "kyc/director_id"),
+        _upload(proof_of_address, "kyc/proof_of_address"),
+    )
 
     now = datetime.now(timezone.utc)
 

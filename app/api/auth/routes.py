@@ -101,11 +101,12 @@ def _user_response(user, memberships) -> dict:
     active_memberships = [
         m for m in memberships if getattr(m, "is_active", True)
     ]
+    from src.infrastructure.storage import s3_client as _s3
     return {
         "id": str(user.id),
         "email": user.email,
         "display_name": user.display_name,
-        "avatar_url": user.avatar_url,
+        "avatar_url": _s3.make_url_public(user.avatar_url),
         "first_name": user.first_name,
         "last_name": user.last_name,
         "job_title": user.job_title,
