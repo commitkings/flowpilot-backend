@@ -464,6 +464,22 @@ async def login_with_password(
             "mfa_token": mfa_token,
         }
 
+    # Check if any org this user belongs to requires 2FA but the user hasn't set it up.
+    requires_2fa_setup = False
+    from sqlalchemy import select as _select
+    from src.infrastructure.database.flowpilot_models import BusinessMemberModel, BusinessConfigModel
+    config_q = await session.execute(
+        _select(BusinessConfigModel)
+        .join(BusinessMemberModel, BusinessMemberModel.business_id == BusinessConfigModel.business_id)
+        .where(
+            BusinessMemberModel.user_id == user.id,
+            BusinessMemberModel.is_active == True,  # noqa: E712
+            BusinessConfigModel.require_2fa == True,  # noqa: E712
+        )
+        .limit(1)
+    )
+    requires_2fa_setup = config_q.scalars().first() is not None
+
     token = create_access_token(user.id, user.email)
     return {
         "token": token,
@@ -472,6 +488,7 @@ async def login_with_password(
             "email": user.email,
             "display_name": user.display_name,
         },
+        "requires_2fa_setup": requires_2fa_setup,
     }
 
 
@@ -574,9 +591,26 @@ async def google_callback(
         redirect_url = f"{Settings.FRONTEND_URL}/verify-2fa?mfa_token={mfa_token}"
         return RedirectResponse(redirect_url)
 
+    # Check if any org requires 2FA and user hasn't set it up
+    from sqlalchemy import select as _select_g
+    from src.infrastructure.database.flowpilot_models import BusinessMemberModel as _BMM, BusinessConfigModel as _BCM
+    _cfg_q = await session.execute(
+        _select_g(_BCM)
+        .join(_BMM, _BMM.business_id == _BCM.business_id)
+        .where(
+            _BMM.user_id == user.id,
+            _BMM.is_active == True,  # noqa: E712
+            _BCM.require_2fa == True,  # noqa: E712
+        )
+        .limit(1)
+    )
+    requires_2fa_setup = _cfg_q.scalars().first() is not None
+
     # Issue JWT and redirect to frontend
     jwt_token = create_access_token(user.id, user.email)
     redirect_url = f"{Settings.FRONTEND_URL}/auth/callback?token={jwt_token}"
+    if requires_2fa_setup:
+        redirect_url += "&requires_2fa_setup=true"
     return RedirectResponse(redirect_url)
 
 
