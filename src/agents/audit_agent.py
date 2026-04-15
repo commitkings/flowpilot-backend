@@ -173,12 +173,13 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
     total_paid_amount = _safe_float(metrics.get("total_amount_disbursed"))
 
     if not candidate_details:
-        parts = [
-            f"This run was created for {objective}, but there were no recipients in the summary bundle.",
+        sections = [
+            "Overview:\n"
+            f"- This run was created for {objective}, but there were no recipients in the summary bundle."
         ]
         if payout_mode == "simulated":
-            parts.append("This was a test run, so no real money was sent.")
-        return " ".join(parts)
+            sections.append("Outcome:\n- This was a test run, so no real money was sent.")
+        return "\n\n".join(sections)
 
     named_people = [str(detail.get("name") or "Unknown recipient") for detail in candidate_details[:5]]
     if total_candidates <= 5:
@@ -203,35 +204,35 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
         for detail in candidate_details
         if str(detail.get("lookup_status", "")).lower() in {"failed", "mismatch", "name_mismatch"}
     )
-
-    parts = [
+    overview_lines = [
+        "Overview:",
         (
-            f"This run reviewed {people_phrase} for {objective}, with a planned total of "
+            f"- This run reviewed {people_phrase} for {objective}, with a planned total of "
             f"{_format_ngn(total_requested_amount)}."
-        )
+        ),
     ]
+    if approved_count:
+        overview_lines.append(
+            f"- You approved {approved_count} recipient(s) after review so the run could continue."
+        )
 
+    risk_lines = ["Risk Review:"]
     if score_list:
         if review_count == total_candidates:
-            parts.append(
-                f"The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
-                f"comfort setting, so every recipient was held for human review before money could move."
+            risk_lines.append(
+                f"- The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
+                "comfort setting, so every recipient was held for human review before money could move."
             )
         else:
-            parts.append(
-                f"The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
+            risk_lines.append(
+                f"- The scores came in at {_join_plain(score_list)} against your {risk_tolerance:.2f} "
                 "comfort setting, which led to a mix of automatic holds and review decisions."
             )
-
-    if approved_count:
-        parts.append(
-            f"You approved {approved_count} recipient(s) after review so the run could continue."
-        )
-
     scoring_context_note = str(bundle.get("scoring_context_note") or "").strip()
     if scoring_context_note:
-        parts.append(scoring_context_note)
+        risk_lines.append(f"- {scoring_context_note}")
 
+    recipient_lines = ["Recipient Checks:"]
     for detail in candidate_details:
         name = str(detail.get("name") or "Unknown recipient")
         amount = _format_ngn(detail.get("amount"))
@@ -264,32 +265,40 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
             candidate_parts.append(tolerance_explanation)
         candidate_parts.append(_lookup_status_summary(detail))
         candidate_parts.append(_execution_status_summary(detail))
-        parts.append(" ".join(candidate_parts))
+        recipient_lines.append(f"- {' '.join(candidate_parts)}")
 
+    outcome_lines = ["Outcome:"]
     if total_paid_amount > 0:
-        parts.append(
-            f"In the end, {_format_ngn(total_paid_amount)} was sent successfully."
+        outcome_lines.append(
+            f"- In the end, {_format_ngn(total_paid_amount)} was sent successfully."
         )
     elif pending_count > 0:
-        parts.append(
-            f"No payout has fully completed yet, and {pending_count} payout(s) are still awaiting a final update."
+        outcome_lines.append(
+            f"- No payout has fully completed yet, and {pending_count} payout(s) are still awaiting a final update."
         )
     else:
-        parts.append("No payout was completed in this run.")
+        outcome_lines.append("- No payout was completed in this run.")
 
     if failed_count > 0 or lookup_failed_count > 0 or block_count > 0:
-        parts.append(
-            f"The run finished with exceptions because {lookup_failed_count} recipient(s) could not be confirmed "
+        outcome_lines.append(
+            f"- The run finished with exceptions because {lookup_failed_count} recipient(s) could not be confirmed "
             f"with the bank, {failed_count} payout attempt(s) failed after submission, and {success_count} of "
             f"{approved_count or total_candidates} approved payout(s) reached a successful finish."
         )
     else:
-        parts.append("The run finished cleanly with no unresolved payout issues.")
+        outcome_lines.append("- The run finished cleanly with no unresolved payout issues.")
 
     if payout_mode == "simulated":
-        parts.append("This was a test run, so no real money was sent.")
+        outcome_lines.append("- This was a test run, so no real money was sent.")
 
-    return " ".join(parts)
+    return "\n\n".join(
+        [
+            "\n".join(overview_lines),
+            "\n".join(risk_lines),
+            "\n".join(recipient_lines),
+            "\n".join(outcome_lines),
+        ]
+    )
 
 
 def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
