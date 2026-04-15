@@ -519,10 +519,39 @@ async def create_run(
             try:
                 import asyncio as _asyncio
                 from src.services.webhook_dispatcher import dispatch_event as _dispatch
+
+                _candidates = state.get("scored_candidates", [])
+                _total_amount = sum(float(c.get("amount", 0)) for c in _candidates)
+                _risk_breakdown = {"allow": 0, "review": 0, "block": 0}
+                _flagged: list[dict] = []
+                for _c in _candidates:
+                    _decision = _c.get("risk_decision", "allow")
+                    _risk_breakdown[_decision] = _risk_breakdown.get(_decision, 0) + 1
+                    if _decision in ("review", "block"):
+                        _flagged.append({
+                            "candidate_id": _c.get("candidate_id"),
+                            "beneficiary_name": _c.get("beneficiary_name"),
+                            "account_number": _c.get("account_number"),
+                            "institution_code": _c.get("institution_code"),
+                            "amount": float(_c.get("amount", 0)),
+                            "risk_score": float(_c.get("risk_score", 0)),
+                            "risk_decision": _decision,
+                            "risk_reasons": _c.get("risk_reasons", []),
+                        })
+
                 _asyncio.create_task(_dispatch(business_uuid, "approval.requested", {
                     "run_id": run_id,
                     "objective": request.objective,
-                    "candidate_count": len(state.get("scored_candidates", [])),
+                    "candidate_count": len(_candidates),
+                    "total_payout_amount": _total_amount,
+                    "currency": "NGN",
+                    "date_range": {
+                        "from": state.get("date_from"),
+                        "to": state.get("date_to"),
+                    },
+                    "risk_breakdown": _risk_breakdown,
+                    "flagged_candidates": _flagged,
+                    "approval_url": f"{Settings.FRONTEND_URL}/runs/{run_id}",
                 }))
             except Exception as _wh_exc:
                 logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
