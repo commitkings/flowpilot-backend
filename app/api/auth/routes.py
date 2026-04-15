@@ -530,57 +530,75 @@ async def google_callback(
             detail="Google OAuth not configured",
         )
 
+    _error_redirect = f"{Settings.FRONTEND_URL}/auth/callback?error=google_unavailable"
+
     # Exchange code for Google access token
-    async with httpx.AsyncClient() as client:
-        token_resp = await client.post(
-            GOOGLE_TOKEN_URL,
-            data={
-                "code": code,
-                "client_id": google_client_id,
-                "client_secret": google_client_secret,
-                "redirect_uri": Settings.GOOGLE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_resp = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": google_client_id,
+                    "client_secret": google_client_secret,
+                    "redirect_uri": Settings.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
+            )
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+        logger.error("Google token exchange network error: %s", exc)
+        return RedirectResponse(_error_redirect)
 
     if token_resp.status_code != 200:
         logger.error("Google token exchange failed: %s", token_resp.text)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Failed to authenticate with Google",
-        )
+        return RedirectResponse(_error_redirect)
 
     google_tokens = token_resp.json()
     should_return_raw_tokens = raw_tokens or state == "raw_tokens"
     if should_return_raw_tokens and not Settings.is_production():
         return google_tokens
-    access_token = google_tokens["access_token"]
+    access_token = google_tokens.get("access_token")
+    if not access_token:
+        logger.error("Google token response missing access_token: %s", google_tokens)
+        return RedirectResponse(_error_redirect)
 
     # Fetch user profile from Google
-    async with httpx.AsyncClient() as client:
-        userinfo_resp = await client.get(
-            GOOGLE_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            userinfo_resp = await client.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+        logger.error("Google userinfo network error: %s", exc)
+        return RedirectResponse(_error_redirect)
 
     if userinfo_resp.status_code != 200:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Failed to fetch Google user info",
-        )
+        logger.error("Google userinfo fetch failed: %s", userinfo_resp.text)
+        return RedirectResponse(_error_redirect)
 
     google_user = userinfo_resp.json()
+    google_email = google_user.get("email")
+    if not google_email:
+        logger.error("Google userinfo missing email field: %s", google_user)
+        return RedirectResponse(_error_redirect)
 
-    # Upsert user in local DB — Google already verifies the email
+    # Upsert user in local DB — Google already verifies the email.
+    # If an email/password account already exists for this email, Google is
+    # linked to it so the user can sign in either way going forward.
     from datetime import datetime, timezone as _tz
     repo = UserRepository(session)
     user = await repo.upsert_from_oauth(
         external_id=f"google:{google_user['id']}",
-        email=google_user["email"],
-        display_name=google_user.get("name", google_user["email"]),
+        email=google_email,
+        display_name=google_user.get("name", google_email),
         avatar_url=google_user.get("picture"),
         email_verified_at=datetime.now(_tz.utc),
     )
+
+    # Reject disabled accounts
+    if not user.is_active:
+        return RedirectResponse(f"{Settings.FRONTEND_URL}/auth/callback?error=account_disabled")
 
     # If 2FA is enabled, redirect to the MFA challenge page instead
     if user.totp_enabled_at is not None:

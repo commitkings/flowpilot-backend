@@ -442,7 +442,178 @@ async def _check_scheduled_reminders() -> None:
             await asyncio.sleep(60)
 
 
+_webhook_health_task: Optional[asyncio.Task] = None
 _2fa_reminder_task: Optional[asyncio.Task] = None
+
+# ── Webhook health monitoring ─────────────────────────────────────────────────
+
+# Number of consecutive delivery failures before we alert the owner.
+_WEBHOOK_FAIL_THRESHOLD = 3
+# How often to scan for unhealthy webhooks (15 minutes).
+_WEBHOOK_POLL_SECONDS = 900
+# Don't re-alert about the same webhook within this window.
+_WEBHOOK_ALERT_COOLDOWN = timedelta(hours=24)
+
+
+async def _check_webhook_health() -> None:
+    """Poll every 15 minutes for webhooks with consecutive delivery failures.
+
+    Strategy — passive, based on real delivery signal:
+    - For each active webhook, fetch the last `_WEBHOOK_FAIL_THRESHOLD` deliveries.
+    - If every one of them failed, the endpoint is considered unhealthy.
+    - Email the business owner once, then suppress re-alerts for 24 hours.
+    - The cooldown resets automatically if there has been a successful delivery
+      after the last alert, so a break-fix-break cycle will always re-alert.
+    """
+    from src.infrastructure.database.connection import get_session_factory
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessMemberModel,
+        UserModel,
+        WebhookDeliveryModel,
+        WebhookModel,
+    )
+    from src.infrastructure.database.repositories.notification_repository import (
+        NotificationRepository,
+    )
+    from src.services.email_service import send_webhook_unhealthy_email
+    from sqlalchemy import select
+
+    logger.info("[Scheduler] Webhook health check loop started")
+
+    # webhook_id → datetime of last alert sent
+    _alerted_at: dict[uuid.UUID, datetime] = {}
+
+    while True:
+        try:
+            await asyncio.sleep(_WEBHOOK_POLL_SECONDS)
+            now = datetime.now(timezone.utc)
+
+            async with get_session_factory()() as session:
+                webhooks_result = await session.execute(
+                    select(WebhookModel).where(WebhookModel.is_active.is_(True))
+                )
+                webhooks = webhooks_result.scalars().all()
+
+                for webhook in webhooks:
+                    # Fetch the last N deliveries for this webhook, newest first
+                    deliveries_result = await session.execute(
+                        select(WebhookDeliveryModel)
+                        .where(WebhookDeliveryModel.webhook_id == webhook.id)
+                        .order_by(WebhookDeliveryModel.delivered_at.desc())
+                        .limit(_WEBHOOK_FAIL_THRESHOLD)
+                    )
+                    recent = deliveries_result.scalars().all()
+
+                    # Need exactly the threshold count to make a confident judgement
+                    if len(recent) < _WEBHOOK_FAIL_THRESHOLD:
+                        continue
+
+                    # All of the recent deliveries must be failures
+                    if any(d.success for d in recent):
+                        continue
+
+                    # ── Determine whether to send an alert ──────────────────
+                    last_alert = _alerted_at.get(webhook.id)
+                    if last_alert is not None:
+                        # Check if there has been a successful delivery since
+                        # the last alert — if so, the issue recurred and we
+                        # should alert again regardless of cooldown.
+                        success_since_alert_result = await session.execute(
+                            select(WebhookDeliveryModel)
+                            .where(
+                                WebhookDeliveryModel.webhook_id == webhook.id,
+                                WebhookDeliveryModel.success.is_(True),
+                                WebhookDeliveryModel.delivered_at > last_alert,
+                            )
+                            .limit(1)
+                        )
+                        recovered_after_alert = (
+                            success_since_alert_result.scalars().first() is not None
+                        )
+
+                        if not recovered_after_alert:
+                            # Still failing from the same streak — respect cooldown
+                            if now - last_alert < _WEBHOOK_ALERT_COOLDOWN:
+                                continue
+
+                    # ── Find the business owner ──────────────────────────────
+                    owner_result = await session.execute(
+                        select(BusinessMemberModel, UserModel)
+                        .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+                        .where(
+                            BusinessMemberModel.business_id == webhook.business_id,
+                            BusinessMemberModel.role == "owner",
+                            BusinessMemberModel.is_active.is_(True),
+                        )
+                        .limit(1)
+                    )
+                    owner_row = owner_result.first()
+                    if not owner_row:
+                        continue
+                    _, owner = owner_row
+
+                    # ── Build alert context ──────────────────────────────────
+                    latest_failure = recent[0]  # already ordered newest first
+                    last_failure_at_str = latest_failure.delivered_at.strftime(
+                        "%d %b %Y at %I:%M %p UTC"
+                    )
+                    last_error = latest_failure.error_message or (
+                        f"HTTP {latest_failure.status_code}"
+                        if latest_failure.status_code
+                        else None
+                    )
+
+                    # ── In-app notification ──────────────────────────────────
+                    notif_repo = NotificationRepository(session)
+                    await notif_repo.create(
+                        user_id=owner.id,
+                        business_id=webhook.business_id,
+                        title="Webhook endpoint is failing",
+                        message=(
+                            f"Your webhook endpoint ({webhook.url}) has failed "
+                            f"{_WEBHOOK_FAIL_THRESHOLD} consecutive deliveries. "
+                            "Check your developer settings."
+                        ),
+                        type="warning",
+                        resource_type="webhook",
+                        resource_id=str(webhook.id),
+                    )
+                    await session.commit()
+
+                    # ── Email ────────────────────────────────────────────────
+                    sent = await send_webhook_unhealthy_email(
+                        to=owner.email,
+                        display_name=owner.display_name or owner.email,
+                        webhook_url=webhook.url,
+                        consecutive_failures=_WEBHOOK_FAIL_THRESHOLD,
+                        last_failure_at=last_failure_at_str,
+                        last_error=last_error,
+                    )
+
+                    if sent:
+                        _alerted_at[webhook.id] = now
+                        logger.info(
+                            "[Scheduler] Webhook health alert sent for webhook %s "
+                            "(business=%s owner=%s)",
+                            webhook.id,
+                            webhook.business_id,
+                            owner.email,
+                        )
+                    else:
+                        logger.warning(
+                            "[Scheduler] Failed to send webhook health alert for %s",
+                            webhook.id,
+                        )
+
+        except asyncio.CancelledError:
+            logger.info("[Scheduler] Webhook health check loop cancelled")
+            break
+        except Exception as exc:
+            logger.exception("[Scheduler] Error in webhook health check: %s", exc)
+            await asyncio.sleep(60)
+
+
+# ── 2FA grace expiry ──────────────────────────────────────────────────────────
 
 # Send the warning when grace_until is within this many minutes of expiry.
 _2FA_WARN_MINUTES = 20
@@ -522,8 +693,8 @@ async def _check_2fa_grace_expiry() -> None:
 
 
 def start_scheduler() -> None:
-    """Start the background dispatch loop. Call once from app lifespan."""
-    global _task, _expiry_task, _reminder_task, _2fa_reminder_task
+    """Start all background loops. Call once from app lifespan."""
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task
     if _task is None or _task.done():
         _task = asyncio.create_task(_dispatch_loop())
         logger.info("[Scheduler] Background task created")
@@ -536,11 +707,14 @@ def start_scheduler() -> None:
     if _2fa_reminder_task is None or _2fa_reminder_task.done():
         _2fa_reminder_task = asyncio.create_task(_check_2fa_grace_expiry())
         logger.info("[Scheduler] 2FA grace-expiry reminder task created")
+    if _webhook_health_task is None or _webhook_health_task.done():
+        _webhook_health_task = asyncio.create_task(_check_webhook_health())
+        logger.info("[Scheduler] Webhook health check task created")
 
 
 def stop_scheduler() -> None:
-    """Cancel the background dispatch loop. Call from app shutdown."""
-    global _task, _expiry_task, _reminder_task, _2fa_reminder_task
+    """Cancel all background loops. Call from app shutdown."""
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task
     if _task and not _task.done():
         _task.cancel()
         logger.info("[Scheduler] Background task cancelled")
@@ -553,3 +727,6 @@ def stop_scheduler() -> None:
     if _2fa_reminder_task and not _2fa_reminder_task.done():
         _2fa_reminder_task.cancel()
         logger.info("[Scheduler] 2FA grace-expiry reminder task cancelled")
+    if _webhook_health_task and not _webhook_health_task.done():
+        _webhook_health_task.cancel()
+        logger.info("[Scheduler] Webhook health check task cancelled")

@@ -32,17 +32,60 @@ class UserRepository:
     ) -> UserModel:
         """Create or update a user from an OAuth provider callback.
 
-        On conflict (external_id already exists) we update profile fields
-        and bump last_login_at. email_verified_at is set on first insert only
-        (existing users keep their existing verification state).
+        Lookup order:
+        1. By external_id  — returning Google user, just refresh fields.
+        2. By email        — existing email/password account; link Google to it
+                             so the user can use either sign-in method going forward.
+        3. Neither found   — new user; INSERT with ON CONFLICT on external_id to
+                             handle concurrent first-logins atomically.
+
+        email_verified_at is only set when the existing record has not yet been
+        verified (Google proving ownership is sufficient proof).
+        external_provider is always written so GET /auth/connections is accurate.
         """
         now = datetime.now(timezone_mod.utc)
+        normalized_email = email.strip().lower()
+
+        # ── 1. Returning Google user ──────────────────────────────────────────
+        user = await self.get_by_external_id(external_id)
+        if user is not None:
+            user.email = normalized_email
+            user.display_name = display_name
+            user.external_provider = "google"
+            if avatar_url:
+                user.avatar_url = avatar_url
+            user.last_login_at = now
+            if email_verified_at and user.email_verified_at is None:
+                user.email_verified_at = email_verified_at
+            await self._s.flush()
+            await self._s.commit()
+            return user
+
+        # ── 2. Existing email/password account — link Google ──────────────────
+        user = await self.get_by_email(normalized_email)
+        if user is not None:
+            user.external_id = external_id
+            user.external_provider = "google"
+            user.last_login_at = now
+            # Don't overwrite an avatar the user already chose
+            if avatar_url and not user.avatar_url:
+                user.avatar_url = avatar_url
+            # Google confirms the email — mark verified if not already
+            if email_verified_at and user.email_verified_at is None:
+                user.email_verified_at = email_verified_at
+            await self._s.flush()
+            await self._s.commit()
+            return user
+
+        # ── 3. Truly new user — atomic upsert handles concurrent first-logins ─
         insert_values: dict = {
             "external_id": external_id,
-            "email": email,
+            "external_provider": "google",
+            "email": normalized_email,
             "display_name": display_name,
             "avatar_url": avatar_url,
             "last_login_at": now,
+            "is_active": True,
         }
         if email_verified_at is not None:
             insert_values["email_verified_at"] = email_verified_at
@@ -53,11 +96,11 @@ class UserRepository:
             .on_conflict_do_update(
                 index_elements=["external_id"],
                 set_={
-                    "email": email,
+                    "email": normalized_email,
                     "display_name": display_name,
                     "avatar_url": avatar_url,
                     "last_login_at": now,
-                    # Only set email_verified_at if not already verified
+                    "external_provider": "google",
                     **(
                         {"email_verified_at": email_verified_at}
                         if email_verified_at is not None

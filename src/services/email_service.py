@@ -726,6 +726,39 @@ async def send_wallet_low_balance_email(
     )
 
 
+async def send_webhook_unhealthy_email(
+    to: str,
+    display_name: str,
+    webhook_url: str,
+    consecutive_failures: int,
+    last_failure_at: str,
+    last_error: Optional[str] = None,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Alert the business owner that a webhook endpoint has failed repeatedly.
+
+    Template: src/templates/emails/webhook_unhealthy.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "webhook_unhealthy.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        webhook_url=webhook_url,
+        consecutive_failures=consecutive_failures,
+        last_failure_at=last_failure_at,
+        last_error=last_error,
+        settings_url=f"{base}/dashboard/settings?tab=developer",
+    )
+    return await _send(
+        to=to,
+        subject=f"Webhook failing — {consecutive_failures} consecutive delivery errors",
+        html=html,
+    )
+
+
 async def send_account_deletion_code_email(
     to: str,
     display_name: str,

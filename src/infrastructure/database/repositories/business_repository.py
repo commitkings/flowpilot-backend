@@ -97,7 +97,7 @@ class BusinessRepository:
         allowed = {
             "business_name", "business_type", "rc_number", "tax_id",
             "city", "state", "country", "website", "phone",
-            "interswitch_merchant_id",
+            "interswitch_merchant_id", "logo_url",
         }
         for key, value in kwargs.items():
             if key in allowed and value is not None:
