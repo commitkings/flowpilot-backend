@@ -167,26 +167,26 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
 
     async def check_wallet_balance() -> dict[str, Any]:
         try:
-            from src.infrastructure.external_services.interswitch.payouts import (
-                PayoutClient,
+            from src.infrastructure.database.repositories.wallet_repository import (
+                WalletRepository,
             )
-            from src.config.settings import Settings
+            from uuid import UUID
 
-            if Settings.PAYOUT_MODE == "simulated":
-                return {
-                    "mode": "simulated",
-                    "available_balance": 5000000.00,
-                    "ledger_balance": 5000000.00,
-                    "currency": "NGN",
-                    "note": "Simulated balance — not real",
-                }
-            client = PayoutClient()
-            balance_data = await client.get_wallet_balance()
+            if db_session is None:
+                return {"error": "No database session available"}
+
+            business_id = state.get("business_id")
+            if not business_id:
+                return {"error": "No business_id in state"}
+
+            repo = WalletRepository(db_session)
+            wallet = await repo.get(UUID(str(business_id)))
+            if wallet is None:
+                return {"error": "Wallet not found for this business", "available_balance": 0}
+
             return {
-                "mode": "live",
-                "available_balance": balance_data.get("availableBalance"),
-                "ledger_balance": balance_data.get("ledgerBalance"),
-                "currency": "NGN",
+                "available_balance": float(wallet.balance),
+                "currency": wallet.currency,
             }
         except Exception as e:
             logger.error(f"check_wallet_balance failed: {e}", exc_info=True)
@@ -356,7 +356,7 @@ def _build_planner_tools(state: AgentState, db_session=None) -> list[Tool]:
         ),
         Tool(
             name="check_wallet_balance",
-            description="Check the current Interswitch wallet balance to verify available funds for payouts.",
+            description="Check the current FlowPilot wallet balance for this business to verify available funds for payouts.",
             parameters=[],
             execute=check_wallet_balance,
         ),
