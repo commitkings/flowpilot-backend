@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 from uuid import UUID
 
-from groq import AsyncGroq
+from groq import AsyncGroq, BadRequestError
 
 from src.agents.tools import ToolRegistry, ToolCall, ToolResult, parse_tool_calls_from_response
 from src.config.settings import Settings
@@ -168,7 +168,37 @@ class BaseAgent:
                 kwargs["tool_choice"] = "auto"
 
             t0 = time.monotonic()
-            response = await self.llm_client.chat.completions.create(**kwargs)
+            try:
+                response = await self.llm_client.chat.completions.create(**kwargs)
+            except BadRequestError as exc:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                recovered = self._recover_phantom_tool_call(exc)
+                if recovered is not None:
+                    logger.warning(
+                        f"[{self.name}] Recovered final answer from phantom tool call "
+                        f"({len(recovered)} chars, {elapsed_ms}ms)"
+                    )
+                    log_agent_event(self.name, "phantom_tool_recovered", {
+                        "model": model, "iteration": iteration,
+                        "recovered_length": len(recovered),
+                    })
+                    log_llm_call(
+                        model=model, prompt_tokens=0, completion_tokens=0,
+                        duration_ms=elapsed_ms, agent=self.name, iteration=iteration,
+                    )
+                    self._record_reasoning(
+                        thinking=recovered[:500], model=model,
+                        prompt_tokens=0, completion_tokens=0,
+                        duration_ms=elapsed_ms, iteration=iteration,
+                    )
+                    log_agent_event(self.name, "react_complete", {
+                        "iterations": iteration,
+                        "result_length": len(recovered),
+                        "validation_retries": validation_retries,
+                    })
+                    logger.info(f"[{self.name}] ReAct concluded after {iteration} iteration(s) (phantom recovery)")
+                    return recovered
+                raise
             elapsed_ms = int((time.monotonic() - t0) * 1000)
 
             msg = response.choices[0].message
@@ -383,6 +413,39 @@ class BaseAgent:
         )
 
         return result
+
+    @staticmethod
+    def _recover_phantom_tool_call(exc: BadRequestError) -> Optional[str]:
+        """Extract valid content when a model wraps its final answer in a fake tool call.
+
+        Some models (e.g. openai/gpt-oss-120b) emit a tool_call to a non-existent
+        tool like ``json`` or ``return_result`` instead of returning plain text.
+        Groq rejects this with a 400 containing the generated text in
+        ``failed_generation``.  We extract and return it so the ReAct loop can
+        treat it as a normal final answer.
+        """
+        try:
+            body = exc.body
+            if not isinstance(body, dict):
+                return None
+            error_obj = body.get("error", {})
+            if error_obj.get("code") != "tool_use_failed":
+                return None
+            raw = error_obj.get("failed_generation", "")
+            if not raw:
+                return None
+            # The failed_generation is the raw text the model tried to emit as
+            # a tool call.  It is typically JSON like {"name": "json", "arguments": {... actual payload ...}}
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and "arguments" in parsed:
+                    inner = parsed["arguments"]
+                    return json.dumps(inner)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return raw
+        except Exception:
+            return None
 
     async def emit_progress(self, message: str, metadata: dict | None = None) -> None:
         if self._event_publisher:
