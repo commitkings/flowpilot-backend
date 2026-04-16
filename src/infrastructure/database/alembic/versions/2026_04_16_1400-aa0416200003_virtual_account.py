@@ -44,11 +44,13 @@ def upgrade() -> None:
         ["virtual_account_number"],
     )
 
-    # Back-fill existing businesses with generated account numbers
+    # Back-fill existing businesses with generated account numbers.
+    # Strip dashes from the UUID before using it as hex — LEFT(id::text, 15)
+    # would otherwise include '-' characters which are not valid hex digits.
     op.execute("""
         UPDATE business
         SET virtual_account_number = LPAD(
-            (ABS(('x' || LEFT(id::text, 15))::bit(64)::bigint) % 9000000000 + 1000000000)::text,
+            (ABS(('x' || LEFT(REPLACE(id::text, '-', ''), 15))::bit(64)::bigint) % 9000000000 + 1000000000)::text,
             10, '0'
         ),
         virtual_account_name = LEFT(business_name, 30)
