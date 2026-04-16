@@ -759,6 +759,86 @@ async def send_webhook_unhealthy_email(
     )
 
 
+async def send_beneficiary_payment_email(
+    to: str,
+    org_name: str,
+    beneficiary_name: str,
+    amount: float,
+    account_number: str,
+    bank_name: str,
+    payment_date: str,
+    status: str,
+    reference: Optional[str] = None,
+    purpose: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Notify a beneficiary that a payment was sent (or failed) to their account.
+
+    Template: src/templates/emails/beneficiary_payment.html
+    status: "success" | "failed"
+    """
+    html = _render(
+        "beneficiary_payment.html",
+        org_name=org_name,
+        beneficiary_name=beneficiary_name,
+        amount=f"{amount:,.2f}",
+        account_number=account_number,
+        bank_name=bank_name,
+        payment_date=payment_date,
+        status=status,
+        reference=reference,
+        purpose=purpose,
+        reason=reason,
+    )
+    if status == "success":
+        subject = f"You've received ₦{amount:,.2f} from {org_name}"
+    else:
+        subject = f"Payment from {org_name} could not be processed"
+    return await _send(to=to, subject=subject, html=html)
+
+
+async def send_receipt_email(
+    to: str,
+    org_name: str,
+    run_id_short: str,
+    run_status: str,
+    receipt_date: str,
+    objective: str,
+    candidates: list[dict],
+    payout_total: float,
+    platform_fee: float,
+    total_deducted: float,
+    fee_rate_pct: float,
+    successful_count: int,
+    approved_by: Optional[str] = None,
+) -> bool:
+    """Send a payment receipt to a recipient or vendor email address.
+
+    Template: src/templates/emails/receipt.html
+    candidates: list of {name, bank, account, amount, status}
+    """
+    html = _render(
+        "receipt.html",
+        org_name=org_name,
+        run_id_short=run_id_short,
+        run_status=run_status,
+        receipt_date=receipt_date,
+        objective=objective,
+        candidates=candidates,
+        payout_total=f"{payout_total:,.2f}",
+        platform_fee=f"{platform_fee:,.2f}",
+        total_deducted=f"{total_deducted:,.2f}",
+        fee_rate_pct=f"{fee_rate_pct:.1f}",
+        successful_count=successful_count,
+        approved_by=approved_by,
+    )
+    return await _send(
+        to=to,
+        subject=f"Payment Receipt from {org_name} — ₦{payout_total:,.2f} disbursed",
+        html=html,
+    )
+
+
 async def send_account_deletion_code_email(
     to: str,
     display_name: str,

@@ -74,11 +74,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("FlowPilot API shutting down")
 
 
+_is_prod = Settings.is_production()
 app = FastAPI(
     title="FlowPilot",
     description="Multi-agent fintech execution system powered by Interswitch APIs",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
 )
 
 _cors_origins = [

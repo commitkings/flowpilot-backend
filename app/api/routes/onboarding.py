@@ -100,6 +100,22 @@ async def complete_onboarding(
         resource_id=str(business.id),
     )
 
+    # Notify about virtual account assignment
+    if business.virtual_account_number:
+        await notif_repo.create(
+            user_id=current_user.id,
+            business_id=business.id,
+            title="Your wallet account details are ready",
+            message=(
+                f"Fund your FlowPilot wallet by transferring to account "
+                f"{business.virtual_account_number} at {business.virtual_account_bank}. "
+                "Find these details on your Wallet page."
+            ),
+            type="success",
+            resource_type="business",
+            resource_id=str(business.id),
+        )
+
     # Send welcome email — best-effort, never blocks the response
     await send_welcome_email(
         to=current_user.email,
@@ -113,6 +129,9 @@ async def complete_onboarding(
             "id": str(business.id),
             "business_name": business.business_name,
             "business_type": business.business_type,
+            "virtual_account_number": business.virtual_account_number,
+            "virtual_account_bank": business.virtual_account_bank,
+            "virtual_account_name": business.virtual_account_name,
         },
         "config": {
             "onboarding_step": config.onboarding_step,

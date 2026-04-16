@@ -216,6 +216,14 @@ class BusinessModel(Base):
     logo_url: Mapped[Optional[str]] = mapped_column(String(512))
     kyc_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    # AI processing credits — each payout run costs 1 credit
+    ai_credit_balance: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    # Virtual account — assigned at onboarding for wallet top-up via bank transfer
+    virtual_account_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    virtual_account_bank: Mapped[Optional[str]] = mapped_column(
+        String(128), server_default=text("'FlowPilot Microfinance Bank'"), nullable=True
+    )
+    virtual_account_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -403,6 +411,9 @@ class AgentRunModel(Base):
     cancelled_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     started_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    # Monetization: platform fee charged at execution time
+    platform_fee_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4))
+    platform_fee_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -725,6 +736,7 @@ class PayoutCandidateModel(Base):
     )
     beneficiary_name: Mapped[str] = mapped_column(String(255))
     account_number: Mapped[str] = mapped_column(String(20))
+    beneficiary_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     currency: Mapped[str] = mapped_column(CHAR(3), server_default=text("'NGN'"))
     purpose: Mapped[Optional[str]] = mapped_column(String(255))
@@ -1804,7 +1816,11 @@ class ScheduledRunModel(Base):
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     objective: Mapped[str] = mapped_column(Text, nullable=False)
-    cron_expression: Mapped[str] = mapped_column(String(128), nullable=False)
+    run_type: Mapped[str] = mapped_column(
+        String(16), server_default=text("'recurring'"), nullable=False
+    )
+    # Null for one_time runs; populated for recurring runs
+    cron_expression: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     frequency_label: Mapped[str] = mapped_column(String(64), nullable=False)
     next_run_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
@@ -1855,15 +1871,38 @@ class KycSubmissionModel(Base):
     # status: not_submitted → pending → verified
     status: Mapped[str] = mapped_column(String(20), server_default=text("'pending'"))
 
+    # Business entity type
+    # limited_company | ngo | partnership | sole_proprietorship | mda
+    business_type: Mapped[Optional[str]] = mapped_column(String(50))
+    registration_number: Mapped[Optional[str]] = mapped_column(String(100))
+    tin_number: Mapped[Optional[str]] = mapped_column(String(50))
+
     # Document object keys stored in MinIO (not full URLs — generate presigned on demand)
     cac_certificate_key: Mapped[Optional[str]] = mapped_column(String(512))
     tin_document_key: Mapped[Optional[str]] = mapped_column(String(512))
     director_id_key: Mapped[Optional[str]] = mapped_column(String(512))
     proof_of_address_key: Mapped[Optional[str]] = mapped_column(String(512))
 
-    # Director details
+    # Director details (Limited Company / Sole Proprietorship)
     director_name: Mapped[Optional[str]] = mapped_column(String(255))
     director_bvn: Mapped[Optional[str]] = mapped_column(String(20))
+
+    # NGO / Non-profit fields
+    trustee_name: Mapped[Optional[str]] = mapped_column(String(255))
+    trustee_bvn: Mapped[Optional[str]] = mapped_column(String(20))
+    trustee_id_key: Mapped[Optional[str]] = mapped_column(String(512))
+    scuml_number: Mapped[Optional[str]] = mapped_column(String(100))
+    scuml_letter_key: Mapped[Optional[str]] = mapped_column(String(512))
+
+    # Partnership fields
+    partner_names: Mapped[Optional[str]] = mapped_column(Text)  # JSON array string
+    partner_id_key: Mapped[Optional[str]] = mapped_column(String(512))
+
+    # Government / MDA fields
+    mda_letter_key: Mapped[Optional[str]] = mapped_column(String(512))
+    authorized_officer_name: Mapped[Optional[str]] = mapped_column(String(255))
+    authorized_officer_bvn: Mapped[Optional[str]] = mapped_column(String(20))
+    authorized_officer_id_key: Mapped[Optional[str]] = mapped_column(String(512))
 
     submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
@@ -1982,6 +2021,42 @@ class WalletTransactionModel(Base):
     )
 
     wallet: Mapped["WalletModel"] = relationship(back_populates="transactions")
+
+
+# --------------------------------------------------------------------------- #
+# ai_credit_transaction — log of credit purchases and per-run debits
+# --------------------------------------------------------------------------- #
+class AiCreditTransactionModel(Base):
+    __tablename__ = "ai_credit_transaction"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+    )
+    run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # 'purchase' = org bought credits, 'debit' = run consumed 1 credit
+    type: Mapped[str] = mapped_column(String(20))
+    credits: Mapped[int] = mapped_column(Integer)
+    description: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("type IN ('purchase', 'debit')", name="ai_credit_tx_type_check"),
+        CheckConstraint("credits > 0", name="ai_credit_tx_credits_positive"),
+        Index("ai_credit_tx_business_idx", "business_id"),
+        Index("ai_credit_tx_created_idx", text("created_at DESC")),
+    )
 
 
 # =========================================================================== #

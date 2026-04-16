@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Payment Confirmation — {{ org_name }}</title>
+  <style>
+    @media only screen and (max-width:600px) {
+      .outer-pad { padding: 24px 8px 32px !important; }
+      .logo-pad  { padding: 24px 20px 18px !important; }
+      .body-pad  { padding: 0 20px 32px !important; }
+      .foot-pad  { padding: 16px 20px 20px !important; }
+      .h1        { font-size: 18px !important; }
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background-color:#f0ede8;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+  <!-- Preheader -->
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
+    {% if status == "success" %}You have received a payment of ₦{{ amount }} from {{ org_name }}.{% else %}Payment of ₦{{ amount }} from {{ org_name }} could not be processed.{% endif %}&nbsp;&zwnj;&nbsp;&zwnj;
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
+    <tr>
+      <td align="center" class="outer-pad" style="padding:48px 16px 40px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;">
+
+          <!-- Accent bar -->
+          <tr>
+            <td style="height:4px;background-color:{% if status == 'success' %}#16a34a{% else %}#dc2626{% endif %};border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
+          </tr>
+
+          <!-- Logo -->
+          <tr>
+            <td align="center" class="logo-pad" style="background-color:#ffffff;padding:28px 40px 20px;">
+              <img src="https://i.postimg.cc/ZqzNQW8H/flowpilot-logo-darkblue.png" alt="FlowPilot" height="28"
+                   style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;" />
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
+              <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;">&nbsp;</div>
+
+              <!-- Status icon + headline -->
+              <div style="text-align:center;margin-bottom:28px;">
+                {% if status == "success" %}
+                <div style="display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:50%;background-color:#dcfce7;margin-bottom:14px;">
+                  <span style="font-size:24px;">✓</span>
+                </div>
+                <h1 class="h1" style="font-size:22px;font-weight:800;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 6px;">
+                  Payment Received
+                </h1>
+                <p style="font-size:14px;color:#64748b;margin:0;">
+                  A payment has been successfully sent to your account by <strong style="color:#0f172a;">{{ org_name }}</strong>.
+                </p>
+                {% else %}
+                <div style="display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:50%;background-color:#fee2e2;margin-bottom:14px;">
+                  <span style="font-size:24px;">✕</span>
+                </div>
+                <h1 class="h1" style="font-size:22px;font-weight:800;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 6px;">
+                  Payment Unsuccessful
+                </h1>
+                <p style="font-size:14px;color:#64748b;margin:0;">
+                  <strong style="color:#0f172a;">{{ org_name }}</strong> attempted a payment to your account but it could not be processed.
+                </p>
+                {% endif %}
+              </div>
+
+              <!-- Amount highlight -->
+              <div style="background-color:{% if status == 'success' %}#f0fdf4{% else %}#fef2f2{% endif %};border:1px solid {% if status == 'success' %}#bbf7d0{% else %}#fecaca{% endif %};border-radius:12px;padding:20px 24px;text-align:center;margin-bottom:24px;">
+                <p style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:{% if status == 'success' %}#15803d{% else %}#dc2626{% endif %};margin:0 0 6px;">
+                  {% if status == "success" %}Amount Credited{% else %}Attempted Amount{% endif %}
+                </p>
+                <p style="font-size:32px;font-weight:900;color:{% if status == 'success' %}#15803d{% else %}#dc2626{% endif %};margin:0;letter-spacing:-1px;">
+                  &#8358;{{ amount }}
+                </p>
+              </div>
+
+              <!-- Detail strip -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                     style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;margin-bottom:24px;">
+                <tr>
+                  <td style="padding:16px 20px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;padding-bottom:10px;">Beneficiary Name</td>
+                        <td style="font-size:12px;font-weight:600;color:#0f172a;text-align:right;padding-bottom:10px;">{{ beneficiary_name }}</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;padding-bottom:10px;">Account Number</td>
+                        <td style="font-size:12px;font-family:monospace;font-weight:600;color:#0f172a;text-align:right;padding-bottom:10px;">{{ account_number }}</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;padding-bottom:10px;">Bank</td>
+                        <td style="font-size:12px;font-weight:600;color:#0f172a;text-align:right;padding-bottom:10px;">{{ bank_name }}</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;padding-bottom:10px;">Payment Date</td>
+                        <td style="font-size:12px;font-weight:600;color:#0f172a;text-align:right;padding-bottom:10px;">{{ payment_date }}</td>
+                      </tr>
+                      {% if reference %}
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;padding-bottom:10px;">Reference</td>
+                        <td style="font-size:12px;font-family:monospace;color:#64748b;text-align:right;padding-bottom:10px;">{{ reference }}</td>
+                      </tr>
+                      {% endif %}
+                      {% if purpose %}
+                      <tr>
+                        <td style="font-size:12px;color:#64748b;">Purpose</td>
+                        <td style="font-size:12px;color:#0f172a;text-align:right;">{{ purpose }}</td>
+                      </tr>
+                      {% endif %}
+                    </table>
+                  </td>
+                </tr>
+              </table>
+
+              {% if status != "success" and reason %}
+              <div style="background-color:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px 16px;margin-bottom:24px;">
+                <p style="font-size:12px;color:#dc2626;margin:0;">
+                  <strong>Reason:</strong> {{ reason }}
+                </p>
+                <p style="font-size:12px;color:#64748b;margin:6px 0 0;">
+                  Please contact <strong style="color:#0f172a;">{{ org_name }}</strong> directly for assistance.
+                </p>
+              </div>
+              {% endif %}
+
+              <p style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;">
+                This is an automated payment notification from <strong style="color:#0f172a;">{{ org_name }}</strong>
+                via FlowPilot on {{ payment_date }}. If you have questions about this payment, please contact the sender directly.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td class="foot-pad" style="background-color:#f7f5f2;border-radius:0 0 12px 12px;padding:18px 40px 22px;border-top:1px solid #ede9e3;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td align="center">
+                    <p style="margin:0 0 4px;font-size:12px;color:#94a3b8;line-height:1.6;">
+                      Powered by <a href="https://flowpilot.club" style="color:#e86727;text-decoration:none;">FlowPilot</a>
+                      &middot; <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;">support@flowpilot.club</a>
+                    </p>
+                    <p style="margin:0;font-size:11px;color:#b0aaa4;line-height:1.6;">&copy; 2026 FlowPilot &middot; Automate your payouts.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>

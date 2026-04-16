@@ -97,6 +97,9 @@ async def get_org_profile(
         "logo_url": s3_client.make_file_url(biz.logo_url),
         "kyc_status": biz.kyc_status,
         "is_active": biz.is_active,
+        "virtual_account_number": biz.virtual_account_number,
+        "virtual_account_bank": biz.virtual_account_bank,
+        "virtual_account_name": biz.virtual_account_name,
         "config": {
             "monthly_txn_volume_range": config.monthly_txn_volume_range if config else None,
             "avg_monthly_payouts_range": config.avg_monthly_payouts_range if config else None,

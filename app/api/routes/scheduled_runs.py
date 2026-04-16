@@ -1,5 +1,5 @@
 """
-Scheduled runs — CRUD for recurring payout run definitions.
+Scheduled runs — CRUD for recurring and one-time payout run definitions.
 
 All routes require a valid JWT. Create/update/delete require owner or analyst role.
 
@@ -12,15 +12,16 @@ Endpoints:
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
+from app.api.auth.kyc_deps import require_verified_kyc
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
@@ -30,11 +31,18 @@ from src.infrastructure.database.flowpilot_models import (
 )
 from src.infrastructure.database.repositories.notification_repository import NotificationRepository
 
+import logging
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["scheduled-runs"])
 
 
-def _next_run_from_cron(cron_expr: str) -> Optional[datetime]:
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _next_run_from_cron(cron_expr: Optional[str]) -> Optional[datetime]:
     """Compute the next fire time from a cron expression using croniter if available."""
+    if not cron_expr or not cron_expr.strip():
+        return None
     try:
         from croniter import croniter
         now = datetime.now(timezone.utc)
@@ -58,11 +66,36 @@ async def _get_business_id(current_user, session: AsyncSession) -> uuid.UUID:
     return membership.business_id
 
 
+# ── Request / Response schemas ────────────────────────────────────────────────
+
 class CreateScheduledRunRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     objective: str = Field(..., min_length=1)
-    cron_expression: str = Field(..., min_length=1, max_length=128)
+    run_type: Literal["recurring", "one_time"] = "recurring"
+
+    # Required for recurring; omit for one_time
+    cron_expression: Optional[str] = Field(None, max_length=128)
     frequency_label: str = Field(..., min_length=1, max_length=64)
+
+    # Required for one_time — ISO 8601 UTC datetime for the single execution
+    run_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _validate_by_type(self) -> "CreateScheduledRunRequest":
+        if self.run_type == "recurring":
+            if not self.cron_expression or not self.cron_expression.strip():
+                raise ValueError("cron_expression is required for recurring runs.")
+        else:  # one_time
+            if self.run_at is None:
+                raise ValueError("run_at is required for one-time runs.")
+            # Ensure run_at is timezone-aware
+            run_at = self.run_at
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+            if run_at <= datetime.now(timezone.utc):
+                raise ValueError("run_at must be a future date and time.")
+            self.run_at = run_at
+        return self
 
 
 class PatchScheduledRunRequest(BaseModel):
@@ -71,6 +104,8 @@ class PatchScheduledRunRequest(BaseModel):
     cron_expression: Optional[str] = None
     frequency_label: Optional[str] = None
     is_active: Optional[bool] = None
+    # For one-time runs: reschedule to a new future datetime
+    run_at: Optional[datetime] = None
 
 
 def _serialize(r: ScheduledRunModel) -> dict:
@@ -78,6 +113,7 @@ def _serialize(r: ScheduledRunModel) -> dict:
         "id": str(r.id),
         "name": r.name,
         "objective": r.objective,
+        "run_type": r.run_type,
         "cron_expression": r.cron_expression,
         "frequency_label": r.frequency_label,
         "next_run_at": r.next_run_at.isoformat() if r.next_run_at else None,
@@ -88,10 +124,13 @@ def _serialize(r: ScheduledRunModel) -> dict:
     }
 
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 @router.get("/runs/scheduled")
 async def list_scheduled_runs(
     current_user=Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
+    _kyc=Depends(require_verified_kyc),
 ):
     business_id = await _get_business_id(current_user, session)
     result = await session.execute(
@@ -110,12 +149,9 @@ async def create_scheduled_run(
     _=Depends(require_role("owner", "analyst")),
     session: AsyncSession = Depends(get_db_session),
 ):
-    # Validate cron expression
-    next_run = _next_run_from_cron(body.cron_expression)
-
     business_id = await _get_business_id(current_user, session)
 
-    # KYC gate: business must be verified before scheduling runs
+    # KYC gate
     biz_result = await session.execute(
         select(BusinessModel).where(BusinessModel.id == business_id)
     )
@@ -127,12 +163,23 @@ async def create_scheduled_run(
             else "Business verification (KYC) is required before creating scheduled runs. Please complete your KYC."
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    # Resolve timing
+    if body.run_type == "recurring":
+        next_run = _next_run_from_cron(body.cron_expression)
+        cron_expression = body.cron_expression
+    else:
+        # One-time: use run_at directly (already validated as future)
+        next_run = body.run_at
+        cron_expression = None
+
     scheduled = ScheduledRunModel(
         business_id=business_id,
         created_by=current_user.id,
         name=body.name,
         objective=body.objective,
-        cron_expression=body.cron_expression,
+        run_type=body.run_type,
+        cron_expression=cron_expression,
         frequency_label=body.frequency_label,
         next_run_at=next_run,
         is_active=True,
@@ -141,7 +188,7 @@ async def create_scheduled_run(
     await session.commit()
     await session.refresh(scheduled)
 
-    # Notify the owner — in-app + email (best-effort, non-blocking)
+    # Notify owner — best-effort
     try:
         owner_result = await session.execute(
             select(BusinessMemberModel, UserModel)
@@ -160,16 +207,16 @@ async def create_scheduled_run(
                 scheduled.next_run_at.strftime("%A, %d %B %Y at %I:%M %p UTC")
                 if scheduled.next_run_at else "—"
             )
+            type_label = "one-time payout" if body.run_type == "one_time" else f"recurring payout ({scheduled.frequency_label})"
 
-            # In-app notification
             notif_repo = NotificationRepository(session)
             await notif_repo.create(
                 user_id=owner_user.id,
                 business_id=business_id,
                 title="Scheduled run created",
                 message=(
-                    f'"{scheduled.name}" ({scheduled.frequency_label}) has been set up. '
-                    f"First run: {next_run_str}."
+                    f'"{scheduled.name}" ({type_label}) has been set up. '
+                    f"{'Runs on' if body.run_type == 'one_time' else 'First run:'} {next_run_str}."
                 ),
                 type="success",
                 resource_type="scheduled_run",
@@ -177,7 +224,6 @@ async def create_scheduled_run(
             )
             await session.commit()
 
-            # Email (fire-and-forget)
             import asyncio as _asyncio
             from src.services.email_service import send_scheduled_run_created_email
             _asyncio.create_task(
@@ -202,6 +248,7 @@ async def update_scheduled_run(
     body: PatchScheduledRunRequest,
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner", "analyst")),
+    _kyc=Depends(require_verified_kyc),
     session: AsyncSession = Depends(get_db_session),
 ):
     business_id = await _get_business_id(current_user, session)
@@ -216,6 +263,7 @@ async def update_scheduled_run(
         raise HTTPException(status_code=404, detail="Scheduled run not found")
 
     values: dict = {"updated_at": datetime.now(timezone.utc)}
+
     if body.name is not None:
         values["name"] = body.name
     if body.objective is not None:
@@ -224,9 +272,35 @@ async def update_scheduled_run(
         values["frequency_label"] = body.frequency_label
     if body.is_active is not None:
         values["is_active"] = body.is_active
+
+    # Recurring: update cron and recompute next_run_at
     if body.cron_expression is not None:
+        if run.run_type == "one_time":
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot set a cron expression on a one-time run. Update run_at instead.",
+            )
         values["cron_expression"] = body.cron_expression
         values["next_run_at"] = _next_run_from_cron(body.cron_expression)
+
+    # One-time: reschedule to a new future datetime
+    if body.run_at is not None:
+        run_at = body.run_at
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=timezone.utc)
+        if run_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail="run_at must be a future date and time.",
+            )
+        if run.run_type != "one_time":
+            raise HTTPException(
+                status_code=400,
+                detail="run_at can only be updated on one-time runs.",
+            )
+        values["next_run_at"] = run_at
+        # Re-activate if it had been deactivated / cancelled
+        values["is_active"] = True
 
     await session.execute(
         update(ScheduledRunModel).where(ScheduledRunModel.id == run_id).values(**values)
@@ -241,6 +315,7 @@ async def delete_scheduled_run(
     run_id: uuid.UUID,
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner", "analyst")),
+    _kyc=Depends(require_verified_kyc),
     session: AsyncSession = Depends(get_db_session),
 ):
     business_id = await _get_business_id(current_user, session)

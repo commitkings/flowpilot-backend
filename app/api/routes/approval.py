@@ -399,8 +399,8 @@ async def approve_candidates(
             detail=f"Run is not awaiting approval (status: {run_fresh.status if run_fresh else 'unknown'})",
         )
 
-    # ── 5. Wallet debit — debit the actual approved total, not budget_cap ──
-    #      Money only leaves the wallet at execution time, not at run creation.
+    # ── 5. Wallet debit — debit approved total + 0.2 % platform fee ─────────
+    _PLATFORM_FEE_RATE = Decimal("0.002")
     _wallet_balance_after: float | None = None
     if total_approved > 0:
         from src.infrastructure.database.repositories.wallet_repository import (
@@ -409,15 +409,34 @@ async def approve_candidates(
             LOW_BALANCE_THRESHOLD as _LOW_THRESHOLD,
         )
         _wallet_repo = _WalletRepo(session)
+        _total_decimal = Decimal(str(total_approved))
+        _fee_amount = (_total_decimal * _PLATFORM_FEE_RATE).quantize(Decimal("0.01"))
         try:
+            # Debit payout amount
             _debit_tx, _ = await _wallet_repo.debit(
                 business_id=run.business_id,
-                amount=Decimal(str(total_approved)),
+                amount=_total_decimal,
                 reference=f"run_exec_{run_id}",
                 description=f"Payout execution: {run.objective[:80]}",
                 run_id=run_uuid,
             )
             _wallet_balance_after = float(_debit_tx.balance_after)
+
+            # Debit platform fee (separate ledger line)
+            if _fee_amount > 0:
+                _fee_tx, _ = await _wallet_repo.debit(
+                    business_id=run.business_id,
+                    amount=_fee_amount,
+                    reference=f"platform_fee_{run_id}",
+                    description=f"Platform fee (0.2%): {run.objective[:60]}",
+                    run_id=run_uuid,
+                )
+                _wallet_balance_after = float(_fee_tx.balance_after)
+
+            # Persist fee on the run
+            run.platform_fee_rate = _PLATFORM_FEE_RATE
+            run.platform_fee_amount = _fee_amount
+
         except _InsufficientBalance as exc:
             # Revert status so the approver can try again after topping up
             await run_repo.update_status(run_uuid, "awaiting_approval", None)

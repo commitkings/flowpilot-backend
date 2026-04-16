@@ -174,31 +174,42 @@ async def _dispatch_loop() -> None:
                         f"[Scheduler] Scheduled run {scheduled.id} ({scheduled.name}) is due"
                     )
 
-                    # Compute next fire time anchored to `now` so there's no drift
-                    next_run = _compute_next(scheduled.cron_expression, after=now)
-                    if next_run is None:
-                        logger.warning(
-                            f"[Scheduler] Could not compute next run for '{scheduled.name}' "
-                            f"(id={scheduled.id}, cron='{scheduled.cron_expression}'). "
-                            "Deactivating to prevent it from becoming permanently stuck."
-                        )
+                    run_type = getattr(scheduled, "run_type", "recurring")
+
+                    if run_type == "one_time":
+                        # One-time: mark as fired and deactivate — never reschedule
                         await session.execute(
                             update(ScheduledRunModel)
                             .where(ScheduledRunModel.id == scheduled.id)
-                            .values(last_run_at=now, is_active=False)
+                            .values(last_run_at=now, next_run_at=None, is_active=False)
                         )
                         await session.commit()
-                        continue
+                    else:
+                        # Recurring: compute next fire time anchored to `now` so there's no drift
+                        next_run = _compute_next(scheduled.cron_expression, after=now)
+                        if next_run is None:
+                            logger.warning(
+                                f"[Scheduler] Could not compute next run for '{scheduled.name}' "
+                                f"(id={scheduled.id}, cron='{scheduled.cron_expression}'). "
+                                "Deactivating to prevent it from becoming permanently stuck."
+                            )
+                            await session.execute(
+                                update(ScheduledRunModel)
+                                .where(ScheduledRunModel.id == scheduled.id)
+                                .values(last_run_at=now, is_active=False)
+                            )
+                            await session.commit()
+                            continue
 
-                    # Update timestamps first so we don't double-fire
-                    await session.execute(
-                        update(ScheduledRunModel)
-                        .where(ScheduledRunModel.id == scheduled.id)
-                        .values(last_run_at=now, next_run_at=next_run)
-                    )
-                    await session.commit()
+                        # Update timestamps first so we don't double-fire
+                        await session.execute(
+                            update(ScheduledRunModel)
+                            .where(ScheduledRunModel.id == scheduled.id)
+                            .values(last_run_at=now, next_run_at=next_run)
+                        )
+                        await session.commit()
 
-                    # Fire asynchronously
+                    # Fire asynchronously regardless of type
                     asyncio.create_task(
                         _fire_run(scheduled.id, scheduled.business_id, scheduled.objective)
                     )

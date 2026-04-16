@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
+from app.api.auth.kyc_deps import require_verified_kyc
 from src.agents.orchestrator import RunOrchestrator
 from src.services.email_service import send_run_awaiting_approval_email
 from src.infrastructure.database.repositories.notification_repository import NotificationRepository
@@ -46,6 +47,7 @@ class CandidateInput(BaseModel):
     institution_code: str = Field(..., max_length=10, description="Bank/institution code")
     beneficiary_name: str = Field(..., max_length=255)
     account_number: str = Field(..., max_length=20)
+    beneficiary_email: Optional[str] = Field(None, max_length=255, description="Beneficiary email for payment notification")
     amount: float = Field(..., gt=0, description="Payout amount (must be > 0)")
     currency: str = Field("NGN", max_length=3)
     purpose: Optional[str] = Field(None, max_length=255)
@@ -106,6 +108,8 @@ class RunResponse(BaseModel):
     candidate_count: int = 0
     current_step: Optional[str] = None
     error: Optional[str] = None
+    platform_fee_rate: Optional[float] = None
+    platform_fee_amount: Optional[float] = None
 
 
 def _parse_uuid(value: str, field_name: str) -> uuid.UUID:
@@ -333,6 +337,59 @@ async def create_run(
                 detail="; ".join(validation_errors[:10]),
             )
 
+    # ── Wallet balance pre-flight ────────────────────────────────────────────
+    # Block run creation early so we don't burn AI API tokens on a payout that
+    # will fail at approval time due to insufficient funds.
+    #
+    # • Candidates provided (CSV/direct): check exact sum of amounts.
+    # • No candidates but budget_cap set: use cap as the upper-bound proxy.
+    # • Neither: skip — the AI pipeline will determine amounts; approval-time
+    #   check in approval.py will still catch shortfalls.
+    from src.infrastructure.database.repositories.wallet_repository import (
+        WalletRepository as _WalletRepo,
+    )
+    _wallet_repo_cf = _WalletRepo(session)
+    _wallet_cf = await _wallet_repo_cf.get(business_uuid)
+    _wallet_available = _wallet_cf.balance if _wallet_cf else Decimal("0")
+
+    if candidate_rows:
+        _cf_required = sum(row["amount"] for row in candidate_rows)
+        if _wallet_available < _cf_required:
+            raise HTTPException(status_code=402, detail="Insufficient wallet balance.")
+    elif request.budget_cap is not None:
+        _cf_required = Decimal(str(request.budget_cap))
+        if _wallet_available < _cf_required:
+            raise HTTPException(status_code=402, detail="Insufficient wallet balance.")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── AI processing credit — atomic deduction ──────────────────────────────
+    # Single SQL UPDATE with a WHERE guard:  no TOCTOU race, balance can never
+    # go negative. If 0 rows are updated the balance was already 0 (or the biz
+    # row doesn't exist) — block immediately before any run is created.
+    from sqlalchemy import update as _sa_update
+    _credit_result = await session.execute(
+        _sa_update(BusinessModel)
+        .where(
+            BusinessModel.id == business_uuid,
+            BusinessModel.ai_credit_balance > 0,
+        )
+        .values(ai_credit_balance=BusinessModel.ai_credit_balance - 1)
+        .returning(BusinessModel.id)
+        .execution_options(synchronize_session=False)
+    )
+    if _credit_result.fetchone() is None:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "No AI processing credits remaining. "
+                "Purchase a credit bundle to create new payouts."
+            ),
+        )
+    # Credit deduction is now live in the current DB transaction.
+    # run_repo.create() below (flush-only) joins the same transaction so both
+    # are committed atomically at the first session.commit() call.
+    # ─────────────────────────────────────────────────────────────────────────
+
     run = await run_repo.create(
         business_id=business_uuid,
         created_by=operator_id,
@@ -351,7 +408,28 @@ async def create_run(
     # Store manually pre-assigned approver if provided (for 3+ member teams)
     if request.assigned_approver_id:
         try:
-            run.assigned_to_id = uuid.UUID(request.assigned_approver_id)
+            assigned_uuid = uuid.UUID(request.assigned_approver_id)
+            # Self-assignment guard: block when >1 approval-capable members exist
+            if assigned_uuid == current_user.id:
+                from sqlalchemy import select as _sa_sel, func as _sa_func
+                _capable_result = await session.execute(
+                    _sa_sel(_sa_func.count())
+                    .select_from(BusinessMemberModel)
+                    .where(
+                        BusinessMemberModel.business_id == business_uuid,
+                        BusinessMemberModel.is_active.is_(True),
+                        BusinessMemberModel.role.in_(["owner", "approver"]),
+                    )
+                )
+                capable_count = _capable_result.scalar_one()
+                if capable_count > 1:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You cannot assign yourself as the approver when other team members with approval access are available. This restriction prevents a single person from both creating and approving a payout.",
+                    )
+            run.assigned_to_id = assigned_uuid
+        except HTTPException:
+            raise
         except ValueError:
             pass  # Invalid UUID — ignore silently, auto-assign will take over
 
@@ -383,6 +461,7 @@ async def create_run(
                 "institution_code": p.institution_code,
                 "beneficiary_name": p.beneficiary_name,
                 "account_number": p.account_number,
+                "beneficiary_email": p.beneficiary_email,
                 "amount": float(p.amount),
                 "currency": p.currency,
                 "purpose": p.purpose,
@@ -419,6 +498,18 @@ async def create_run(
         "audit_entries": [],
         "reasoning_log": [],
     }
+
+    # ── AI credit log entry (audit trail only — deduction was already committed) ─
+    from src.infrastructure.database.flowpilot_models import AiCreditTransactionModel as _CreditTxModel
+    _credit_log = _CreditTxModel(
+        business_id=business_uuid,
+        run_id=run.id,
+        type="debit",
+        credits=1,
+        description=f"AI analysis: {request.objective[:80]}",
+    )
+    session.add(_credit_log)
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Notify creator that the run has started
     await _notify(session, current_user.id, business_uuid,
@@ -577,6 +668,7 @@ async def list_runs(
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
+    _kyc=Depends(require_verified_kyc),
 ):
     from sqlalchemy import select as _select_biz
     membership_result = await session.execute(
@@ -621,6 +713,7 @@ async def get_run(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
+    _kyc=Depends(require_verified_kyc),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)
@@ -727,6 +820,8 @@ async def get_run(
         candidate_count=len(candidate_responses),
         current_step=current_step,
         error=run.error_message,
+        platform_fee_rate=float(run.platform_fee_rate) if run.platform_fee_rate is not None else None,
+        platform_fee_amount=float(run.platform_fee_amount) if run.platform_fee_amount is not None else None,
     )
 
 
@@ -772,8 +867,9 @@ async def get_run_status(
     }
 
 
-# Required CSV columns (must match CandidateInput fields)
-_CSV_REQUIRED_COLS = {"institution_code", "beneficiary_name", "account_number", "amount"}
+# Required CSV columns — institution_code OR bank_name is accepted (both resolve to code)
+_CSV_REQUIRED_COLS = {"beneficiary_name", "account_number", "amount"}
+_CSV_INSTITUTION_ALTERNATIVES = {"institution_code", "bank_name"}
 _CSV_OPTIONAL_COLS = {"currency", "purpose"}
 
 
@@ -833,7 +929,11 @@ async def upload_candidates_csv(
             status_code=400,
             detail=f"CSV missing required columns: {', '.join(sorted(missing))}",
         )
-
+    if not (headers & _CSV_INSTITUTION_ALTERNATIVES):
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must include either an 'institution_code' column (bank code) or a 'bank_name' column (e.g. 'Access Bank').",
+        )
     # Parse rows
     rows: list[dict] = []
     errors: list[str] = []
@@ -846,13 +946,14 @@ async def upload_candidates_csv(
         except (KeyError, InvalidOperation, ValueError) as e:
             errors.append(f"Row {i}: invalid amount — {e}")
             continue
-        if not row.get("institution_code") or not row.get("account_number"):
-            errors.append(f"Row {i}: missing institution_code or account_number")
+        institution_value = row.get("institution_code") or row.get("bank_name", "")
+        if not institution_value or not row.get("account_number"):
+            errors.append(f"Row {i}: missing institution/bank or account_number")
             continue
 
         rows.append({
             "source_label": f"Row {i}",
-            "institution_code": row["institution_code"],
+            "institution_code": institution_value,  # alias map resolves name→code later
             "beneficiary_name": row.get("beneficiary_name", ""),
             "account_number": row["account_number"],
             "amount": amount,
@@ -1185,6 +1286,255 @@ async def nudge_approver(
     return {"ok": True, "nudged_user": approver_user.email}
 
 
+# --------------------------------------------------------------------------- #
+# Rerun — edit objective/params and re-trigger pipeline from awaiting_approval
+# --------------------------------------------------------------------------- #
+
+class RerunRequest(BaseModel):
+    objective: str = Field(..., min_length=1, max_length=2000)
+    constraints: Optional[str] = None
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    risk_tolerance: float = Field(0.35, ge=0.0, le=1.0)
+    budget_cap: Optional[float] = None
+
+
+@router.post("/runs/{run_id}/rerun", response_model=RunResponse)
+async def rerun_payout(
+    run_id: str,
+    body: RerunRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Edit and re-trigger a payout that is awaiting approval.
+
+    Only the run creator or an owner may call this.
+    The run must be in 'awaiting_approval' status.
+
+    Steps:
+      1. Validate status and permissions.
+      2. Update objective and parameters on the run.
+      3. Delete existing payout candidates.
+      4. Reset run state to pending.
+      5. Notify assigned approver that the run has been updated.
+      6. Re-launch the orchestration pipeline.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from sqlalchemy import delete as _sa_delete
+
+    run_uuid = _parse_uuid(run_id, "run_id")
+    run_repo = RunRepository(session)
+    candidate_repo = CandidateRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rerun is only allowed when the payout is awaiting approval (current status: {run.status}).",
+        )
+
+    # Membership gate
+    from sqlalchemy import select as _sel_rr
+    _mem_rr = await session.execute(
+        _sel_rr(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    caller_membership = _mem_rr.scalars().first()
+    if not caller_membership:
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
+    is_creator = run.created_by and run.created_by == current_user.id
+    is_owner = caller_membership.role == "owner"
+    if not is_creator and not is_owner:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the payout creator or an owner can edit and rerun this payout.",
+        )
+
+    # Capture assigned approver before reset (for notification)
+    assigned_to_id = run.assigned_to_id
+
+    # Delete all existing payout candidates for this run
+    from src.infrastructure.database.flowpilot_models import PayoutCandidateModel
+    await session.execute(
+        _sa_delete(PayoutCandidateModel).where(PayoutCandidateModel.run_id == run_uuid)
+    )
+
+    # Update run fields
+    now = _dt.now(_tz.utc)
+    run.objective = body.objective
+    run.constraints = body.constraints
+    run.date_from = body.date_from
+    run.date_to = body.date_to
+    run.risk_tolerance = Decimal(str(body.risk_tolerance))
+    run.budget_cap = Decimal(str(body.budget_cap)) if body.budget_cap is not None else None
+
+    # Reset run state
+    run.status = "pending"
+    run.error_message = None
+    run.plan_graph = None
+    run.approved_by = None
+    run.approved_at = None
+    run.started_at = None
+    run.completed_at = None
+    run.cancelled_by = None
+    run.cancelled_at = None
+    run.updated_at = now
+
+    # ── AI credit deduction for rerun (same atomic guard as initial creation) ──
+    # Rerun re-runs the full AI pipeline — costs 1 credit just like a new payout.
+    # Use run_id=None in the log to avoid the partial-unique-index constraint
+    # that prevents duplicate debit entries per run.
+    from sqlalchemy import update as _sa_update_rr
+    _rerun_credit_result = await session.execute(
+        _sa_update_rr(BusinessModel)
+        .where(
+            BusinessModel.id == run.business_id,
+            BusinessModel.ai_credit_balance > 0,
+        )
+        .values(ai_credit_balance=BusinessModel.ai_credit_balance - 1)
+        .returning(BusinessModel.id)
+        .execution_options(synchronize_session=False)
+    )
+    if _rerun_credit_result.fetchone() is None:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "No AI processing credits remaining. "
+                "Purchase a credit bundle to rerun this payout."
+            ),
+        )
+    # ──────────────────────────────────────────────────────────────────────────
+
+    await session.commit()
+    await session.refresh(run)
+
+    # AI credit log for the rerun (run_id=None avoids unique-index conflict)
+    from src.infrastructure.database.flowpilot_models import AiCreditTransactionModel as _CreditTxModelRR
+    _rerun_credit_log = _CreditTxModelRR(
+        business_id=run.business_id,
+        run_id=None,
+        type="debit",
+        credits=1,
+        description=f"AI rerun: {body.objective[:80]} (run {run_id[:8]})",
+    )
+    session.add(_rerun_credit_log)
+    await session.commit()
+
+    # Notify assigned approver that the payout was updated
+    if assigned_to_id:
+        try:
+            from sqlalchemy import select as _sel_at
+            _at_result = await session.execute(
+                _sel_at(UserModel).where(UserModel.id == assigned_to_id)
+            )
+            approver_user = _at_result.scalar_one_or_none()
+            if approver_user:
+                await _notify(
+                    session,
+                    approver_user.id,
+                    run.business_id,
+                    title="Payout updated and resubmitted",
+                    message=(
+                        f'The payout "{body.objective[:60]}" has been updated and resubmitted for analysis. '
+                        "You will be notified again when it is ready for your review."
+                    ),
+                    type="info",
+                    resource_type="run",
+                    resource_id=run_id,
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.warning("[Rerun] Could not notify approver: %s", exc)
+
+    logger.info(f"Rerun triggered for run {run_id} by {current_user.id}")
+
+    # Re-launch orchestration pipeline
+    state: AgentState = {
+        "run_id": run_id,
+        "business_id": str(run.business_id),
+        "objective": body.objective,
+        "constraints": body.constraints,
+        "date_from": body.date_from.isoformat() if body.date_from else None,
+        "date_to": body.date_to.isoformat() if body.date_to else None,
+        "risk_tolerance": body.risk_tolerance,
+        "budget_cap": body.budget_cap,
+        "merchant_id": run.merchant_id,
+        "plan_steps": [],
+        "transactions": [],
+        "reconciled_ledger": {},
+        "unresolved_references": [],
+        "resolved_references": [],
+        "scored_candidates": [],
+        "forecast": None,
+        "candidate_lookup_results": [],
+        "candidate_execution_results": [],
+        "batch_details": None,
+        "approved_candidate_ids": [],
+        "rejected_candidate_ids": [],
+        "audit_report": None,
+        "current_step": "created",
+        "error": None,
+        "audit_entries": [],
+        "reasoning_log": [],
+    }
+
+    try:
+        publisher = EventPublisher(run.id, session)
+        orchestrator = RunOrchestrator(session, publisher=publisher)
+        state = await orchestrator.execute_run(run.id, state)
+
+        if state.get("current_step") == "awaiting_approval":
+            _running_states[run_id] = state
+
+            # Notify assigned approver that review is needed again
+            if assigned_to_id:
+                try:
+                    from sqlalchemy import select as _sel_at2
+                    _at2_result = await session.execute(
+                        _sel_at2(UserModel).where(UserModel.id == assigned_to_id)
+                    )
+                    approver_user2 = _at2_result.scalar_one_or_none()
+                    if approver_user2:
+                        db_candidates2 = await candidate_repo.get_by_run(run_uuid)
+                        await send_run_awaiting_approval_email(
+                            to=approver_user2.email,
+                            run_id=run_id,
+                            objective=body.objective,
+                            candidate_count=len(db_candidates2),
+                            approver_name=approver_user2.display_name or approver_user2.email,
+                        )
+                except Exception as exc:
+                    logger.warning("[Rerun] Could not re-notify approver: %s", exc)
+
+    except Exception as exc:
+        logger.exception(f"Rerun pipeline failed for run {run_id}: {exc}")
+        run.status = "failed"
+        run.error_message = str(exc)[:500]
+        await session.commit()
+
+    await session.refresh(run)
+    db_candidates = await candidate_repo.get_by_run(run_uuid)
+    return RunResponse(
+        run_id=str(run.id),
+        objective=run.objective,
+        status=run.status,
+        created_at=run.created_at.isoformat(),
+        risk_tolerance=float(run.risk_tolerance),
+        budget_cap=float(run.budget_cap) if run.budget_cap else None,
+        assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
+        created_by=str(run.created_by) if run.created_by else None,
+        error=run.error_message,
+        candidate_count=len(db_candidates),
+    )
+
+
 @router.get("/runs/{run_id}/events/stream")
 async def stream_run_events(
     run_id: str,
@@ -1274,3 +1624,136 @@ async def stream_run_events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Receipt email ─────────────────────────────────────────────────────────────
+
+class SendReceiptEmailRequest(BaseModel):
+    email: str = Field(..., description="Recipient email address")
+    # Optionally scope to a single beneficiary by candidate_id
+    candidate_id: Optional[str] = Field(None, description="If set, send a single-beneficiary receipt")
+
+
+@router.post("/{run_id}/receipt/email")
+async def send_receipt_email_endpoint(
+    run_id: str,
+    body: SendReceiptEmailRequest,
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Send a payment receipt email for a completed payout run.
+
+    If candidate_id is provided, sends a single-beneficiary receipt.
+    Otherwise sends the full batch receipt to the given address.
+    """
+    import datetime as _dt
+    from sqlalchemy import select as _sel_re
+    from src.services.email_service import send_receipt_email as _send_receipt
+
+    run_uuid = _parse_uuid(run_id, "run_id")
+    run_repo = RunRepository(session)
+    cand_repo = CandidateRepository(session)
+
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status not in ("completed", "completed_with_errors"):
+        raise HTTPException(status_code=400, detail="Receipts are only available for completed runs")
+
+    # Membership check
+    _mem_re = await session.execute(
+        _sel_re(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_re.scalars().first():
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Org name
+    _biz_re = await session.execute(
+        _sel_re(BusinessModel).where(BusinessModel.id == run.business_id)
+    )
+    biz = _biz_re.scalar_one_or_none()
+    org_name = biz.business_name if biz else "Your Organisation"
+
+    # Approved-by name
+    approved_by_name: Optional[str] = None
+    if run.approved_by:
+        _approver_re = await session.execute(
+            _sel_re(UserModel).where(UserModel.id == run.approved_by)
+        )
+        _approver = _approver_re.scalar_one_or_none()
+        if _approver:
+            approved_by_name = _approver.display_name or _approver.email
+
+    # Candidates
+    all_candidates = await cand_repo.get_by_run(run_uuid)
+
+    if body.candidate_id:
+        target_uuid = _parse_uuid(body.candidate_id, "candidate_id")
+        single = next((c for c in all_candidates if c.id == target_uuid), None)
+        if single is None:
+            raise HTTPException(status_code=404, detail="Candidate not found in this run")
+        receipt_candidates = [single]
+    else:
+        receipt_candidates = all_candidates
+
+    # Build candidate rows for the template
+    def _cand_status(c) -> str:
+        if c.execution_status == "success":
+            return "Paid"
+        if c.execution_status == "failed":
+            return "Failed"
+        if c.risk_decision == "block" or c.approval_status == "blocked":
+            return "Held Back"
+        return "Pending"
+
+    inst_repo = InstitutionRepository(session)
+    all_institutions = await inst_repo.get_all_active()
+    inst_map = {i.institution_code: i.institution_name for i in all_institutions}
+
+    candidate_rows = [
+        {
+            "name": c.beneficiary_name,
+            "bank": inst_map.get(c.institution_code, c.institution_code),
+            "account": c.account_number,
+            "amount": f"{float(c.amount):,.2f}",
+            "status": _cand_status(c),
+        }
+        for c in receipt_candidates
+    ]
+
+    # Financial summary
+    successful = [c for c in all_candidates if c.execution_status == "success"]
+    payout_total = float(sum(c.amount for c in successful))
+    platform_fee_rate = float(run.platform_fee_rate) if run.platform_fee_rate else 0.002
+    platform_fee = float(run.platform_fee_amount) if run.platform_fee_amount else round(payout_total * platform_fee_rate, 2)
+    total_deducted = payout_total + platform_fee
+
+    receipt_date = (run.approved_at or run.started_at or _dt.datetime.now(_dt.timezone.utc)).strftime(
+        "%d %b %Y, %I:%M %p WAT"
+    )
+
+    ok = await _send_receipt(
+        to=body.email,
+        org_name=org_name,
+        run_id_short=run_id[:8].upper(),
+        run_status="Completed" if run.status == "completed" else "Completed (with errors)",
+        receipt_date=receipt_date,
+        objective=run.objective or "",
+        candidates=candidate_rows,
+        payout_total=payout_total,
+        platform_fee=platform_fee,
+        total_deducted=total_deducted,
+        fee_rate_pct=platform_fee_rate * 100,
+        successful_count=len(successful),
+        approved_by=approved_by_name,
+    )
+
+    if not ok:
+        raise HTTPException(status_code=503, detail="Failed to send email. Please try again.")
+
+    return {"message": f"Receipt sent to {body.email}"}

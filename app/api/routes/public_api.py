@@ -30,8 +30,10 @@ from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
     AuditLogModel,
     BusinessModel,
+    BusinessConfigModel,
     PayoutCandidateModel,
     ReconciledTransactionModel,
+    ScheduledRunModel,
     UserModel,
 )
 
@@ -77,6 +79,8 @@ def _ser_run(run: AgentRunModel) -> dict:
         "status": run.status,
         "risk_tolerance": float(run.risk_tolerance),
         "budget_cap": float(run.budget_cap) if run.budget_cap is not None else None,
+        "platform_fee_rate": float(run.platform_fee_rate) if run.platform_fee_rate is not None else None,
+        "platform_fee_amount": float(run.platform_fee_amount) if run.platform_fee_amount is not None else None,
         "error": run.error_message,
         "created_at": run.created_at.isoformat(),
         "started_at": run.started_at.isoformat() if run.started_at else None,
@@ -114,6 +118,7 @@ def _ser_candidate(c: PayoutCandidateModel) -> dict:
         "run_id": str(c.run_id),
         "beneficiary_name": c.beneficiary_name,
         "account_number": c.account_number,
+        "beneficiary_email": c.beneficiary_email,
         "institution_code": c.institution_code,
         "amount": float(c.amount),
         "currency": c.currency,
@@ -406,3 +411,92 @@ async def list_audit(
     entries = rows_result.scalars().all()
 
     return paginate([_ser_audit(e) for e in entries], total, limit, offset)
+
+
+# --------------------------------------------------------------------------- #
+# Organisation profile
+# --------------------------------------------------------------------------- #
+
+@router.get("/org")
+async def get_org_profile(
+    ctx: ApiKeyContext = Depends(require_scope("runs:read")),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return the organisation profile associated with this API key.
+
+    Includes virtual account details for wallet top-up, KYC status, and basic
+    configuration such as daily payout limits.
+    """
+    biz_result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == ctx.business_id)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if biz is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
+
+    cfg_result = await session.execute(
+        select(BusinessConfigModel).where(BusinessConfigModel.business_id == ctx.business_id)
+    )
+    config = cfg_result.scalar_one_or_none()
+
+    return {
+        "id": str(biz.id),
+        "business_name": biz.business_name,
+        "business_type": biz.business_type,
+        "kyc_status": biz.kyc_status,
+        "is_active": biz.is_active,
+        # Virtual account — fund wallet via bank transfer
+        "virtual_account_number": biz.virtual_account_number,
+        "virtual_account_bank": biz.virtual_account_bank,
+        "virtual_account_name": biz.virtual_account_name,
+        # Financial limits from config
+        "daily_payout_limit": float(config.daily_payout_limit) if config and config.daily_payout_limit else None,
+        "single_payout_cap": float(config.single_payout_cap) if config and config.single_payout_cap else None,
+        "risk_appetite": config.risk_appetite if config else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Scheduled runs
+# --------------------------------------------------------------------------- #
+
+@router.get("/scheduled-runs")
+async def list_scheduled_runs(
+    ctx: ApiKeyContext = Depends(require_scope("runs:read")),
+    session: AsyncSession = Depends(get_db_session),
+    is_active: Optional[bool] = Query(None),
+    run_type: Optional[str] = Query(None, description="Filter by run_type: 'recurring' or 'one_time'"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """List scheduled payout runs for your organisation."""
+    base = select(ScheduledRunModel).where(ScheduledRunModel.business_id == ctx.business_id)
+    if is_active is not None:
+        base = base.where(ScheduledRunModel.is_active == is_active)
+    if run_type:
+        base = base.where(ScheduledRunModel.run_type == run_type)
+
+    total_result = await session.execute(
+        select(func.count()).select_from(base.subquery())
+    )
+    total = total_result.scalar_one()
+
+    rows_result = await session.execute(
+        base.order_by(ScheduledRunModel.created_at.desc()).limit(limit).offset(offset)
+    )
+    schedules = rows_result.scalars().all()
+
+    def _ser_scheduled(s: ScheduledRunModel) -> dict:
+        return {
+            "id": str(s.id),
+            "name": s.name,
+            "objective": s.objective,
+            "run_type": s.run_type,
+            "cron_expression": s.cron_expression,
+            "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+            "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
+            "is_active": s.is_active,
+            "created_at": s.created_at.isoformat(),
+        }
+
+    return paginate([_ser_scheduled(s) for s in schedules], total, limit, offset)

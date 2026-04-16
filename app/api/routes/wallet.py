@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
+from app.api.auth.kyc_deps import require_verified_kyc
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
@@ -195,6 +196,7 @@ async def topup_wallet(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner")),
+    _kyc=Depends(require_verified_kyc),
 ):
     try:
         business_uuid = uuid.UUID(business_id)
@@ -348,6 +350,227 @@ async def withdraw_wallet(
     )
 
 
+# ── AI Credit routes ──────────────────────────────────────────────────────────
+
+# Credit bundle options: {credits: price_ngn}
+_CREDIT_BUNDLES: dict[int, int] = {5: 2500, 20: 9000, 50: 21000}
+
+
+class CreditBalanceResponse(BaseModel):
+    business_id: str
+    balance: int
+    bundles: list[dict]  # [{credits, price}]
+
+
+class CreditPurchaseRequest(BaseModel):
+    credits: int = Field(..., description="Must be one of: 5, 20, 50")
+    reference: str = Field(..., min_length=1, max_length=255, description="Unique payment reference")
+
+
+class CreditPurchaseResponse(BaseModel):
+    balance: int
+    credits_added: int
+    amount_charged: float
+    reference: str
+    already_processed: bool
+
+
+class CreditTransactionResponse(BaseModel):
+    id: str
+    type: str
+    credits: int
+    description: Optional[str]
+    run_id: Optional[str]
+    created_at: str
+
+
+class CreditTransactionListResponse(BaseModel):
+    transactions: list[CreditTransactionResponse]
+    total: int
+
+
+@router.get("/credits", response_model=CreditBalanceResponse)
+async def get_credits(
+    business_id: str = Query(..., description="Business UUID"),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
+    _kyc=Depends(require_verified_kyc),
+):
+    try:
+        business_uuid = uuid.UUID(business_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
+
+    membership = await _get_membership(session, current_user.id, business_uuid)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    from src.infrastructure.database.flowpilot_models import BusinessModel as _BizModel
+    biz_result = await session.execute(
+        select(_BizModel).where(_BizModel.id == business_uuid)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if not biz:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    return CreditBalanceResponse(
+        business_id=str(biz.id),
+        balance=biz.ai_credit_balance,
+        bundles=[{"credits": k, "price": v} for k, v in _CREDIT_BUNDLES.items()],
+    )
+
+
+@router.post("/credits/purchase", response_model=CreditPurchaseResponse)
+async def purchase_credits(
+    request: CreditPurchaseRequest,
+    business_id: str = Query(..., description="Business UUID"),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner")),
+    _kyc=Depends(require_verified_kyc),
+):
+    try:
+        business_uuid = uuid.UUID(business_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
+
+    if request.credits not in _CREDIT_BUNDLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid bundle size. Choose from: {list(_CREDIT_BUNDLES.keys())}",
+        )
+
+    membership = await _get_membership(session, current_user.id, business_uuid)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    bundle_price = _CREDIT_BUNDLES[request.credits]
+    bundle_price_decimal = Decimal(str(bundle_price))
+
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessModel as _BizModel,
+        AiCreditTransactionModel as _CreditTxModel,
+    )
+    from src.infrastructure.database.repositories.wallet_repository import (
+        InsufficientBalanceError as _InsufficientBalance,
+    )
+    from sqlalchemy import select as _sel
+
+    # ── Idempotency: use the wallet transaction as the authoritative token ────
+    # wallet_transaction.reference has a UNIQUE constraint, so the wallet repo
+    # guarantees exactly-once processing.  If created=False the debit already
+    # happened; skip the credit addition and return the current balance.
+    repo = WalletRepository(session)
+    wallet_ref = f"credit_purchase_{request.reference}"
+    try:
+        _debit_tx, created = await repo.debit(
+            business_id=business_uuid,
+            amount=bundle_price_decimal,
+            reference=wallet_ref,
+            description=f"AI credit bundle ({request.credits} credits)",
+        )
+    except _InsufficientBalance:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient wallet balance. Top up at least ₦{bundle_price:,} before purchasing credits.",
+        )
+
+    if not created:
+        # Already processed — return current balance without modifying anything
+        biz_result = await session.execute(
+            _sel(_BizModel).where(_BizModel.id == business_uuid)
+        )
+        biz = biz_result.scalar_one_or_none()
+        return CreditPurchaseResponse(
+            balance=biz.ai_credit_balance if biz else 0,
+            credits_added=request.credits,
+            amount_charged=bundle_price,
+            reference=request.reference,
+            already_processed=True,
+        )
+
+    # New purchase — add credits and log the transaction
+    biz_result = await session.execute(
+        _sel(_BizModel).where(_BizModel.id == business_uuid)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if not biz:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    biz.ai_credit_balance += request.credits
+
+    session.add(_CreditTxModel(
+        business_id=business_uuid,
+        type="purchase",
+        credits=request.credits,
+        description=f"Purchased {request.credits} credits · ref: {request.reference}",
+    ))
+    await session.commit()
+
+    return CreditPurchaseResponse(
+        balance=biz.ai_credit_balance,
+        credits_added=request.credits,
+        amount_charged=bundle_price,
+        reference=request.reference,
+        already_processed=False,
+    )
+
+
+@router.get("/credits/transactions", response_model=CreditTransactionListResponse)
+async def list_credit_transactions(
+    business_id: str = Query(..., description="Business UUID"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
+    _kyc=Depends(require_verified_kyc),
+):
+    try:
+        business_uuid = uuid.UUID(business_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
+
+    membership = await _get_membership(session, current_user.id, business_uuid)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    from src.infrastructure.database.flowpilot_models import AiCreditTransactionModel as _CreditTxModel
+    from sqlalchemy import select as _sel, func as _func
+
+    count_result = await session.execute(
+        _sel(_func.count()).select_from(_CreditTxModel).where(
+            _CreditTxModel.business_id == business_uuid
+        )
+    )
+    total = count_result.scalar_one()
+
+    rows_result = await session.execute(
+        _sel(_CreditTxModel)
+        .where(_CreditTxModel.business_id == business_uuid)
+        .order_by(_CreditTxModel.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = rows_result.scalars().all()
+
+    return CreditTransactionListResponse(
+        transactions=[
+            CreditTransactionResponse(
+                id=str(r.id),
+                type=r.type,
+                credits=r.credits,
+                description=r.description,
+                run_id=str(r.run_id) if r.run_id else None,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in rows
+        ],
+        total=total,
+    )
+
+
 @router.get("/wallet/transactions", response_model=WalletTransactionListResponse)
 async def list_wallet_transactions(
     business_id: str = Query(..., description="Business UUID"),
@@ -357,6 +580,7 @@ async def list_wallet_transactions(
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner", "approver")),
+    _kyc=Depends(require_verified_kyc),
 ):
     try:
         business_uuid = uuid.UUID(business_id)

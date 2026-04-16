@@ -845,12 +845,16 @@ class RunOrchestrator:
                 logger.warning(f"Run {run_id}: {msg}")
                 persist_errors.append(msg)
 
-        # Fire payout.succeeded / payout.failed webhooks for each executed candidate
+        # Fire payout.succeeded / payout.failed webhooks + beneficiary emails
         business_id_str = state.get("business_id")
         if business_id_str:
             try:
                 import asyncio as _asyncio
+                import datetime as _dt_exec
                 from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                from src.services.email_service import send_beneficiary_payment_email as _send_bene_email
+                from src.infrastructure.database.repositories import InstitutionRepository as _InstRepoOrch
+
                 # Build lookup for beneficiary details from scored_candidates
                 _candidate_meta = {
                     c.get("candidate_id"): c
@@ -858,34 +862,106 @@ class RunOrchestrator:
                 }
                 business_uuid_wh = uuid.UUID(str(business_id_str))
                 _objective = state.get("objective")
+                _payment_date = _dt_exec.datetime.now(_dt_exec.timezone.utc).strftime("%d %b %Y, %I:%M %p WAT")
+
+                # Resolve institution codes → bank names once
+                _inst_map: dict[str, str] = {}
+                try:
+                    _inst_repo_orch = _InstRepoOrch(session)
+                    _institutions = await _inst_repo_orch.get_all_active()
+                    _inst_map = {i.institution_code: i.institution_name for i in _institutions}
+                except Exception:
+                    pass
+
+                # Org name for emails
+                _org_name_exec = "Your Organisation"
+                try:
+                    from sqlalchemy import select as _sel_orch
+                    from src.infrastructure.database.flowpilot_models import BusinessModel as _BizModelOrch
+                    _biz_r = await session.execute(
+                        _sel_orch(_BizModelOrch).where(_BizModelOrch.id == business_uuid_wh)
+                    )
+                    _biz_e = _biz_r.scalar_one_or_none()
+                    if _biz_e:
+                        _org_name_exec = _biz_e.business_name
+                except Exception:
+                    pass
+
                 for er in state.get("candidate_execution_results", []):
                     exec_status = er.get("execution_status", "pending")
                     _cid = er.get("candidate_id")
                     _meta = _candidate_meta.get(_cid, {})
+                    _bene_email = _meta.get("beneficiary_email")
+                    _institution_code = _meta.get("institution_code", "")
+                    _bank_name = _inst_map.get(_institution_code, _institution_code)
+                    _amount_val = er.get("amount") or _meta.get("amount")
+                    _provider_ref = er.get("provider_reference")
+
                     if exec_status == "success":
+                        # Enriched webhook payload
                         _asyncio.create_task(_dispatch(business_uuid_wh, "payout.succeeded", {
                             "run_id": str(run_id),
+                            "business_id": business_id_str,
                             "objective": _objective,
                             "candidate_id": _cid,
                             "beneficiary_name": _meta.get("beneficiary_name"),
                             "account_number": _meta.get("account_number"),
-                            "institution_code": _meta.get("institution_code"),
-                            "amount": er.get("amount"),
-                            "provider_reference": er.get("provider_reference"),
+                            "institution_code": _institution_code,
+                            "bank_name": _bank_name,
+                            "amount": _amount_val,
+                            "currency": _meta.get("currency", "NGN"),
+                            "purpose": _meta.get("purpose"),
+                            "provider_reference": _provider_ref,
+                            "executed_at": _payment_date,
                         }))
+                        # Auto-notify beneficiary by email if email was provided
+                        if _bene_email:
+                            _asyncio.create_task(_send_bene_email(
+                                to=_bene_email,
+                                org_name=_org_name_exec,
+                                beneficiary_name=_meta.get("beneficiary_name", ""),
+                                amount=float(_amount_val or 0),
+                                account_number=_meta.get("account_number", ""),
+                                bank_name=_bank_name,
+                                payment_date=_payment_date,
+                                status="success",
+                                reference=_provider_ref,
+                                purpose=_meta.get("purpose"),
+                            ))
                     elif exec_status == "failed":
+                        _reason = er.get("response_message") or "execution_failed"
+                        # Enriched webhook payload
                         _asyncio.create_task(_dispatch(business_uuid_wh, "payout.failed", {
                             "run_id": str(run_id),
+                            "business_id": business_id_str,
                             "objective": _objective,
                             "candidate_id": _cid,
                             "beneficiary_name": _meta.get("beneficiary_name"),
                             "account_number": _meta.get("account_number"),
-                            "institution_code": _meta.get("institution_code"),
-                            "amount": er.get("amount"),
-                            "reason": er.get("response_message") or "execution_failed",
+                            "institution_code": _institution_code,
+                            "bank_name": _bank_name,
+                            "amount": _amount_val,
+                            "currency": _meta.get("currency", "NGN"),
+                            "purpose": _meta.get("purpose"),
+                            "reason": _reason,
+                            "executed_at": _payment_date,
                         }))
+                        # Notify beneficiary of failed payment
+                        if _bene_email:
+                            _asyncio.create_task(_send_bene_email(
+                                to=_bene_email,
+                                org_name=_org_name_exec,
+                                beneficiary_name=_meta.get("beneficiary_name", ""),
+                                amount=float(_amount_val or 0),
+                                account_number=_meta.get("account_number", ""),
+                                bank_name=_bank_name,
+                                payment_date=_payment_date,
+                                status="failed",
+                                purpose=_meta.get("purpose"),
+                                reason=_reason,
+                            ))
             except Exception as _wh_exc:
-                logger.warning(f"Run {run_id}: payout webhook dispatch failed: {_wh_exc}")
+                logger.warning(f"Run {run_id}: payout webhook/email dispatch failed: {_wh_exc}")
 
         # Propagate critical persistence failures to state so run doesn't silently complete
         if persist_errors:

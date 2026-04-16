@@ -5,6 +5,16 @@ Business repository — create business with owner for onboarding flow.
 import uuid
 from datetime import datetime, timezone
 
+
+def _generate_virtual_account_number(business_id: uuid.UUID) -> str:
+    """Derive a deterministic 10-digit virtual account number from the business UUID.
+
+    Uses the integer representation of the UUID, modulo 9 billion, offset to guarantee
+    10 digits. Collision probability across UUIDs is negligible for practical org counts.
+    """
+    n = (business_id.int % 9_000_000_000) + 1_000_000_000
+    return str(n)
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.infrastructure.database.flowpilot_models import (
@@ -50,6 +60,12 @@ class BusinessRepository:
         )
         self._s.add(business)
         await self._s.flush()  # assigns business.id
+
+        # Assign a virtual account for wallet top-up via bank transfer
+        business.virtual_account_number = _generate_virtual_account_number(business.id)
+        business.virtual_account_bank = "FlowPilot Microfinance Bank"
+        business.virtual_account_name = business_name[:30]
+        await self._s.flush()
 
         config = BusinessConfigModel(
             business_id=business.id,
