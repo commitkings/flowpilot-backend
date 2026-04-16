@@ -30,6 +30,7 @@ from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
     BusinessModel,
     IndividualKycSubmissionModel,
+    KycLimitTrackerModel,
     KycSubmissionModel,
     UserModel,
 )
@@ -444,8 +445,25 @@ async def get_kyc_status(
     kyc_level = getattr(biz, "kyc_level", 0) or 0
 
     # Build limit info
+    from datetime import date as _date
     limits = get_limits(account_type, kyc_level)
     max_level = max(KYC_LIMITS.get(account_type, {}).keys(), default=0)
+
+    # Fetch monthly usage tracker
+    _today = _date.today()
+    _month_start = _today.replace(day=1)
+    _tracker_result = await session.execute(
+        select(KycLimitTrackerModel).where(KycLimitTrackerModel.business_id == biz.id)
+    )
+    _tracker = _tracker_result.scalar_one_or_none()
+    monthly_payout_used = 0.0
+    if _tracker:
+        if _tracker.month_start < _month_start:
+            # New month — treat as zero (will reset on next approval)
+            monthly_payout_used = 0.0
+        else:
+            monthly_payout_used = float(_tracker.monthly_payout_used)
+
     limit_info = {
         "account_type": account_type,
         "kyc_level": kyc_level,
@@ -454,6 +472,7 @@ async def get_kyc_status(
         "wallet_limit": float(limits["wallet"]) if limits else 0,
         "at_max_level": kyc_level >= max_level,
         "support_email": SUPPORT_EMAIL,
+        "monthly_payout_used": monthly_payout_used,
     }
 
     if account_type == "individual":
