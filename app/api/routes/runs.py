@@ -96,6 +96,11 @@ class RunResponse(BaseModel):
     budget_cap: Optional[float] = None
     assigned_to_id: Optional[str] = None
     assigned_to: Optional[dict] = None  # {id, name, email}
+    created_by: Optional[str] = None
+    created_by_user: Optional[dict] = None  # {id, name, email}
+    approved_by: Optional[str] = None
+    approved_by_user: Optional[dict] = None  # {id, name, email}
+    approved_at: Optional[str] = None
     plan_steps: Optional[list] = None
     candidates: Optional[list[CandidateResponse]] = None
     candidate_count: int = 0
@@ -661,9 +666,9 @@ async def get_run(
     candidate_responses = _candidates_to_response(db_candidates)
 
     # Load assigned approver user info if set
+    from sqlalchemy import select as _sat
     assigned_to: dict | None = None
     if run.assigned_to_id:
-        from sqlalchemy import select as _sat
         at_result = await session.execute(
             _sat(UserModel).where(UserModel.id == run.assigned_to_id)
         )
@@ -675,6 +680,34 @@ async def get_run(
                 "email": at_user.email,
             }
 
+    # Load creator user info
+    created_by_user: dict | None = None
+    if run.created_by:
+        cb_result = await session.execute(
+            _sat(UserModel).where(UserModel.id == run.created_by)
+        )
+        cb_user = cb_result.scalar_one_or_none()
+        if cb_user:
+            created_by_user = {
+                "id": str(cb_user.id),
+                "name": cb_user.display_name or cb_user.email,
+                "email": cb_user.email,
+            }
+
+    # Load approver user info
+    approved_by_user: dict | None = None
+    if run.approved_by:
+        ab_result = await session.execute(
+            _sat(UserModel).where(UserModel.id == run.approved_by)
+        )
+        ab_user = ab_result.scalar_one_or_none()
+        if ab_user:
+            approved_by_user = {
+                "id": str(ab_user.id),
+                "name": ab_user.display_name or ab_user.email,
+                "email": ab_user.email,
+            }
+
     return RunResponse(
         run_id=run_id,
         objective=run.objective,
@@ -684,6 +717,11 @@ async def get_run(
         budget_cap=float(run.budget_cap) if run.budget_cap is not None else None,
         assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
         assigned_to=assigned_to,
+        created_by=str(run.created_by) if run.created_by else None,
+        created_by_user=created_by_user,
+        approved_by=str(run.approved_by) if run.approved_by else None,
+        approved_by_user=approved_by_user,
+        approved_at=run.approved_at.isoformat() if run.approved_at else None,
         plan_steps=plan_steps or None,
         candidates=candidate_responses or None,
         candidate_count=len(candidate_responses),
@@ -1047,6 +1085,104 @@ async def get_run_step_detail(
 # =====================================================================
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+# --------------------------------------------------------------------------- #
+# Nudge — remind the assigned approver to take action
+# --------------------------------------------------------------------------- #
+
+@router.post("/runs/{run_id}/nudge")
+async def nudge_approver(
+    run_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    """Send an email + in-app notification to the assigned approver, reminding
+    them that a payout run is awaiting their review.
+
+    Only the run creator or an owner may trigger a nudge.
+    The run must be in 'awaiting_approval' status.
+    """
+    run_uuid = _parse_uuid(run_id, "run_id")
+    run_repo = RunRepository(session)
+    candidate_repo = CandidateRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Membership gate
+    from sqlalchemy import select as _select_nudge
+    _mem_q = await session.execute(
+        _select_nudge(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    caller_membership = _mem_q.scalars().first()
+    if not caller_membership:
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
+    # Only creator or owner may nudge
+    is_creator = run.created_by and run.created_by == current_user.id
+    is_owner = caller_membership.role == "owner"
+    if not is_creator and not is_owner:
+        raise HTTPException(status_code=403, detail="Only the payout creator or an owner can send a nudge.")
+
+    if run.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=400,
+            detail="Nudge can only be sent when the payout is awaiting approval.",
+        )
+
+    if not run.assigned_to_id:
+        raise HTTPException(status_code=400, detail="This payout has no assigned approver.")
+
+    # Load the assigned approver
+    at_result = await session.execute(
+        _select_nudge(UserModel).where(UserModel.id == run.assigned_to_id)
+    )
+    approver_user = at_result.scalar_one_or_none()
+    if not approver_user:
+        raise HTTPException(status_code=404, detail="Assigned approver not found.")
+
+    # Count candidates
+    db_candidates = await candidate_repo.get_by_run(run_uuid)
+    candidate_count = len(db_candidates)
+
+    # In-app notification
+    await _notify(
+        session,
+        approver_user.id,
+        run.business_id,
+        title="Reminder: Payout awaiting your approval",
+        message=(
+            f'The payout "{run.objective[:60]}" is still waiting for your review. '
+            "Please approve or reject it to proceed."
+        ),
+        type="warning",
+        resource_type="run",
+        resource_id=run_id,
+    )
+    await session.commit()
+
+    # Email — fire-and-forget
+    try:
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            send_run_awaiting_approval_email(
+                to=approver_user.email,
+                run_id=run_id,
+                objective=run.objective,
+                candidate_count=candidate_count,
+                approver_name=approver_user.display_name or approver_user.email,
+            )
+        )
+    except Exception as exc:
+        logger.warning("[Nudge] Could not send nudge email: %s", exc)
+
+    return {"ok": True, "nudged_user": approver_user.email}
 
 
 @router.get("/runs/{run_id}/events/stream")

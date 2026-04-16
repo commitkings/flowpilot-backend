@@ -496,6 +496,12 @@ async def approve_candidates(
     # Approve candidates in DB (candidate_ids already validated above)
     approved_count = await candidate_repo.approve(candidate_ids, current_user.id, run_uuid)
 
+    # Stamp the run itself with who approved it and when
+    from datetime import datetime as _dt, timezone as _tz
+    run.approved_by = current_user.id
+    run.approved_at = _dt.now(_tz.utc)
+    await session.flush()
+
     # Audit log: approval action
     audit_repo = AuditRepository(session)
     await audit_repo.append(

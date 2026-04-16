@@ -40,6 +40,8 @@ class WalletResponse(BaseModel):
     business_id: str
     balance: float
     currency: str
+    total_credit: float = 0.0
+    total_debit: float = 0.0
     created_at: str
     updated_at: str
 
@@ -156,11 +158,31 @@ async def get_wallet(
     wallet = await repo.get_or_create(business_uuid)
     await session.commit()
 
+    # Compute aggregate credit / debit totals
+    from sqlalchemy import func as _func
+    from src.infrastructure.database.flowpilot_models import WalletTransactionModel
+    _credit_result = await session.execute(
+        select(_func.coalesce(_func.sum(WalletTransactionModel.amount), 0)).where(
+            WalletTransactionModel.business_id == business_uuid,
+            WalletTransactionModel.type == "credit",
+        )
+    )
+    total_credit = float(_credit_result.scalar_one())
+    _debit_result = await session.execute(
+        select(_func.coalesce(_func.sum(WalletTransactionModel.amount), 0)).where(
+            WalletTransactionModel.business_id == business_uuid,
+            WalletTransactionModel.type == "debit",
+        )
+    )
+    total_debit = float(_debit_result.scalar_one())
+
     return WalletResponse(
         id=str(wallet.id),
         business_id=str(wallet.business_id),
         balance=float(wallet.balance),
         currency=wallet.currency,
+        total_credit=total_credit,
+        total_debit=total_debit,
         created_at=wallet.created_at.isoformat(),
         updated_at=wallet.updated_at.isoformat(),
     )
@@ -246,11 +268,92 @@ async def topup_wallet(
     )
 
 
+class WithdrawRequest(BaseModel):
+    amount: float = Field(..., gt=0, description="Amount to withdraw (must be > 0)")
+    reference: str = Field(..., min_length=1, max_length=255, description="Unique withdrawal reference")
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class WithdrawResponse(BaseModel):
+    balance: float
+    amount_debited: float
+    reference: str
+
+
+@router.post("/wallet/withdraw", response_model=WithdrawResponse)
+async def withdraw_wallet(
+    request: WithdrawRequest,
+    business_id: str = Query(..., description="Business UUID"),
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner")),
+):
+    try:
+        business_uuid = uuid.UUID(business_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
+
+    membership = await _get_membership(session, current_user.id, business_uuid)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        amount = Decimal(str(request.amount))
+    except InvalidOperation:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    from src.infrastructure.database.repositories.wallet_repository import InsufficientBalanceError
+    repo = WalletRepository(session)
+    try:
+        tx, created = await repo.debit(
+            business_id=business_uuid,
+            amount=amount,
+            reference=request.reference,
+            description=request.description or "Wallet withdrawal",
+        )
+    except InsufficientBalanceError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient balance: available ₦{float(exc.balance):,.2f}, requested ₦{float(exc.required):,.2f}",
+        )
+    await session.commit()
+    await session.refresh(tx)
+
+    # In-app notification (best-effort)
+    try:
+        owner_row = await _get_owner(session, business_uuid)
+        if owner_row:
+            _, owner_user = owner_row
+            from src.infrastructure.database.repositories.notification_repository import NotificationRepository
+            notif_repo = NotificationRepository(session)
+            await notif_repo.create(
+                user_id=owner_user.id,
+                business_id=business_uuid,
+                title="Wallet withdrawal recorded",
+                message=(
+                    f"₦{float(amount):,.2f} withdrawal recorded. "
+                    f"New balance: ₦{float(tx.balance_after):,.2f}."
+                ),
+                type="info",
+                resource_type="wallet",
+            )
+            await session.commit()
+    except Exception as exc:
+        logger.warning("[Wallet] Could not send withdrawal notification: %s", exc)
+
+    return WithdrawResponse(
+        balance=float(tx.balance_after),
+        amount_debited=float(amount),
+        reference=tx.reference,
+    )
+
+
 @router.get("/wallet/transactions", response_model=WalletTransactionListResponse)
 async def list_wallet_transactions(
     business_id: str = Query(..., description="Business UUID"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    month: Optional[str] = Query(None, description="Filter by month: YYYY-MM"),
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner", "approver")),
@@ -264,9 +367,25 @@ async def list_wallet_transactions(
     if not membership:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # Parse optional month filter
+    month_start = None
+    month_end = None
+    if month:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            month_start = _dt.strptime(month, "%Y-%m").replace(tzinfo=_tz.utc)
+            # First day of next month
+            if month_start.month == 12:
+                month_end = month_start.replace(year=month_start.year + 1, month=1)
+            else:
+                month_end = month_start.replace(month=month_start.month + 1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM.")
+
     repo = WalletRepository(session)
     transactions, total = await repo.list_transactions(
-        business_id=business_uuid, limit=limit, offset=offset
+        business_id=business_uuid, limit=limit, offset=offset,
+        month_start=month_start, month_end=month_end,
     )
 
     return WalletTransactionListResponse(

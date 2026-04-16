@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -200,22 +200,33 @@ class WalletRepository:
     async def list_transactions(
         self,
         business_id: uuid.UUID,
-        limit: int = 20,
+        limit: int = 50,
         offset: int = 0,
+        month_start: Optional[datetime] = None,
+        month_end: Optional[datetime] = None,
     ) -> tuple[list[WalletTransactionModel], int]:
-        """Return paginated transactions (newest first) and total count."""
+        """Return paginated transactions (newest first) and total count.
+
+        Optional month_start / month_end narrow results to that calendar month.
+        """
         from sqlalchemy import func as _func
+
+        base_filter = [WalletTransactionModel.business_id == business_id]
+        if month_start:
+            base_filter.append(WalletTransactionModel.created_at >= month_start)
+        if month_end:
+            base_filter.append(WalletTransactionModel.created_at < month_end)
 
         count_result = await self._session.execute(
             select(_func.count()).select_from(WalletTransactionModel).where(
-                WalletTransactionModel.business_id == business_id
+                and_(*base_filter)
             )
         )
         total = count_result.scalar_one()
 
         result = await self._session.execute(
             select(WalletTransactionModel)
-            .where(WalletTransactionModel.business_id == business_id)
+            .where(and_(*base_filter))
             .order_by(WalletTransactionModel.created_at.desc())
             .limit(limit)
             .offset(offset)

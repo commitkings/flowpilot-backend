@@ -32,6 +32,7 @@ from src.infrastructure.database.flowpilot_models import (
     BusinessModel,
     PayoutCandidateModel,
     ReconciledTransactionModel,
+    UserModel,
 )
 
 
@@ -69,15 +70,41 @@ def paginate(data: list, total: int, limit: int, offset: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _ser_run(run: AgentRunModel) -> dict:
+    """Serialize a run for the public API list response (IDs only for relations)."""
     return {
         "id": str(run.id),
         "objective": run.objective,
         "status": run.status,
         "risk_tolerance": float(run.risk_tolerance),
         "budget_cap": float(run.budget_cap) if run.budget_cap is not None else None,
+        "error": run.error_message,
         "created_at": run.created_at.isoformat(),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "approved_at": run.approved_at.isoformat() if run.approved_at else None,
+        # Relation IDs — full user objects are available on the single-run endpoint
+        "created_by": str(run.created_by) if run.created_by else None,
+        "approved_by": str(run.approved_by) if run.approved_by else None,
+        "assigned_to_id": str(run.assigned_to_id) if run.assigned_to_id else None,
+    }
+
+
+def _ser_run_detail(run: AgentRunModel, created_by_user: dict | None, approved_by_user: dict | None, assigned_to_user: dict | None) -> dict:
+    """Serialize a run for the public API single-run response (full user objects)."""
+    base = _ser_run(run)
+    base["created_by_user"] = created_by_user
+    base["approved_by_user"] = approved_by_user
+    base["assigned_to"] = assigned_to_user
+    return base
+
+
+def _ser_user(user: UserModel | None) -> dict | None:
+    if user is None:
+        return None
+    return {
+        "id": str(user.id),
+        "name": user.display_name or user.email,
+        "email": user.email,
     }
 
 
@@ -93,7 +120,11 @@ def _ser_candidate(c: PayoutCandidateModel) -> dict:
         "purpose": c.purpose,
         "risk_score": float(c.risk_score) if c.risk_score is not None else None,
         "risk_decision": c.risk_decision,
+        "lookup_status": c.lookup_status,
+        "lookup_account_name": c.lookup_account_name,
         "approval_status": c.approval_status,
+        "approved_by": str(c.approved_by) if c.approved_by else None,
+        "approved_at": c.approved_at.isoformat() if c.approved_at else None,
         "execution_status": c.execution_status,
         "executed_at": c.executed_at.isoformat() if c.executed_at else None,
     }
@@ -163,7 +194,7 @@ async def get_run(
     ctx: ApiKeyContext = Depends(require_scope("runs:read")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Get a single run by ID."""
+    """Get a single run by ID, including full user details for creator, approver, and assignee."""
     result = await session.execute(
         select(AgentRunModel).where(
             AgentRunModel.id == run_id,
@@ -173,7 +204,23 @@ async def get_run(
     run = result.scalars().first()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return _ser_run(run)
+
+    async def _load_user(user_id: uuid.UUID | None) -> UserModel | None:
+        if not user_id:
+            return None
+        r = await session.execute(select(UserModel).where(UserModel.id == user_id))
+        return r.scalar_one_or_none()
+
+    created_by_user = await _load_user(run.created_by)
+    approved_by_user = await _load_user(run.approved_by)
+    assigned_to_user = await _load_user(run.assigned_to_id)
+
+    return _ser_run_detail(
+        run,
+        created_by_user=_ser_user(created_by_user),
+        approved_by_user=_ser_user(approved_by_user),
+        assigned_to_user=_ser_user(assigned_to_user),
+    )
 
 
 @router.get("/runs/{run_id}/candidates")
