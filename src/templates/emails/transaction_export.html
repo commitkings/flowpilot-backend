@@ -6,6 +6,10 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <title>Transaction export ready</title>
   <style>
+    @media (prefers-color-scheme: dark) {
+      .light-logo { display: none !important; }
+      .dark-logo  { display: block !important; }
+    }
     @media only screen and (max-width:600px) {
       .outer-pad { padding: 24px 12px 32px !important; }
       .logo-pad  { padding: 24px 24px 18px !important; }
@@ -35,8 +39,12 @@
           <!-- Logo -->
           <tr>
             <td align="center" class="logo-pad" style="background-color:#ffffff;padding:28px 40px 20px;">
-              <img src="{{ logo_url }}" alt="FlowPilot" height="28"
+              <img src="{{ logo_url }}" alt="FlowPilot" height="28" class="light-logo"
                    style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;" />
+              <!--[if !mso]><!-->
+              <img src="{{ logo_dark_url }}" alt="FlowPilot" height="28" class="dark-logo"
+                   style="display:none;border:0;outline:none;text-decoration:none;margin:0 auto;" />
+              <!--<![endif]-->
             </td>
           </tr>
 
