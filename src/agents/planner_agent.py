@@ -6,6 +6,7 @@ from typing import Any
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
 from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
+from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +430,7 @@ Use your tools to gather the information you need, then produce the execution pl
             response = await self.reason_and_act_json(
                 system_prompt=PLANNER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL,
             )
             plan = json.loads(response)
             steps = plan.get("plan_steps", [])

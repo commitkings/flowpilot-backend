@@ -867,6 +867,7 @@ Steps:
             response = await self.reason_and_act_json(
                 system_prompt=RECONCILIATION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL_RECONCILIATION,
             )
 
             try:

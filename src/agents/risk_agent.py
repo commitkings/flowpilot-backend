@@ -20,6 +20,7 @@ from uuid import UUID
 from src.agents.base import BaseAgent
 from src.agents.state import AgentState
 from src.agents.tools import Tool, ToolParam, ToolParamType, ToolRegistry
+from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -1387,6 +1388,7 @@ Remember: You are REVIEWING computed scores, not guessing them. The computed sco
             response = await self.reason_and_act_json(
                 system_prompt=RISK_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                model=Settings.GROQ_LLM_MODEL,
             )
 
             # Parse response

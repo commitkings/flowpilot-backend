@@ -243,7 +243,14 @@ class Settings:
     # Groq API (LLM)
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
-    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL")
+    # Planner, risk, execution (default). Reconciliation uses this unless GROQ_LLM_MODEL_RECONCILIATION is set.
+    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL") or "llama-3.3-70b-versatile"
+    # Audit reports can be long; GPT-OSS 120B supports larger max completion on Groq than Llama 3.3 70B.
+    GROQ_LLM_MODEL_AUDIT: str = os.getenv("GROQ_LLM_MODEL_AUDIT") or "openai/gpt-oss-120b"
+    # Optional: e.g. openai/gpt-oss-120b for very long recon summaries. Empty → same as GROQ_LLM_MODEL.
+    GROQ_LLM_MODEL_RECONCILIATION: str = (
+        os.getenv("GROQ_LLM_MODEL_RECONCILIATION", "").strip() or GROQ_LLM_MODEL
+    )
     # Fast/cheap model for simple tasks (intent classification, slot extraction, response generation)
     GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant")
 

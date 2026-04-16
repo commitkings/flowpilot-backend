@@ -668,7 +668,7 @@ class IntentService:
         try:
             client = self._get_client()
             response = await client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=Settings.GROQ_LLM_MODEL_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=80,

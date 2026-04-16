@@ -122,3 +122,4 @@ scripts/deploy.sh
 scripts/install-skill-to-github.sh
 whatsapp/
 copilot-instructions.md
+*.sh
