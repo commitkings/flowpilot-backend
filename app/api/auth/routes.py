@@ -119,6 +119,7 @@ def _user_response(user, memberships) -> dict:
         "last_login_at": (
             user.last_login_at.isoformat() if user.last_login_at else None
         ),
+        "date_of_birth": user.date_of_birth.isoformat() if getattr(user, "date_of_birth", None) else None,
         "memberships": [
             {"business_id": str(m.business_id), "role": m.role}
             for m in active_memberships
@@ -266,6 +267,7 @@ class RegisterViaInviteRequest(BaseModel):
     first_name: str = Field(min_length=1, max_length=100)
     last_name: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=512)
+    date_of_birth: Optional[str] = None  # ISO format YYYY-MM-DD
 
 
 @router.post("/register-via-invite", status_code=status.HTTP_201_CREATED)
@@ -311,6 +313,27 @@ async def register_via_invite(
     display_name = f"{body.first_name.strip()} {body.last_name.strip()}"
     password_hashed = hash_password(body.password)
 
+    # Validate DOB — must be 18+
+    parsed_dob = None
+    if body.date_of_birth:
+        try:
+            from datetime import date as _date
+            parsed_dob = _date.fromisoformat(body.date_of_birth)
+            today = _date.today()
+            age = today.year - parsed_dob.year - (
+                (today.month, today.day) < (parsed_dob.month, parsed_dob.day)
+            )
+            if age < 18:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="You must be at least 18 years old to register.",
+                )
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid date_of_birth format. Use YYYY-MM-DD.",
+            )
+
     new_user = UserModel(
         email=invite.invited_email,
         display_name=display_name,
@@ -318,6 +341,7 @@ async def register_via_invite(
         last_name=body.last_name.strip(),
         password_hash=password_hashed,
         is_active=True,
+        date_of_birth=parsed_dob,
         # Invitation proves email ownership — mark as verified immediately
         email_verified_at=datetime.now(tz.utc),
     )

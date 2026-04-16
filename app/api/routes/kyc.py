@@ -29,9 +29,11 @@ from src.infrastructure.database.connection import get_db_session, get_session_f
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
     BusinessModel,
+    IndividualKycSubmissionModel,
     KycSubmissionModel,
     UserModel,
 )
+from src.config.kyc_limits import KYC_LIMITS, SUPPORT_EMAIL, get_limits
 from src.infrastructure.database.repositories.business_repository import (
     _generate_virtual_account_number,
 )
@@ -108,7 +110,11 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                     select(BusinessModel).where(BusinessModel.id == bid)
                 )
                 biz = biz_result.scalar_one_or_none()
-                va_updates: dict = {"kyc_status": "verified", "updated_at": now}
+                va_updates: dict = {
+                    "kyc_status": "verified",
+                    "kyc_level": 1,  # Business full submission = Level 1
+                    "updated_at": now,
+                }
                 if biz and not biz.virtual_account_number:
                     va_updates["virtual_account_number"] = _generate_virtual_account_number(bid)
                     va_updates["virtual_account_bank"] = "FlowPilot Microfinance Bank"
@@ -135,10 +141,18 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                         resource_id=business_id,
                     )
 
+        _biz_l1 = get_limits("business", 1)
+        _biz_max = get_limits("business", max(KYC_LIMITS.get("business", {}).keys(), default=1))
+        def _fmtb(n) -> str:
+            return f"\u20a6{float(n):,.0f}"
         await email_service.send_kyc_verified_email(
             to=owner_email,
             display_name=owner_name,
             business_name=business_name,
+            monthly_limit=_fmtb(_biz_l1["monthly"]) if _biz_l1 else "₦1,500,000",
+            single_limit=_fmtb(_biz_l1["single"]) if _biz_l1 else "₦300,000",
+            wallet_limit=_fmtb(_biz_l1["wallet"]) if _biz_l1 else "₦3,000,000",
+            max_monthly_limit=_fmtb(_biz_max["monthly"]) if _biz_max else "₦50,000,000",
         )
         logger.info("KYC auto-verified for business %s", business_id)
 
@@ -377,12 +391,18 @@ async def submit_kyc(
     if authorized_officer_name:
         submitted_docs.append(f"Authorized Officer Details ({authorized_officer_name})")
 
+    _sub_l1 = get_limits("business", 1)
+    def _fmts(n) -> str:
+        return f"\u20a6{float(n):,.0f}"
     asyncio.create_task(
         email_service.send_kyc_submitted_email(
             to=user.email,
             display_name=user.display_name or user.email,
             business_name=biz.business_name,
             submitted_docs=submitted_docs,
+            monthly_limit=_fmts(_sub_l1["monthly"]) if _sub_l1 else "₦1,500,000",
+            single_limit=_fmts(_sub_l1["single"]) if _sub_l1 else "₦300,000",
+            wallet_limit=_fmts(_sub_l1["wallet"]) if _sub_l1 else "₦3,000,000",
         )
     )
 
@@ -409,10 +429,55 @@ async def get_kyc_status(
 ):
     """Return the current KYC status for the user's business.
 
-    When verified, includes all text fields and presigned document URLs (1-hour expiry).
+    Includes account_type, kyc_level, limit info, and submission details.
     """
     biz, _ = await _get_business_and_owner(current_user, session)
 
+    account_type = getattr(biz, "account_type", "business") or "business"
+    kyc_level = getattr(biz, "kyc_level", 0) or 0
+
+    # Build limit info
+    limits = get_limits(account_type, kyc_level)
+    max_level = max(KYC_LIMITS.get(account_type, {}).keys(), default=0)
+    limit_info = {
+        "account_type": account_type,
+        "kyc_level": kyc_level,
+        "monthly_limit": float(limits["monthly"]) if limits else 0,
+        "single_limit": float(limits["single"]) if limits else 0,
+        "wallet_limit": float(limits["wallet"]) if limits else 0,
+        "at_max_level": kyc_level >= max_level,
+        "support_email": SUPPORT_EMAIL,
+    }
+
+    if account_type == "individual":
+        ind_result = await session.execute(
+            select(IndividualKycSubmissionModel).where(
+                IndividualKycSubmissionModel.business_id == biz.id
+            )
+        )
+        ind = ind_result.scalar_one_or_none()
+        return {
+            "kyc_status": biz.kyc_status,
+            "limit_info": limit_info,
+            "individual_submission": {
+                "level_1_type": ind.level_1_type if ind else None,
+                "level_1_status": ind.level_1_status if ind else "not_submitted",
+                "level_1_submitted_at": ind.level_1_submitted_at.isoformat() if ind and ind.level_1_submitted_at else None,
+                "level_1_verified_at": ind.level_1_verified_at.isoformat() if ind and ind.level_1_verified_at else None,
+                "level_2_address": ind.level_2_address if ind else None,
+                "level_2_status": ind.level_2_status if ind else "not_submitted",
+                "level_2_document_url": _presigned(ind.level_2_document_key) if ind else None,
+                "level_2_submitted_at": ind.level_2_submitted_at.isoformat() if ind and ind.level_2_submitted_at else None,
+                "level_2_verified_at": ind.level_2_verified_at.isoformat() if ind and ind.level_2_verified_at else None,
+                "level_3_status": ind.level_3_status if ind else "not_submitted",
+                "level_3_document_url": _presigned(ind.level_3_document_key) if ind else None,
+                "level_3_submitted_at": ind.level_3_submitted_at.isoformat() if ind and ind.level_3_submitted_at else None,
+                "level_3_verified_at": ind.level_3_verified_at.isoformat() if ind and ind.level_3_verified_at else None,
+            } if ind else None,
+            "submission": None,
+        }
+
+    # Business account — return existing business KYC submission
     kyc_result = await session.execute(
         select(KycSubmissionModel).where(KycSubmissionModel.business_id == biz.id)
     )
@@ -421,34 +486,29 @@ async def get_kyc_status(
     if kyc is None:
         return {
             "kyc_status": biz.kyc_status,
+            "limit_info": limit_info,
             "submission": None,
         }
 
     return {
         "kyc_status": biz.kyc_status,
+        "limit_info": limit_info,
         "submission": {
             "status": kyc.status,
             "business_type": kyc.business_type,
             "registration_number": kyc.registration_number,
             "tin_number": kyc.tin_number,
-            # Director / owner
             "director_name": kyc.director_name,
-            # NGO
             "trustee_name": kyc.trustee_name,
             "scuml_number": kyc.scuml_number,
-            # Partnership
             "partner_names": kyc.partner_names,
-            # MDA
             "authorized_officer_name": kyc.authorized_officer_name,
-            # Timestamps
             "submitted_at": kyc.submitted_at.isoformat() if kyc.submitted_at else None,
             "verified_at": kyc.verified_at.isoformat() if kyc.verified_at else None,
-            # Document presence flags (backwards compat)
             "has_cac_certificate": bool(kyc.cac_certificate_key),
             "has_tin_document": bool(kyc.tin_document_key),
             "has_director_id": bool(kyc.director_id_key),
             "has_proof_of_address": bool(kyc.proof_of_address_key),
-            # Presigned document URLs — 1 hour expiry; None if not uploaded
             "cac_certificate_url": _presigned(kyc.cac_certificate_key),
             "tin_document_url": _presigned(kyc.tin_document_key),
             "proof_of_address_url": _presigned(kyc.proof_of_address_key),
@@ -460,3 +520,327 @@ async def get_kyc_status(
             "authorized_officer_id_url": _presigned(kyc.authorized_officer_id_key),
         },
     }
+
+
+# ── Individual KYC routes ─────────────────────────────────────────────────────
+
+async def _auto_verify_individual_kyc(
+    business_id: str, level: int, owner_email: str, owner_name: str
+) -> None:
+    """Background task: wait 60 seconds then mark individual KYC level as verified."""
+    await asyncio.sleep(60)
+    try:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            async with session.begin():
+                bid = uuid.UUID(business_id)
+                now = datetime.now(timezone.utc)
+
+                level_field = f"level_{level}_status"
+                verified_field = f"level_{level}_verified_at"
+
+                await session.execute(
+                    update(IndividualKycSubmissionModel)
+                    .where(IndividualKycSubmissionModel.business_id == bid)
+                    .values({level_field: "verified", verified_field: now, "updated_at": now})
+                )
+
+                # Update business kyc_level and kyc_status
+                biz_result = await session.execute(
+                    select(BusinessModel).where(BusinessModel.id == bid)
+                )
+                biz = biz_result.scalar_one_or_none()
+                if biz:
+                    new_level = max(getattr(biz, "kyc_level", 0) or 0, level)
+                    biz_updates: dict = {
+                        "kyc_level": new_level,
+                        "kyc_status": "verified",
+                        "updated_at": now,
+                    }
+                    # Assign virtual account on first KYC approval
+                    if not biz.virtual_account_number:
+                        biz_updates["virtual_account_number"] = _generate_virtual_account_number(bid)
+                        biz_updates["virtual_account_bank"] = "FlowPilot Microfinance Bank"
+                        biz_updates["virtual_account_name"] = (biz.business_name or "Individual")[:30]
+                    await session.execute(
+                        update(BusinessModel).where(BusinessModel.id == bid).values(**biz_updates)
+                    )
+
+                # In-app notification
+                owner_result = await session.execute(
+                    select(UserModel).where(UserModel.email == owner_email)
+                )
+                owner = owner_result.scalar_one_or_none()
+                if owner and biz:
+                    notif_repo = NotificationRepository(session)
+                    await notif_repo.create(
+                        user_id=owner.id,
+                        business_id=bid,
+                        title=f"KYC Level {level} Verified",
+                        message=f"Your Level {level} verification is complete. Your monthly limit has been updated.",
+                        type="success",
+                        resource_type="kyc",
+                        resource_id=business_id,
+                    )
+
+        # Send approval email with new limits
+        _level_names = {1: "Identity", 2: "Address", 3: "Government ID"}
+        _limits = get_limits("individual", level)
+        _max_level = max(KYC_LIMITS.get("individual", {}).keys(), default=0)
+        def _fmt(n) -> str:
+            return f"\u20a6{float(n):,.0f}"
+        await email_service.send_individual_kyc_verified_email(
+            to=owner_email,
+            display_name=owner_name,
+            level=level,
+            level_name=_level_names.get(level, f"Level {level}"),
+            monthly_limit=_fmt(_limits["monthly"]) if _limits else "N/A",
+            single_limit=_fmt(_limits["single"]) if _limits else "N/A",
+            wallet_limit=_fmt(_limits["wallet"]) if _limits else "N/A",
+            at_max_level=(level >= _max_level),
+            support_email=SUPPORT_EMAIL,
+        )
+        logger.info("Individual KYC Level %d auto-verified for business %s", level, business_id)
+    except Exception as exc:
+        logger.error("Individual KYC auto-verification failed (level %d, business %s): %s", level, business_id, exc)
+
+
+@router.post("/individual/level1")
+async def submit_individual_kyc_level1(
+    id_type: str = Form(..., description="'nin' or 'bvn'"),
+    id_value: str = Form(..., min_length=10, max_length=20),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Submit NIN or BVN for Level 1 individual KYC."""
+    biz, user = await _get_business_and_owner(current_user, session)
+
+    if getattr(biz, "account_type", "business") != "individual":
+        raise HTTPException(status_code=400, detail="This endpoint is for individual accounts only.")
+
+    if id_type not in ("nin", "bvn"):
+        raise HTTPException(status_code=422, detail="id_type must be 'nin' or 'bvn'")
+
+    now = datetime.now(timezone.utc)
+
+    ind_result = await session.execute(
+        select(IndividualKycSubmissionModel).where(
+            IndividualKycSubmissionModel.business_id == biz.id
+        )
+    )
+    ind = ind_result.scalar_one_or_none()
+
+    if ind is None:
+        ind = IndividualKycSubmissionModel(
+            business_id=biz.id,
+            level_1_type=id_type,
+            level_1_value=id_value,
+            level_1_status="pending",
+            level_1_submitted_at=now,
+        )
+        session.add(ind)
+    else:
+        ind.level_1_type = id_type
+        ind.level_1_value = id_value
+        ind.level_1_status = "pending"
+        ind.level_1_submitted_at = now
+        ind.updated_at = now
+
+    biz.kyc_status = "pending"
+    biz.updated_at = now
+
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=user.id,
+        business_id=biz.id,
+        title="Identity Verification Submitted",
+        message=f"Your {id_type.upper()} has been submitted. We'll verify it shortly.",
+        type="info",
+        resource_type="kyc",
+        resource_id=str(biz.id),
+    )
+    await session.commit()
+
+    asyncio.create_task(
+        email_service.send_individual_kyc_submitted_email(
+            to=user.email,
+            display_name=user.display_name or user.email,
+            level=1,
+            level_name=f"Identity ({id_type.upper()})",
+        )
+    )
+    asyncio.create_task(
+        _auto_verify_individual_kyc(
+            business_id=str(biz.id),
+            level=1,
+            owner_email=user.email,
+            owner_name=user.display_name or user.email,
+        )
+    )
+
+    return {"status": "pending", "message": f"{id_type.upper()} submitted for verification."}
+
+
+@router.post("/individual/level2")
+async def submit_individual_kyc_level2(
+    address: str = Form(..., min_length=5, max_length=500),
+    proof_of_address: Optional[UploadFile] = File(None),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Submit address + proof of address document for Level 2 individual KYC.
+
+    Requires Level 1 to already be verified.
+    """
+    biz, user = await _get_business_and_owner(current_user, session)
+
+    if getattr(biz, "account_type", "business") != "individual":
+        raise HTTPException(status_code=400, detail="This endpoint is for individual accounts only.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Complete Level 1 verification before proceeding to Level 2.",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    poa_key: Optional[str] = None
+    if proof_of_address:
+        content = await proof_of_address.read()
+        error = validate_document(content, max_bytes=10 * 1024 * 1024)
+        if error:
+            raise HTTPException(status_code=400, detail=f"{proof_of_address.filename}: {error}")
+        poa_key = await s3_client.upload_file(
+            content, proof_of_address.filename or "proof_of_address", folder="kyc/individual/poa"
+        )
+
+    ind_result = await session.execute(
+        select(IndividualKycSubmissionModel).where(
+            IndividualKycSubmissionModel.business_id == biz.id
+        )
+    )
+    ind = ind_result.scalar_one_or_none()
+    if ind is None:
+        raise HTTPException(status_code=400, detail="Level 1 submission not found.")
+
+    ind.level_2_address = address
+    if poa_key:
+        ind.level_2_document_key = poa_key
+    ind.level_2_status = "pending"
+    ind.level_2_submitted_at = now
+    ind.updated_at = now
+
+    biz.kyc_status = "pending"
+    biz.updated_at = now
+
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=user.id,
+        business_id=biz.id,
+        title="Address Verification Submitted",
+        message="Your address and proof of address have been submitted for review.",
+        type="info",
+        resource_type="kyc",
+        resource_id=str(biz.id),
+    )
+    await session.commit()
+
+    asyncio.create_task(
+        email_service.send_individual_kyc_submitted_email(
+            to=user.email,
+            display_name=user.display_name or user.email,
+            level=2,
+            level_name="Address",
+        )
+    )
+    asyncio.create_task(
+        _auto_verify_individual_kyc(
+            business_id=str(biz.id),
+            level=2,
+            owner_email=user.email,
+            owner_name=user.display_name or user.email,
+        )
+    )
+
+    return {"status": "pending", "message": "Address verification submitted."}
+
+
+@router.post("/individual/level3")
+async def submit_individual_kyc_level3(
+    government_id: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Submit government-issued photo ID (image or PDF) for Level 3 individual KYC.
+
+    Requires Level 2 to already be verified. Accepts NIN card, passport, or driver's licence.
+    """
+    biz, user = await _get_business_and_owner(current_user, session)
+
+    if getattr(biz, "account_type", "business") != "individual":
+        raise HTTPException(status_code=400, detail="This endpoint is for individual accounts only.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Complete Level 2 verification before proceeding to Level 3.",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    content = await government_id.read()
+    error = validate_document(content, max_bytes=10 * 1024 * 1024)
+    if error:
+        raise HTTPException(status_code=400, detail=f"{government_id.filename}: {error}")
+    gov_id_key = await s3_client.upload_file(
+        content, government_id.filename or "government_id", folder="kyc/individual/gov_id"
+    )
+
+    ind_result = await session.execute(
+        select(IndividualKycSubmissionModel).where(
+            IndividualKycSubmissionModel.business_id == biz.id
+        )
+    )
+    ind = ind_result.scalar_one_or_none()
+    if ind is None:
+        raise HTTPException(status_code=400, detail="Level 1 submission not found.")
+
+    ind.level_3_document_key = gov_id_key
+    ind.level_3_status = "pending"
+    ind.level_3_submitted_at = now
+    ind.updated_at = now
+
+    biz.kyc_status = "pending"
+    biz.updated_at = now
+
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=user.id,
+        business_id=biz.id,
+        title="Government ID Submitted",
+        message="Your government-issued ID has been submitted for Level 3 verification.",
+        type="info",
+        resource_type="kyc",
+        resource_id=str(biz.id),
+    )
+    await session.commit()
+
+    asyncio.create_task(
+        email_service.send_individual_kyc_submitted_email(
+            to=user.email,
+            display_name=user.display_name or user.email,
+            level=3,
+            level_name="Government ID",
+        )
+    )
+    asyncio.create_task(
+        _auto_verify_individual_kyc(
+            business_id=str(biz.id),
+            level=3,
+            owner_email=user.email,
+            owner_name=user.display_name or user.email,
+        )
+    )
+
+    return {"status": "pending", "message": "Government ID submitted for Level 3 verification."}

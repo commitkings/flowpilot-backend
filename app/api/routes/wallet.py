@@ -212,6 +212,29 @@ async def topup_wallet(
     except InvalidOperation:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
+    # Enforce wallet balance cap based on KYC level
+    from src.config.kyc_limits import get_limits as _get_limits
+    biz_for_cap = await session.execute(select(BusinessModel).where(BusinessModel.id == business_uuid))
+    biz_cap = biz_for_cap.scalar_one_or_none()
+    if biz_cap:
+        from src.infrastructure.database.repositories.wallet_repository import WalletRepository as _WR
+        _cap_repo = _WR(session)
+        _current_wallet = await _cap_repo.get_or_create(business_uuid)
+        _account_type = getattr(biz_cap, "account_type", "business") or "business"
+        _kyc_level = getattr(biz_cap, "kyc_level", 0) or 0
+        _limits = _get_limits(_account_type, _kyc_level)
+        if _limits:
+            from decimal import Decimal as _D
+            _cap = _limits["wallet"]
+            if _current_wallet.balance + _D(str(request.amount)) > _cap:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Wallet balance cap exceeded. Your current KYC level allows a maximum wallet "
+                        f"balance of ₦{float(_cap):,.2f}. Complete a higher KYC level to increase this limit."
+                    ),
+                )
+
     repo = WalletRepository(session)
     tx, created = await repo.credit(
         business_id=business_uuid,

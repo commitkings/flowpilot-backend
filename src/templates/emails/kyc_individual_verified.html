@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <title>Business verified</title>
+  <title>Level {{ level }} verified</title>
   <style>
     @media (prefers-color-scheme: dark) {
       .light-logo { display: none !important; }
@@ -23,7 +23,7 @@
 
   <!-- Preheader -->
   <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
-    {{ business_name }} is verified on FlowPilot. Level 1 limits are now active — {{ monthly_limit }}/month. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
+    Your Level {{ level }} ({{ level_name }}) verification is complete. Your payout limits have been updated. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
 
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
@@ -57,21 +57,21 @@
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:16px;">
                 <tr>
                   <td style="background-color:#f0fdf4;border:1px solid #bbf7d0;border-radius:20px;padding:6px 14px;">
-                    <span style="font-size:13px;font-weight:700;color:#16a34a;">&#10003; Level 1 Verified</span>
+                    <span style="font-size:13px;font-weight:700;color:#16a34a;">&#10003; Level {{ level }} Verified</span>
                   </td>
                 </tr>
               </table>
 
-              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">{{ business_name }} is verified</h1>
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">Your limits have been upgraded</h1>
               <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
-                Hi {{ first_name }}, your business is now fully verified and Level 1 payout limits are active. Here's what you can do:
+                Hi {{ first_name }}, your <strong style="color:#0f172a;">Level {{ level }} — {{ level_name }}</strong> verification is complete. Here are your new payout limits:
               </p>
 
-              <!-- Active limits card -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
+              <!-- New limits card -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
                   <td style="background-color:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;padding:16px 18px;">
-                    <p style="margin:0 0 12px;font-size:13px;font-weight:700;color:#16a34a;">Active limits — Level 1</p>
+                    <p style="margin:0 0 12px;font-size:13px;font-weight:700;color:#16a34a;">Active limits — Level {{ level }}</p>
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                       <tr>
                         <td style="padding-bottom:8px;width:50%;">
@@ -95,28 +95,22 @@
                 </tr>
               </table>
 
-              <!-- What's available card -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
-                <tr>
-                  <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
-                    <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#e86727;">Also now available</p>
-                    <p style="margin:0 0 4px;font-size:13px;color:#64748b;line-height:1.6;">Create and execute payout runs</p>
-                    <p style="margin:0 0 4px;font-size:13px;color:#64748b;line-height:1.6;">AI risk scoring and approval workflows</p>
-                    <p style="margin:0;font-size:13px;color:#64748b;line-height:1.6;">Compliance audit reports and transaction history</p>
-                  </td>
-                </tr>
-              </table>
-
+              {% if not at_max_level %}
               <p style="font-size:14px;color:#64748b;line-height:1.6;margin:0 0 24px;">
-                Need higher limits? Complete Level 2 and Level 3 verification from your dashboard to unlock up to {{ max_monthly_limit }}/month.
+                Want higher limits? Complete the next verification level from your dashboard.
               </p>
+              {% else %}
+              <p style="font-size:14px;color:#64748b;line-height:1.6;margin:0 0 24px;">
+                You're at the maximum verification level. Need higher limits? Email us at <a href="mailto:{{ support_email }}" style="color:#e86727;text-decoration:none;font-weight:600;">{{ support_email }}</a>.
+              </p>
+              {% endif %}
 
               <!-- CTA button -->
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                 <tr>
                   <td style="border-radius:8px;background-color:#e86727;">
                     <a href="{{ dashboard_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      Go to dashboard &rarr;
+                      Start sending payouts &rarr;
                     </a>
                   </td>
                 </tr>

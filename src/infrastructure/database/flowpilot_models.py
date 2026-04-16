@@ -61,6 +61,8 @@ class UserModel(Base):
     has_taken_tour: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    # Date of birth — collected at registration; only users 18+ may register
+    date_of_birth: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     # 2FA / TOTP
     totp_secret: Mapped[Optional[str]] = mapped_column(String(64))
     totp_enabled_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
@@ -214,7 +216,11 @@ class BusinessModel(Base):
     website: Mapped[Optional[str]] = mapped_column(String(255))
     phone: Mapped[Optional[str]] = mapped_column(String(30))
     logo_url: Mapped[Optional[str]] = mapped_column(String(512))
+    # "individual" or "business" — set at onboarding, determines KYC flow + team visibility
+    account_type: Mapped[str] = mapped_column(String(20), server_default=text("'business'"))
     kyc_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
+    # Verified KYC level (0 = none, 1–3 = progressively higher)
+    kyc_level: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     # AI processing credits — each payout run costs 1 credit
     ai_credit_balance: Mapped[int] = mapped_column(Integer, server_default=text("0"))
@@ -1919,6 +1925,106 @@ class KycSubmissionModel(Base):
             "status IN ('pending', 'verified', 'rejected')",
             name="kyc_submission_status_check",
         ),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# individual_kyc_submission — tiered identity verification for individual accounts
+# --------------------------------------------------------------------------- #
+class IndividualKycSubmissionModel(Base):
+    __tablename__ = "individual_kyc_submission"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+
+    # Level 1 — NIN or BVN
+    level_1_type: Mapped[Optional[str]] = mapped_column(String(10))   # "nin" | "bvn"
+    level_1_value: Mapped[Optional[str]] = mapped_column(String(20))
+    level_1_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
+    level_1_submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    level_1_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Level 2 — proof of address (physical address + document)
+    level_2_address: Mapped[Optional[str]] = mapped_column(Text)
+    level_2_document_key: Mapped[Optional[str]] = mapped_column(String(512))
+    level_2_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
+    level_2_submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    level_2_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Level 3 — government-issued photo ID (image or PDF)
+    level_3_document_key: Mapped[Optional[str]] = mapped_column(String(512))
+    level_3_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
+    level_3_submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    level_3_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "level_1_type IN ('nin', 'bvn')",
+            name="individual_kyc_level_1_type_check",
+        ),
+        CheckConstraint(
+            "level_1_status IN ('not_submitted', 'pending', 'verified', 'rejected')",
+            name="individual_kyc_level_1_status_check",
+        ),
+        CheckConstraint(
+            "level_2_status IN ('not_submitted', 'pending', 'verified', 'rejected')",
+            name="individual_kyc_level_2_status_check",
+        ),
+        CheckConstraint(
+            "level_3_status IN ('not_submitted', 'pending', 'verified', 'rejected')",
+            name="individual_kyc_level_3_status_check",
+        ),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# kyc_limit_tracker — tracks monthly payout usage per business for KYC limits
+# --------------------------------------------------------------------------- #
+class KycLimitTrackerModel(Base):
+    __tablename__ = "kyc_limit_tracker"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    monthly_payout_used: Mapped[Decimal] = mapped_column(
+        Numeric(18, 2), server_default=text("0.00")
+    )
+    # First day of the month being tracked
+    month_start: Mapped[date] = mapped_column(Date, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()")
     )
 
     business: Mapped["BusinessModel"] = relationship()

@@ -34,6 +34,7 @@ class BusinessRepository:
         *,
         owner_id: uuid.UUID,
         business_name: str,
+        account_type: str = "business",
         business_type: str | None = None,
         interswitch_merchant_id: str | None = None,
         monthly_txn_volume_range: str | None = None,
@@ -55,6 +56,7 @@ class BusinessRepository:
 
         business = BusinessModel(
             business_name=business_name,
+            account_type=account_type,
             business_type=business_type,
             interswitch_merchant_id=interswitch_merchant_id,
         )

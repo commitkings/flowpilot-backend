@@ -17,7 +17,13 @@ from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import AgentRunModel, BusinessMemberModel, UserModel
+from src.infrastructure.database.flowpilot_models import (
+    AgentRunModel,
+    BusinessMemberModel,
+    BusinessModel,
+    KycLimitTrackerModel,
+    UserModel,
+)
 from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
@@ -390,6 +396,76 @@ async def approve_candidates(
             ),
         )
 
+    # ── 3b. KYC payout limits — single transaction cap + monthly cap ────────
+    from decimal import Decimal as _D
+    from datetime import date as _date
+    from src.config.kyc_limits import get_limits as _get_limits, SUPPORT_EMAIL as _SUPPORT_EMAIL
+    from sqlalchemy import select as _sa_sel
+
+    _biz_result = await session.execute(
+        _sa_sel(BusinessModel).where(BusinessModel.id == run.business_id)
+    )
+    _biz = _biz_result.scalar_one_or_none()
+    if _biz:
+        _account_type = getattr(_biz, "account_type", "business") or "business"
+        _kyc_level = getattr(_biz, "kyc_level", 0) or 0
+        _limits = _get_limits(_account_type, _kyc_level)
+
+        if _limits:
+            # Single transaction cap
+            for c in selected_candidates:
+                if _D(str(c.amount)) > _limits["single"]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Payout to {c.beneficiary_name} (₦{float(c.amount):,.2f}) exceeds your "
+                            f"single-transaction limit of ₦{float(_limits['single']):,.2f}. "
+                            f"Upgrade your KYC level or contact {_SUPPORT_EMAIL} for a higher limit."
+                        ),
+                    )
+
+            # Monthly cap: get or create tracker, reset if new month
+            _today = _date.today()
+            _month_start = _today.replace(day=1)
+            _tracker_result = await session.execute(
+                _sa_sel(KycLimitTrackerModel).where(
+                    KycLimitTrackerModel.business_id == run.business_id
+                )
+            )
+            _tracker = _tracker_result.scalar_one_or_none()
+
+            if _tracker is None:
+                _tracker = KycLimitTrackerModel(
+                    business_id=run.business_id,
+                    monthly_payout_used=_D("0.00"),
+                    month_start=_month_start,
+                )
+                session.add(_tracker)
+                await session.flush()
+            elif _tracker.month_start < _month_start:
+                # New month — reset counter
+                _tracker.monthly_payout_used = _D("0.00")
+                _tracker.month_start = _month_start
+                await session.flush()
+
+            _projected = _tracker.monthly_payout_used + _D(str(total_approved))
+            if _projected > _limits["monthly"]:
+                _remaining = max(_D("0"), _limits["monthly"] - _tracker.monthly_payout_used)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"This payout (₦{total_approved:,.2f}) would exceed your monthly limit of "
+                        f"₦{float(_limits['monthly']):,.2f}. You have ₦{float(_remaining):,.2f} remaining "
+                        f"this month. Upgrade your KYC level or contact {_SUPPORT_EMAIL} for a higher limit."
+                    ),
+                )
+        elif _kyc_level == 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Complete KYC verification to execute payouts.",
+                headers={"X-KYC-Status": "not_submitted"},
+            )
+
     # ── 4. Atomic CAS: awaiting_approval → executing ───────────────────────
     acquired = await run_repo.transition_status(run_uuid, "awaiting_approval", "executing")
     if not acquired:
@@ -436,6 +512,29 @@ async def approve_candidates(
             # Persist fee on the run
             run.platform_fee_rate = _PLATFORM_FEE_RATE
             run.platform_fee_amount = _fee_amount
+
+            # Update monthly KYC limit tracker
+            try:
+                from sqlalchemy import select as _sa_lim
+                from src.infrastructure.database.flowpilot_models import KycLimitTrackerModel as _KycTracker
+                from datetime import datetime as _dt2, timezone as _tz2, date as _d2
+                _t2 = await session.execute(
+                    _sa_lim(_KycTracker).where(_KycTracker.business_id == run.business_id)
+                )
+                _tracker2 = _t2.scalar_one_or_none()
+                if _tracker2 is None:
+                    # Shouldn't happen (created during pre-check), but create defensively
+                    _tracker2 = _KycTracker(
+                        business_id=run.business_id,
+                        monthly_payout_used=_total_decimal,
+                        month_start=_date.today().replace(day=1),
+                    )
+                    session.add(_tracker2)
+                else:
+                    _tracker2.monthly_payout_used += _total_decimal
+                    _tracker2.updated_at = _dt2.now(_tz2.utc)
+            except Exception as _lim_exc:
+                logger.warning("Could not update KYC limit tracker: %s", _lim_exc)
 
         except _InsufficientBalance as exc:
             # Revert status so the approver can try again after topping up

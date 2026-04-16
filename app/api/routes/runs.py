@@ -668,7 +668,6 @@ async def list_runs(
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
-    _kyc=Depends(require_verified_kyc),
 ):
     from sqlalchemy import select as _select_biz
     membership_result = await session.execute(
@@ -713,7 +712,6 @@ async def get_run(
     run_id: str,
     session: AsyncSession = Depends(get_db_session),
     current_user=Depends(get_current_user),
-    _kyc=Depends(require_verified_kyc),
 ):
     run_uuid = _parse_uuid(run_id, "run_id")
     run_repo = RunRepository(session)

@@ -3,6 +3,7 @@ Onboarding routes — create business + config + membership in one step.
 """
 
 import logging
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -27,7 +28,11 @@ router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 
 class OnboardingRequest(BaseModel):
     business_name: str
+    # "individual" or "business" — determines KYC flow and team visibility
+    account_type: str = "business"
     business_type: Optional[str] = None
+    # Owner date of birth — must be 18+ at registration
+    date_of_birth: Optional[date] = None
     monthly_txn_volume_range: Optional[str] = None
     avg_monthly_payouts_range: Optional[str] = None
     primary_bank: Optional[str] = None
@@ -58,6 +63,12 @@ async def complete_onboarding(
             detail="User has already completed onboarding",
         )
 
+    if body.account_type not in ("individual", "business"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="account_type must be 'individual' or 'business'",
+        )
+
     if body.risk_appetite and body.risk_appetite not in (
         "conservative",
         "moderate",
@@ -68,10 +79,39 @@ async def complete_onboarding(
             detail="risk_appetite must be conservative, moderate, or aggressive",
         )
 
+    # Validate date_of_birth — required for individual accounts, must be 18+
+    if body.account_type == "individual" and not body.date_of_birth:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_of_birth is required for individual accounts.",
+        )
+
+    if body.date_of_birth:
+        from datetime import date as _date
+        today = _date.today()
+        age = today.year - body.date_of_birth.year - (
+            (today.month, today.day) < (body.date_of_birth.month, body.date_of_birth.day)
+        )
+        if age < 18:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="You must be at least 18 years old to register.",
+            )
+
+        # Persist DOB on the user
+        from sqlalchemy import update as sa_update
+        from src.infrastructure.database.flowpilot_models import UserModel as _UserModel
+        await session.execute(
+            sa_update(_UserModel)
+            .where(_UserModel.id == current_user.id)
+            .values(date_of_birth=body.date_of_birth)
+        )
+
     biz_repo = BusinessRepository(session)
     business, config, member = await biz_repo.create_with_owner(
         owner_id=current_user.id,
         business_name=body.business_name,
+        account_type=body.account_type,
         business_type=body.business_type,
         interswitch_merchant_id=body.interswitch_merchant_id,
         monthly_txn_volume_range=body.monthly_txn_volume_range,
@@ -128,6 +168,7 @@ async def complete_onboarding(
         "business": {
             "id": str(business.id),
             "business_name": business.business_name,
+            "account_type": business.account_type,
             "business_type": business.business_type,
             "virtual_account_number": business.virtual_account_number,
             "virtual_account_bank": business.virtual_account_bank,

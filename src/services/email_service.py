@@ -551,6 +551,9 @@ async def send_kyc_submitted_email(
     display_name: str,
     business_name: str,
     submitted_docs: list[str],
+    monthly_limit: str = "₦1,500,000",
+    single_limit: str = "₦300,000",
+    wallet_limit: str = "₦3,000,000",
     frontend_url: Optional[str] = None,
 ) -> bool:
     """Notify the business owner that KYC documents were received and are under review.
@@ -566,6 +569,9 @@ async def send_kyc_submitted_email(
         first_name=first_name,
         business_name=business_name,
         submitted_docs=submitted_docs,
+        monthly_limit=monthly_limit,
+        single_limit=single_limit,
+        wallet_limit=wallet_limit,
         dashboard_url=f"{base}/dashboard",
     )
     return await _send(
@@ -579,9 +585,13 @@ async def send_kyc_verified_email(
     to: str,
     display_name: str,
     business_name: str,
+    monthly_limit: str = "₦1,500,000",
+    single_limit: str = "₦300,000",
+    wallet_limit: str = "₦3,000,000",
+    max_monthly_limit: str = "₦50,000,000",
     frontend_url: Optional[str] = None,
 ) -> bool:
-    """Notify the business owner that their KYC has been approved.
+    """Notify the business owner that their KYC has been approved, with Level 1 limits.
 
     Template: src/templates/emails/kyc_verified.html
     """
@@ -593,6 +603,10 @@ async def send_kyc_verified_email(
         logo_dark_url=f"{base}/brand/flowpilot_logo.png",
         first_name=first_name,
         business_name=business_name,
+        monthly_limit=monthly_limit,
+        single_limit=single_limit,
+        wallet_limit=wallet_limit,
+        max_monthly_limit=max_monthly_limit,
         dashboard_url=f"{base}/dashboard",
     )
     return await _send(
@@ -600,6 +614,80 @@ async def send_kyc_verified_email(
         subject=f"{business_name} is verified on FlowPilot — you're ready to go!",
         html=html,
     )
+
+
+async def send_individual_kyc_submitted_email(
+    to: str,
+    display_name: str,
+    level: int,
+    level_name: str,
+    review_time: str = "a few minutes",
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the individual user that their KYC level submission was received.
+
+    Template: src/templates/emails/kyc_individual_submitted.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "kyc_individual_submitted.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        level=level,
+        level_name=level_name,
+        review_time=review_time,
+        dashboard_url=f"{base}/dashboard",
+    )
+    level_subjects = {
+        1: "Identity verification received — we'll verify your details shortly",
+        2: "Address verification received — we're reviewing your details",
+        3: "Government ID received — we're reviewing your document",
+    }
+    subject = level_subjects.get(level, f"Level {level} verification received")
+    return await _send(to=to, subject=subject, html=html)
+
+
+async def send_individual_kyc_verified_email(
+    to: str,
+    display_name: str,
+    level: int,
+    level_name: str,
+    monthly_limit: str,
+    single_limit: str,
+    wallet_limit: str,
+    at_max_level: bool = False,
+    support_email: str = "support@flowpilot.ng",
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the individual user that their KYC level has been approved and show new limits.
+
+    Template: src/templates/emails/kyc_individual_verified.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "kyc_individual_verified.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        level=level,
+        level_name=level_name,
+        monthly_limit=monthly_limit,
+        single_limit=single_limit,
+        wallet_limit=wallet_limit,
+        at_max_level=at_max_level,
+        support_email=support_email,
+        dashboard_url=f"{base}/dashboard",
+    )
+    level_subjects = {
+        1: "Level 1 verified ✓ — You can now send payouts",
+        2: "Level 2 verified ✓ — Your monthly limit has been upgraded",
+        3: "Level 3 verified ✓ — You've reached the maximum verification level",
+    }
+    subject = level_subjects.get(level, f"Level {level} verified — your limits have been upgraded")
+    return await _send(to=to, subject=subject, html=html)
 
 
 async def send_scheduled_run_created_email(

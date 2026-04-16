@@ -130,7 +130,6 @@ def _serialize(r: ScheduledRunModel) -> dict:
 async def list_scheduled_runs(
     current_user=Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
-    _kyc=Depends(require_verified_kyc),
 ):
     business_id = await _get_business_id(current_user, session)
     result = await session.execute(

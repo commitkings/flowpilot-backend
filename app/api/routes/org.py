@@ -85,6 +85,8 @@ async def get_org_profile(
     return {
         "id": str(biz.id),
         "business_name": biz.business_name,
+        "account_type": getattr(biz, "account_type", "business") or "business",
+        "kyc_level": getattr(biz, "kyc_level", 0) or 0,
         "business_type": biz.business_type,
         "rc_number": biz.rc_number,
         "tax_id": biz.tax_id,

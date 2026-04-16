@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <title>Business verified</title>
+  <title>Level {{ level }} verification received</title>
   <style>
     @media (prefers-color-scheme: dark) {
       .light-logo { display: none !important; }
@@ -23,7 +23,7 @@
 
   <!-- Preheader -->
   <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
-    {{ business_name }} is verified on FlowPilot. Level 1 limits are now active — {{ monthly_limit }}/month. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
+    We've received your Level {{ level }} ({{ level_name }}) details and are verifying them now. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
 
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
@@ -33,7 +33,7 @@
 
           <!-- Top accent bar -->
           <tr>
-            <td style="height:4px;background-color:#22c55e;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
+            <td style="height:4px;background-color:#e86727;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
           </tr>
 
           <!-- Logo -->
@@ -53,70 +53,32 @@
             <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
               <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;font-size:0;line-height:0;">&nbsp;</div>
 
-              <!-- Verified badge -->
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:16px;">
-                <tr>
-                  <td style="background-color:#f0fdf4;border:1px solid #bbf7d0;border-radius:20px;padding:6px 14px;">
-                    <span style="font-size:13px;font-weight:700;color:#16a34a;">&#10003; Level 1 Verified</span>
-                  </td>
-                </tr>
-              </table>
-
-              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">{{ business_name }} is verified</h1>
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">Level {{ level }} verification received</h1>
               <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
-                Hi {{ first_name }}, your business is now fully verified and Level 1 payout limits are active. Here's what you can do:
+                Hi {{ first_name }}, we've received your <strong style="color:#0f172a;">Level {{ level }} — {{ level_name }}</strong> details. We'll verify them within {{ review_time }} and notify you once it's done.
               </p>
 
-              <!-- Active limits card -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
-                <tr>
-                  <td style="background-color:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;padding:16px 18px;">
-                    <p style="margin:0 0 12px;font-size:13px;font-weight:700;color:#16a34a;">Active limits — Level 1</p>
-                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                      <tr>
-                        <td style="padding-bottom:8px;width:50%;">
-                          <p style="margin:0;font-size:12px;color:#64748b;">Monthly</p>
-                          <p style="margin:2px 0 0;font-size:15px;font-weight:800;color:#0f172a;">{{ monthly_limit }}</p>
-                        </td>
-                        <td style="padding-bottom:8px;">
-                          <p style="margin:0;font-size:12px;color:#64748b;">Per Transaction</p>
-                          <p style="margin:2px 0 0;font-size:15px;font-weight:800;color:#0f172a;">{{ single_limit }}</p>
-                        </td>
-                      </tr>
-                      <tr>
-                        <td>
-                          <p style="margin:0;font-size:12px;color:#64748b;">Wallet Cap</p>
-                          <p style="margin:2px 0 0;font-size:15px;font-weight:800;color:#0f172a;">{{ wallet_limit }}</p>
-                        </td>
-                        <td></td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-              </table>
-
-              <!-- What's available card -->
+              <!-- Submitted info card -->
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
                   <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
-                    <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#e86727;">Also now available</p>
-                    <p style="margin:0 0 4px;font-size:13px;color:#64748b;line-height:1.6;">Create and execute payout runs</p>
-                    <p style="margin:0 0 4px;font-size:13px;color:#64748b;line-height:1.6;">AI risk scoring and approval workflows</p>
-                    <p style="margin:0;font-size:13px;color:#64748b;line-height:1.6;">Compliance audit reports and transaction history</p>
+                    <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#e86727;">Submitted for review</p>
+                    <p style="margin:0 0 4px;font-size:13px;color:#0f172a;font-weight:600;line-height:1.6;">Level {{ level }} — {{ level_name }}</p>
+                    <p style="margin:0;font-size:13px;color:#64748b;line-height:1.6;">Status: <span style="color:#d97706;font-weight:600;">Pending review</span></p>
                   </td>
                 </tr>
               </table>
 
               <p style="font-size:14px;color:#64748b;line-height:1.6;margin:0 0 24px;">
-                Need higher limits? Complete Level 2 and Level 3 verification from your dashboard to unlock up to {{ max_monthly_limit }}/month.
+                You don't need to do anything else right now. We'll send you another email as soon as your verification is complete.
               </p>
 
               <!-- CTA button -->
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                 <tr>
                   <td style="border-radius:8px;background-color:#e86727;">
-                    <a href="{{ dashboard_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      Go to dashboard &rarr;
+                    <a href="{{ dashboard_url }}/kyc" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      Check verification status &rarr;
                     </a>
                   </td>
                 </tr>
