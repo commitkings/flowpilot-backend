@@ -32,13 +32,11 @@ def validate_password(password: str) -> None:
         )
 
 
-def hash_password(password: str) -> str:
-    validate_password(password)
-
+def _hash_raw(value: str) -> str:
     salt = secrets.token_bytes(16)
     derived_key = hashlib.pbkdf2_hmac(
         "sha256",
-        password.encode("utf-8"),
+        value.encode("utf-8"),
         salt,
         Settings.PASSWORD_HASH_ITERATIONS,
     )
@@ -48,6 +46,16 @@ def hash_password(password: str) -> str:
         f"{_PASSWORD_HASH_SCHEME}${Settings.PASSWORD_HASH_ITERATIONS}$"
         f"{salt_b64}${key_b64}"
     )
+
+
+def hash_password(password: str) -> str:
+    validate_password(password)
+    return _hash_raw(password)
+
+
+def hash_pin(pin: str) -> str:
+    """Hash a short PIN without enforcing password length rules."""
+    return _hash_raw(pin)
 
 
 def verify_password(password: str, stored_hash: str) -> bool:

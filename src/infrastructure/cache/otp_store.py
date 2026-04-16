@@ -50,13 +50,25 @@ def generate_code() -> str:
     return f"{random.randint(0, 999999):06d}"
 
 
-async def save(user_id: str, code: str) -> None:
-    """Persist the OTP for 15 minutes.  Replaces any previous code."""
+async def save(user_id: str, code: str, ttl_seconds: int = _TTL_SECONDS) -> None:
+    """Persist the OTP for ttl_seconds (default 15 min). Replaces any previous code."""
     r = await _redis()
     if r:
-        await r.set(f"{_KEY_PREFIX}{user_id}", code, ex=_TTL_SECONDS)
+        await r.set(f"{_KEY_PREFIX}{user_id}", code, ex=ttl_seconds)
     else:
-        _fallback[user_id] = (code, datetime.now(timezone.utc) + timedelta(seconds=_TTL_SECONDS))
+        _fallback[user_id] = (code, datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds))
+
+
+async def get(user_id: str) -> Optional[str]:
+    """Return the stored value without consuming it. Returns None if missing or expired."""
+    r = await _redis()
+    if r:
+        return await r.get(f"{_KEY_PREFIX}{user_id}")
+    else:
+        entry = _fallback.get(user_id)
+        if entry and datetime.now(timezone.utc) < entry[1]:
+            return entry[0]
+        return None
 
 
 async def verify(user_id: str, code: str) -> bool:

@@ -1588,6 +1588,8 @@ class ApiKeyModel(Base):
     key_prefix: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     # PBKDF2-SHA256 hash of the full raw key
     key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Fernet-encrypted raw key — allows owner to re-reveal with OTP at any time
+    raw_key_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     scopes: Mapped[list] = mapped_column(
         JSONB, server_default=text("'[]'::jsonb"), nullable=False
     )

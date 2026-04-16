@@ -32,7 +32,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.auth.api_key_auth import generate_api_key
+from app.api.auth.crypto import encrypt_value, decrypt_value
 from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.cache import otp_store
+from src.services.email_service import send_api_key_reveal_otp_email
 from src.infrastructure.database.flowpilot_models import (
     ApiKeyModel,
     BusinessMemberModel,
@@ -174,6 +177,7 @@ async def create_api_key(
         key_hash=key_hash,
         scopes=body.scopes,
         expires_at=expires_at,
+        raw_key_encrypted=encrypt_value(raw_key),
     )
     session.add(api_key)
     await session.commit()
@@ -189,6 +193,73 @@ async def create_api_key(
         created_at=api_key.created_at.isoformat(),
         raw_key=raw_key,
     )
+
+
+@router.post("/api-keys/{key_id}/request-reveal", status_code=status.HTTP_200_OK)
+async def request_api_key_reveal(
+    key_id: uuid.UUID,
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner")),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Send an OTP to the owner's email so they can reveal the raw key at any time."""
+    business_id = await _get_business_id(current_user, session)
+    result = await session.execute(
+        select(ApiKeyModel).where(
+            ApiKeyModel.id == key_id,
+            ApiKeyModel.business_id == business_id,
+            ApiKeyModel.revoked_at.is_(None),
+        )
+    )
+    api_key = result.scalars().first()
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API key not found")
+
+    otp_code = otp_store.generate_code()
+    await otp_store.save(f"apikey-reveal:{key_id}", otp_code)
+    await send_api_key_reveal_otp_email(
+        to=current_user.email,
+        display_name=current_user.display_name,
+        key_name=api_key.name,
+        code=otp_code,
+    )
+    return {"sent": True}
+
+
+class VerifyRevealOtpRequest(BaseModel):
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+@router.post("/api-keys/{key_id}/verify-reveal-otp", status_code=status.HTTP_200_OK)
+async def verify_api_key_reveal_otp(
+    key_id: uuid.UUID,
+    body: VerifyRevealOtpRequest,
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner")),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Verify OTP and return the raw key."""
+    business_id = await _get_business_id(current_user, session)
+    result = await session.execute(
+        select(ApiKeyModel).where(
+            ApiKeyModel.id == key_id,
+            ApiKeyModel.business_id == business_id,
+            ApiKeyModel.revoked_at.is_(None),
+        )
+    )
+    api_key = result.scalars().first()
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API key not found")
+
+    valid = await otp_store.verify(f"apikey-reveal:{key_id}", body.otp)
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired code. Request a new one.",
+        )
+
+    raw_key = decrypt_value(api_key.raw_key_encrypted)
+    return {"raw_key": raw_key}
 
 
 @router.delete("/api-keys/{key_id}")

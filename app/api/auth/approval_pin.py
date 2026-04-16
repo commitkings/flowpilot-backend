@@ -12,7 +12,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
-from app.api.auth.passwords import hash_password, verify_password
+from app.api.auth.passwords import hash_pin, verify_password
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import UserModel
 
@@ -42,7 +42,7 @@ async def setup_pin(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Create or replace the approval PIN."""
-    hashed = hash_password(body.pin)
+    hashed = hash_pin(body.pin)
     await session.execute(
         update(UserModel)
         .where(UserModel.id == current_user.id)
