@@ -402,10 +402,23 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
         amount = c.get("amount", 0)
         institution = c.get("institution_code", "?")
         account = c.get("account_number", "?")
-        reasons = c.get("risk_reasons", [])
-        reason_list = _normalize_risk_reason_list(
-            reasons if isinstance(reasons, list) else reasons
-        )
+        reasons_raw = c.get("risk_reasons", [])
+        
+        # ── Cross-state durability: recover narrative from encoded reasons ──
+        risk_narrative = c.get("risk_narrative") or {}
+        if not risk_narrative:
+            for r in reasons_raw:
+                if isinstance(r, str) and r.startswith("NARRATIVE::"):
+                    try:
+                        risk_narrative = json.loads(r[len("NARRATIVE::"):])
+                    except Exception:
+                        pass
+                    break
+                    
+        # Clean the reasons list for display
+        clean_reasons = [r for r in reasons_raw if not (isinstance(r, str) and r.startswith("NARRATIVE::"))]
+        
+        reason_list = _normalize_risk_reason_list(clean_reasons)
         what_drove = _plain_language_risk_drivers(reason_list)
 
         score_f: float | None
@@ -452,8 +465,6 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
         )
         exec_status = exec_result.get("execution_status", "not_executed")
 
-        # ── Extract risk narrative from RiskAgent ──
-        risk_narrative = c.get("risk_narrative") or {}
         top_factors = risk_narrative.get("top_factors") or []
 
         candidate_details.append(
@@ -465,7 +476,7 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
                 "risk_score": round(score_f, 2) if score_f is not None else score,
                 "risk_tolerance": risk_tolerance,
                 "risk_decision": decision,
-                "risk_reasons_raw": reason_list,
+                "risk_reasons_raw": clean_reasons,
                 "what_drove_the_score": what_drove,
                 "tolerance_explanation": tolerance_explanation,
                 "decision_in_plain_words": decision_plain,

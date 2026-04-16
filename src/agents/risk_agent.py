@@ -988,25 +988,34 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 f"so this recipient was held back."
             )
 
+        # Extract single-candidate and data-quality facts safely
+        single_cand_note = (
+            "This was the only recipient in the batch, so the amount was compared "
+            "against the budget cap rather than other recipients in the same run."
+        ) if features.get("single_candidate_mode") else None
+
+        dq_note = (
+            "We had limited transaction history available to cross-check against, "
+            "which added a small penalty to the overall score."
+        ) if features.get("data_quality_degraded") else None
+
         risk_narrative = {
             "top_factors": factor_contributions[:5],
             "score_context": score_context,
-            "single_candidate_note": (
-                "This was the only recipient in the batch, so the amount was compared "
-                "against the budget cap rather than other recipients in the same run."
-            ) if features.get("single_candidate_mode") else None,
-            "data_quality_note": (
-                "We had limited transaction history available to cross-check against, "
-                "which added a small penalty to the overall score."
-            ) if features.get("data_quality_degraded") else None,
+            "single_candidate_note": single_cand_note,
+            "data_quality_note": dq_note,
             "guardrails_triggered": guardrail_reasons if guardrail_reasons else None,
         }
+
+        import json
+        encoded_narrative = f"NARRATIVE::{json.dumps(risk_narrative)}"
+        reasons_with_narrative = reasons + [encoded_narrative]
 
         # Update candidate in state
         for c in candidates:
             if c.get("candidate_id") == candidate_id:
                 c["risk_score"] = final_score
-                c["risk_reasons"] = reasons
+                c["risk_reasons"] = reasons_with_narrative
                 c["risk_decision"] = final_decision
                 c["risk_features"] = features.get("normalized", {})
                 c["risk_narrative"] = risk_narrative
@@ -1016,7 +1025,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             "candidate_id": candidate_id,
             "risk_score": round(final_score, 4),
             "risk_decision": final_decision,
-            "risk_reasons": reasons,
+            "risk_reasons": reasons_with_narrative,
             "computed_score": round(base_score, 4),
             "llm_supplied_score": round(risk_score, 4),
             "adjustment_applied": round(adjustment, 4),

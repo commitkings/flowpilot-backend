@@ -409,6 +409,12 @@ async def approve_candidates(
     if _biz:
         _account_type = getattr(_biz, "account_type", "business") or "business"
         _kyc_level = getattr(_biz, "kyc_level", 0) or 0
+        
+        # Fallback fix: If KYC status is verified but level is 0, default to Level 1
+        _kyc_status = getattr(_biz, "kyc_status", "not_submitted")
+        if _kyc_level == 0 and _kyc_status == "verified":
+            _kyc_level = 1
+
         _limits = _get_limits(_account_type, _kyc_level)
 
         if _limits:
