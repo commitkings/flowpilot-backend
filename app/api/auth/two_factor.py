@@ -20,8 +20,11 @@ from datetime import datetime, timedelta, timezone as _tz
 
 import pyotp
 import qrcode
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
+from src.infrastructure.cache.rate_limiter import is_allowed as _rate_ok
+
+_TOO_MANY_2FA = HTTPException(status_code=429, detail="Too many attempts. Please wait and try again.")
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -269,10 +272,14 @@ async def disable_2fa(
 
 @router.post("/verify")
 async def verify_mfa(
+    request: Request,
     body: VerifyMfaRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
     """Exchange a valid mfa_token + TOTP code for a full access token."""
+    ip = request.client.host if request.client else "unknown"
+    if not await _rate_ok(f"2fa-verify:{ip}", limit=10, window=60):
+        raise _TOO_MANY_2FA
     payload = decode_mfa_token(body.mfa_token)
     if not payload:
         raise HTTPException(
@@ -314,6 +321,7 @@ async def verify_mfa(
 
 @router.post("/backup-login")
 async def backup_code_login(
+    request: Request,
     body: BackupLoginRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -321,6 +329,9 @@ async def backup_code_login(
 
     The used backup code is removed from the stored list (single-use).
     """
+    ip = request.client.host if request.client else "unknown"
+    if not await _rate_ok(f"2fa-backup:{ip}", limit=5, window=900):  # 5 per 15 min
+        raise _TOO_MANY_2FA
     payload = decode_mfa_token(body.mfa_token)
     if not payload:
         raise HTTPException(

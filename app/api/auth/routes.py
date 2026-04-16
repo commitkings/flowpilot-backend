@@ -8,8 +8,9 @@ from urllib.parse import urlencode
 
 import httpx
 import pyotp
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
+from src.infrastructure.cache.rate_limiter import is_allowed as _rate_ok
 from pydantic import AliasChoices, BaseModel, Field
 
 from app.api.auth.dependencies import get_current_user
@@ -31,9 +32,23 @@ from src.infrastructure.database.repositories.notification_repository import (
     NotificationRepository,
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
-from src.services.email_service import send_password_reset_email, send_verification_email
+from src.services.email_service import (
+    send_password_reset_email,
+    send_verification_email,
+    send_account_locked_email,
+)
 from src.infrastructure.cache import otp_store
 from src.infrastructure.cache import password_reset_store
+from src.infrastructure.cache import failed_login_store
+
+_TOO_MANY = HTTPException(status_code=429, detail="Too many requests. Please wait and try again.")
+
+
+async def _rl(request: Request, key_suffix: str, limit: int, window: int) -> None:
+    """Raise 429 if the caller has exceeded the rate limit."""
+    ip = request.client.host if request.client else "unknown"
+    if not await _rate_ok(f"{key_suffix}:{ip}", limit, window):
+        raise _TOO_MANY
 
 
 class RegisterRequest(BaseModel):
@@ -218,11 +233,13 @@ class VerifyEmailRequest(BaseModel):
 
 @router.post("/verify-email", response_model=MessageResponse)
 async def verify_email(
+    request: Request,
     body: VerifyEmailRequest,
     current_user=Depends(get_current_user),
     session=Depends(get_db_session),
 ):
     """Verify the user's email with the 6-digit OTP (stored in Redis)."""
+    await _rl(request, "verify-email", limit=10, window=60)
     from datetime import datetime, timezone as tz
 
     if current_user.email_verified_at is not None:
@@ -243,9 +260,11 @@ async def verify_email(
 
 @router.post("/resend-verification", response_model=MessageResponse)
 async def resend_verification(
+    request: Request,
     current_user=Depends(get_current_user),
 ):
     """Issue a fresh OTP (stored in Redis) and re-send the verification email."""
+    await _rl(request, "resend-otp", limit=5, window=900)  # 5 per 15 min
     if current_user.email_verified_at is not None:
         return MessageResponse(message="Email already verified")
 
@@ -429,12 +448,21 @@ async def register_via_invite(
 
 @router.post("/login")
 async def login_with_password(
+    request: Request,
     body: LoginRequest,
     session=Depends(get_db_session),
 ):
     """Authenticate an existing user with email + password."""
+    await _rl(request, "login", limit=10, window=60)
     repo = UserRepository(session)
     normalized = normalize_email(body.email)
+
+    # Check account lockout before anything else
+    if await failed_login_store.is_locked(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Your account has been temporarily locked due to too many failed login attempts. Please try again in 10 minutes or reset your password.",
+        )
 
     user = await repo.get_by_email(normalized)
     if user is None or not user.is_active:
@@ -451,12 +479,30 @@ async def login_with_password(
         )
 
     if not verify_password(body.password, user.password_hash):
+        failures = await failed_login_store.record_failure(normalized)
+        if failures >= 5:
+            await failed_login_store.lock_account(normalized)
+            import asyncio as _aio
+            _aio.create_task(
+                send_account_locked_email(
+                    to=normalized,
+                    display_name=user.display_name or normalized,
+                    lock_minutes=10,
+                )
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Your account has been temporarily locked due to too many failed login attempts. Please try again in 10 minutes or reset your password.",
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=_INVALID_CREDENTIALS,
         )
 
     from datetime import datetime, timezone as tz
+
+    # Clear failure counter on successful authentication
+    await failed_login_store.reset_failures(normalized)
 
     user.last_login_at = datetime.now(tz.utc)
     await session.flush()
@@ -832,10 +878,12 @@ async def get_connections(
     status_code=status.HTTP_200_OK,
 )
 async def forgot_password(
+    request: Request,
     body: ForgotPasswordRequest,
     session=Depends(get_db_session),
 ):
     """Issue a password-reset link. Token is stored in Redis with TTL — no DB write."""
+    await _rl(request, "forgot-pw", limit=5, window=900)  # 5 per 15 min
     normalized_email = normalize_email(body.email)
     user_repo = UserRepository(session)
 
@@ -872,10 +920,12 @@ async def forgot_password(
     status_code=status.HTTP_200_OK,
 )
 async def reset_password(
+    request: Request,
     body: ResetPasswordRequest,
     session=Depends(get_db_session),
 ):
     """Consume the Redis reset token and update the user's password."""
+    await _rl(request, "reset-pw", limit=5, window=900)  # 5 per 15 min
     import uuid
 
     token_hash = hash_password_reset_token(body.token)

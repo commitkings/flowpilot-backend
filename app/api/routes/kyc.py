@@ -90,8 +90,8 @@ def _presigned(key: Optional[str]) -> Optional[str]:
 
 
 async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, business_name: str) -> None:
-    """Background task: wait 60 seconds then mark KYC as verified."""
-    await asyncio.sleep(60)
+    """Background task: wait 30 seconds then mark KYC as verified."""
+    await asyncio.sleep(30)
     try:
         session_factory = get_session_factory()
         async with session_factory() as session:
@@ -208,6 +208,13 @@ async def submit_kyc(
     Schedules auto-verification after 60 seconds.
     """
     biz, user = await _get_business_and_owner(current_user, session)
+
+    # Block individual accounts from the business KYC route
+    if getattr(biz, "account_type", "business") == "individual":
+        raise HTTPException(
+            status_code=400,
+            detail="Individual accounts must use the /kyc/individual/level1-3 endpoints.",
+        )
 
     # Validate business type
     valid_types = {"limited_company", "ngo", "sole_proprietorship", "partnership", "mda"}
@@ -456,21 +463,34 @@ async def get_kyc_status(
             )
         )
         ind = ind_result.scalar_one_or_none()
+
+        def _mask_id(value: Optional[str]) -> Optional[str]:
+            """Mask BVN/NIN — show first 3 and last 2 digits, hide the rest."""
+            if not value or len(value) < 6:
+                return value
+            return value[:3] + "·" * (len(value) - 5) + value[-2:]
+
         return {
             "kyc_status": biz.kyc_status,
             "limit_info": limit_info,
             "individual_submission": {
                 "level_1_type": ind.level_1_type if ind else None,
+                # Masked — never expose raw BVN/NIN
+                "level_1_masked_value": _mask_id(ind.level_1_value) if ind else None,
                 "level_1_status": ind.level_1_status if ind else "not_submitted",
                 "level_1_submitted_at": ind.level_1_submitted_at.isoformat() if ind and ind.level_1_submitted_at else None,
                 "level_1_verified_at": ind.level_1_verified_at.isoformat() if ind and ind.level_1_verified_at else None,
+                # Address is non-sensitive, show as-is
                 "level_2_address": ind.level_2_address if ind else None,
                 "level_2_status": ind.level_2_status if ind else "not_submitted",
-                "level_2_document_url": _presigned(ind.level_2_document_key) if ind else None,
+                # Only indicate whether a document was uploaded — never return the URL
+                "level_2_document_uploaded": bool(ind.level_2_document_key) if ind else False,
                 "level_2_submitted_at": ind.level_2_submitted_at.isoformat() if ind and ind.level_2_submitted_at else None,
                 "level_2_verified_at": ind.level_2_verified_at.isoformat() if ind and ind.level_2_verified_at else None,
                 "level_3_status": ind.level_3_status if ind else "not_submitted",
-                "level_3_document_url": _presigned(ind.level_3_document_key) if ind else None,
+                # Only indicate what was uploaded — never return document URLs or selfie
+                "level_3_document_uploaded": bool(ind.level_3_document_key) if ind else False,
+                "level_3_selfie_uploaded": bool(ind.level_3_selfie_key) if ind else False,
                 "level_3_submitted_at": ind.level_3_submitted_at.isoformat() if ind and ind.level_3_submitted_at else None,
                 "level_3_verified_at": ind.level_3_verified_at.isoformat() if ind and ind.level_3_verified_at else None,
             } if ind else None,
@@ -527,8 +547,8 @@ async def get_kyc_status(
 async def _auto_verify_individual_kyc(
     business_id: str, level: int, owner_email: str, owner_name: str
 ) -> None:
-    """Background task: wait 60 seconds then mark individual KYC level as verified."""
-    await asyncio.sleep(60)
+    """Background task: wait 30 seconds then mark individual KYC level as verified."""
+    await asyncio.sleep(30)
     try:
         session_factory = get_session_factory()
         async with session_factory() as session:
@@ -769,12 +789,14 @@ async def submit_individual_kyc_level2(
 @router.post("/individual/level3")
 async def submit_individual_kyc_level3(
     government_id: UploadFile = File(...),
+    liveness_selfie: UploadFile = File(...),
     current_user=Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Submit government-issued photo ID (image or PDF) for Level 3 individual KYC.
+    """Submit government-issued photo ID + liveness selfie for Level 3 individual KYC.
 
     Requires Level 2 to already be verified. Accepts NIN card, passport, or driver's licence.
+    The liveness selfie must be a photo taken live via the device camera.
     """
     biz, user = await _get_business_and_owner(current_user, session)
 
@@ -789,12 +811,22 @@ async def submit_individual_kyc_level3(
 
     now = datetime.now(timezone.utc)
 
+    # Upload government ID
     content = await government_id.read()
     error = validate_document(content, max_bytes=10 * 1024 * 1024)
     if error:
         raise HTTPException(status_code=400, detail=f"{government_id.filename}: {error}")
     gov_id_key = await s3_client.upload_file(
         content, government_id.filename or "government_id", folder="kyc/individual/gov_id"
+    )
+
+    # Upload liveness selfie
+    selfie_content = await liveness_selfie.read()
+    selfie_error = validate_document(selfie_content, max_bytes=10 * 1024 * 1024)
+    if selfie_error:
+        raise HTTPException(status_code=400, detail=f"Selfie: {selfie_error}")
+    selfie_key = await s3_client.upload_file(
+        selfie_content, liveness_selfie.filename or "liveness_selfie.jpg", folder="kyc/individual/selfie"
     )
 
     ind_result = await session.execute(
@@ -807,6 +839,7 @@ async def submit_individual_kyc_level3(
         raise HTTPException(status_code=400, detail="Level 1 submission not found.")
 
     ind.level_3_document_key = gov_id_key
+    ind.level_3_selfie_key = selfie_key
     ind.level_3_status = "pending"
     ind.level_3_submitted_at = now
     ind.updated_at = now

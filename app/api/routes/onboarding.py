@@ -130,11 +130,17 @@ async def complete_onboarding(
 
     # Create welcome notification
     notif_repo = NotificationRepository(session)
+    _is_individual = body.account_type == "individual"
+    _welcome_msg = (
+        f"Your account is ready. Complete your identity verification to start sending payouts."
+        if _is_individual
+        else f"Your workspace '{business.business_name}' is ready. Start by creating your first payout run."
+    )
     await notif_repo.create(
         user_id=current_user.id,
         business_id=business.id,
         title="Welcome to FlowPilot!",
-        message=f"Your workspace '{business.business_name}' is ready. Start by creating your first payout run.",
+        message=_welcome_msg,
         type="info",
         resource_type="business",
         resource_id=str(business.id),

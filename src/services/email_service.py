@@ -423,6 +423,29 @@ async def send_password_reset_email(
     )
 
 
+async def send_account_locked_email(
+    to: str,
+    display_name: str,
+    lock_minutes: int = 10,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the user that their account was temporarily locked after too many failed login attempts."""
+    base = frontend_url or Settings.FRONTEND_URL
+    html = _render(
+        "account_locked.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        display_name=display_name,
+        lock_minutes=lock_minutes,
+        reset_url=f"{base}/forgot-password",
+    )
+    return await _send(
+        to=to,
+        subject="Your FlowPilot account has been temporarily locked",
+        html=html,
+    )
+
+
 # ── 2FA emails ────────────────────────────────────────────────────────────────
 
 

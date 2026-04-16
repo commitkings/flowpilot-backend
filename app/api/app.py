@@ -29,6 +29,7 @@ from app.api.routes.kyc import router as kyc_router
 from app.api.routes.wallet import router as wallet_router
 from app.api.routes.files import router as files_router
 from app.api.auth import auth_router, two_factor_router
+from app.api.auth.approval_pin import router as approval_pin_router
 from app.api.middleware import LoggingMiddleware
 from src.config.settings import Settings
 from src.infrastructure.database.connection import (
@@ -123,6 +124,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(two_factor_router, prefix="/api/v1/auth", tags=["2fa"])
+app.include_router(approval_pin_router, prefix="/api/v1", tags=["approval-pin"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
 # IMPORTANT: scheduled_runs_router must be included BEFORE runs_router.

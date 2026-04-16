@@ -68,6 +68,8 @@ class UserModel(Base):
     totp_enabled_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     backup_codes_hash: Mapped[Optional[str]] = mapped_column(Text)  # JSON array of bcrypt hashes
     totp_grace_until: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))  # org-enforced grace deadline
+    # Approval step-up PIN (bcrypt hash of 4-6 digit PIN)
+    approval_pin_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -1962,8 +1964,9 @@ class IndividualKycSubmissionModel(Base):
     level_2_submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     level_2_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 
-    # Level 3 — government-issued photo ID (image or PDF)
+    # Level 3 — government-issued photo ID + liveness selfie
     level_3_document_key: Mapped[Optional[str]] = mapped_column(String(512))
+    level_3_selfie_key: Mapped[Optional[str]] = mapped_column(String(512))
     level_3_status: Mapped[str] = mapped_column(String(20), server_default=text("'not_submitted'"))
     level_3_submitted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     level_3_verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
