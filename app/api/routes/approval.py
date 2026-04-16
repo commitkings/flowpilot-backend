@@ -17,12 +17,13 @@ from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import UserModel
+from src.infrastructure.database.flowpilot_models import AgentRunModel, BusinessMemberModel, UserModel
 from src.infrastructure.database.repositories import (
     AuditRepository,
     BatchRepository,
     CandidateRepository,
     ConversationRepository,
+    InstitutionRepository,
     RunRepository,
     TransactionRepository,
 )
@@ -38,6 +39,17 @@ class ApprovalRequest(BaseModel):
 class RejectionRequest(BaseModel):
     candidate_ids: list[str]
     reason: Optional[str] = None
+
+
+class AssignApproverRequest(BaseModel):
+    user_id: str
+
+
+class UpdateCandidateRequest(BaseModel):
+    amount: Optional[float] = None
+    beneficiary_name: Optional[str] = None
+    account_number: Optional[str] = None
+    institution_code: Optional[str] = None
 
 
 def _parse_uuid_list(values: list[str], field_name: str) -> list[uuid.UUID]:
@@ -277,6 +289,17 @@ async def get_candidates(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    from sqlalchemy import select as _select_mem
+    _mem_q = await session.execute(
+        _select_mem(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
     candidates = await candidate_repo.get_by_run(run_uuid, approval_status=approval_status)
 
     return {
@@ -295,8 +318,10 @@ async def approve_candidates(
     current_user=Depends(get_current_user),
     _=Depends(require_role("owner", "approver")),
 ):
+    from decimal import Decimal
+    from sqlalchemy import select as _sa
+
     run_uuid = _parse_uuid(run_id, "run_id")
-    # Validate input BEFORE acquiring CAS lock to avoid wedging the run
     candidate_ids = _parse_uuid_list(request.candidate_ids, "candidate_ids")
     if not candidate_ids:
         raise HTTPException(status_code=400, detail="candidate_ids must not be empty")
@@ -306,6 +331,7 @@ async def approve_candidates(
     transaction_repo = TransactionRepository(session)
     batch_repo = BatchRepository(session)
 
+    # ── 1. Load run (needed for all pre-CAS gate checks) ─────────────────
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -318,17 +344,136 @@ async def approve_candidates(
             await session.commit()
             run = await run_repo.get_by_id(run_uuid)
 
-    # Atomically transition status to prevent race condition (concurrent approvals)
-    acquired = await run_repo.transition_status(run_uuid, "awaiting_approval", "executing")
-    if not acquired:
-        # Either run doesn't exist, wrong status, or already claimed by another request
-        run = await run_repo.get_by_id(run_uuid)
+    if run.status != "awaiting_approval":
         raise HTTPException(
             status_code=409,
             detail=f"Run is not awaiting approval (status: {run.status})",
         )
-    await run_repo.update_status(run_uuid, "executing", None)
+
+    # ── 2. Authorization: caller must be an active owner/approver in this business ──
+    _biz_mem_q = await session.execute(
+        _sa(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    _current_membership = _biz_mem_q.scalars().first()
+    if not _current_membership or _current_membership.role not in ("owner", "approver"):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to approve runs in this organisation.",
+        )
+
+    # If a specific approver is assigned, only they (or an owner) may proceed
+    if run.assigned_to_id and str(run.assigned_to_id) != str(current_user.id):
+        if _current_membership.role != "owner":
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assigned approver can approve this run.",
+            )
+
+    # ── 3. Load candidates to validate budget cap and compute debit amount ─
+    all_run_candidates = await candidate_repo.get_by_run(run_uuid)
+    candidates_by_id = {str(c.id): c for c in all_run_candidates}
+    selected_candidates = [
+        candidates_by_id[str(cid)] for cid in candidate_ids if str(cid) in candidates_by_id
+    ]
+    total_approved = sum(float(c.amount) for c in selected_candidates)
+
+    if run.budget_cap is not None and total_approved > float(run.budget_cap):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Total approved amount (₦{total_approved:,.2f}) exceeds the run budget cap "
+                f"(₦{float(run.budget_cap):,.2f}). Reduce the selection or increase the budget cap."
+            ),
+        )
+
+    # ── 4. Atomic CAS: awaiting_approval → executing ───────────────────────
+    acquired = await run_repo.transition_status(run_uuid, "awaiting_approval", "executing")
+    if not acquired:
+        run_fresh = await run_repo.get_by_id(run_uuid)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not awaiting approval (status: {run_fresh.status if run_fresh else 'unknown'})",
+        )
+
+    # ── 5. Wallet debit — debit the actual approved total, not budget_cap ──
+    #      Money only leaves the wallet at execution time, not at run creation.
+    _wallet_balance_after: float | None = None
+    if total_approved > 0:
+        from src.infrastructure.database.repositories.wallet_repository import (
+            WalletRepository as _WalletRepo,
+            InsufficientBalanceError as _InsufficientBalance,
+            LOW_BALANCE_THRESHOLD as _LOW_THRESHOLD,
+        )
+        _wallet_repo = _WalletRepo(session)
+        try:
+            _debit_tx, _ = await _wallet_repo.debit(
+                business_id=run.business_id,
+                amount=Decimal(str(total_approved)),
+                reference=f"run_exec_{run_id}",
+                description=f"Payout execution: {run.objective[:80]}",
+                run_id=run_uuid,
+            )
+            _wallet_balance_after = float(_debit_tx.balance_after)
+        except _InsufficientBalance as exc:
+            # Revert status so the approver can try again after topping up
+            await run_repo.update_status(run_uuid, "awaiting_approval", None)
+            await session.commit()
+            raise HTTPException(status_code=402, detail=str(exc))
+        except (ValueError, Exception) as exc:
+            await run_repo.update_status(run_uuid, "awaiting_approval", None)
+            await session.commit()
+            raise HTTPException(
+                status_code=402,
+                detail="Your organisation wallet has no balance. Please top up before executing.",
+            )
+
     await session.commit()
+
+    # Low-balance alert after successful debit
+    if _wallet_balance_after is not None:
+        _LOW_THRESHOLD_VAL = Decimal("50000.00")
+        if Decimal(str(_wallet_balance_after)) < _LOW_THRESHOLD_VAL:
+            try:
+                import asyncio as _asyncio2
+                from src.services.email_service import send_wallet_low_balance_email as _send_lb
+                _owner_result = await session.execute(
+                    _sa(BusinessMemberModel, UserModel)
+                    .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+                    .where(
+                        BusinessMemberModel.business_id == run.business_id,
+                        BusinessMemberModel.role == "owner",
+                        BusinessMemberModel.is_active.is_(True),
+                    )
+                    .limit(1)
+                )
+                _owner_row = _owner_result.first()
+                if _owner_row:
+                    _, _owner_user = _owner_row
+                    _notif_repo = NotificationRepository(session)
+                    await _notif_repo.create(
+                        user_id=_owner_user.id,
+                        business_id=run.business_id,
+                        title="Wallet balance is low",
+                        message=(
+                            f"Your wallet balance (₦{_wallet_balance_after:,.2f}) is below the "
+                            f"₦{float(_LOW_THRESHOLD_VAL):,.2f} threshold. Top up to avoid disruptions."
+                        ),
+                        type="warning",
+                        resource_type="wallet",
+                    )
+                    await session.commit()
+                    _asyncio2.create_task(_send_lb(
+                        to=_owner_user.email,
+                        display_name=_owner_user.display_name or _owner_user.email,
+                        balance=_wallet_balance_after,
+                        threshold=float(_LOW_THRESHOLD_VAL),
+                    ))
+            except Exception as _lb_exc:
+                logger.warning("[Wallet] Low-balance alert failed after approval debit: %s", _lb_exc)
 
     # Idempotency guard: reject if this run already has a payout batch
     existing_batches = await batch_repo.get_by_run(run_uuid)
@@ -524,6 +669,18 @@ async def reject_candidates(
             detail=f"Run is not awaiting approval (status: {run.status})",
         )
 
+    # Business membership gate
+    from sqlalchemy import select as _select_rej
+    _rej_mem_q = await session.execute(
+        _select_rej(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _rej_mem_q.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
     # Reject candidates in DB (candidate_ids already validated above)
     rejected_count = await candidate_repo.reject(candidate_ids, run_uuid)
 
@@ -592,3 +749,224 @@ async def reject_candidates(
         "rejected_count": rejected_count,
         "remaining_approved": remaining_approved,
     }
+
+
+# ------------------------------------------------------------------
+# Assign Approver — PATCH /runs/{run_id}/assign-approver
+# ------------------------------------------------------------------
+
+
+@router.patch("/runs/{run_id}/assign-approver")
+async def assign_approver(
+    run_id: str,
+    request: AssignApproverRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
+):
+    """Reassign which team member is responsible for approving a run.
+
+    Only works while the run is in ``awaiting_approval`` status.
+    The new assignee must be an active owner or approver in the business.
+    Notifies the newly assigned member via in-app notification and email.
+    """
+    from sqlalchemy import select as _sa, update as _su
+
+    run_uuid = _parse_uuid(run_id, "run_id")
+    new_assignee_uuid = _parse_uuid(request.user_id, "user_id")
+
+    run_repo = RunRepository(session)
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail="The approver can only be changed while the run is awaiting approval.",
+        )
+
+    # Business membership gate — verify caller belongs to this run's business
+    from sqlalchemy import select as _select_aa
+    _caller_mem_q = await session.execute(
+        _select_aa(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _caller_mem_q.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
+    # Verify the new assignee is an active approver or owner in this business
+    member_q = await session.execute(
+        _sa(BusinessMemberModel, UserModel)
+        .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+        .where(
+            BusinessMemberModel.user_id == new_assignee_uuid,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.role.in_(["owner", "approver"]),
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    member_row = member_q.first()
+    if not member_row:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected user is not an active approver in this organisation.",
+        )
+    _, assignee_user = member_row
+
+    # Persist the new assignment
+    await session.execute(
+        _su(AgentRunModel)
+        .where(AgentRunModel.id == run_uuid)
+        .values(assigned_to_id=new_assignee_uuid)
+    )
+    await session.flush()
+
+    # In-app notification for the newly assigned approver
+    try:
+        candidate_count = len(run.payout_candidates) if run.payout_candidates else 0
+        notif_repo = NotificationRepository(session)
+        await notif_repo.create(
+            user_id=new_assignee_uuid,
+            business_id=run.business_id,
+            title="You've been assigned to approve a run",
+            message=(
+                f'{candidate_count} candidate{"s" if candidate_count != 1 else ""} need your '
+                f'review on run "{run.objective[:50]}".'
+            ),
+            type="warning",
+            resource_type="run",
+            resource_id=run_id,
+        )
+        await session.commit()
+    except Exception as _notif_exc:
+        logger.warning(f"Run {run_id}: failed to notify new approver: {_notif_exc}")
+
+    # Email the newly assigned approver (best-effort, non-blocking)
+    try:
+        import asyncio as _asyncio_aa
+        from src.services.email_service import send_run_awaiting_approval_email as _send_aa
+        _asyncio_aa.create_task(
+            _send_aa(
+                to=assignee_user.email,
+                run_id=run_id,
+                objective=run.objective,
+                candidate_count=len(run.payout_candidates) if run.payout_candidates else 0,
+                approver_name=assignee_user.display_name or assignee_user.email,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+        )
+    except Exception as _email_exc:
+        logger.warning(f"Run {run_id}: failed to email new approver: {_email_exc}")
+
+    return {
+        "run_id": run_id,
+        "assigned_to_id": str(new_assignee_uuid),
+        "assigned_to_name": assignee_user.display_name or assignee_user.email,
+        "assigned_to_email": assignee_user.email,
+    }
+
+
+# ------------------------------------------------------------------
+# Edit Candidate — PATCH /runs/{run_id}/candidates/{candidate_id}
+# ------------------------------------------------------------------
+
+
+@router.patch("/runs/{run_id}/candidates/{candidate_id}")
+async def update_candidate(
+    run_id: str,
+    candidate_id: str,
+    request: UpdateCandidateRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+    _=Depends(require_role("owner", "approver")),
+):
+    """Edit a payout candidate's core fields before the run is approved.
+
+    Allowed while the run is in ``awaiting_approval``.  Editing resets
+    risk scoring and KYC lookup so the execution agent re-verifies the
+    updated details before any money moves.
+
+    Budget cap: if the run has a budget_cap, the edit is rejected if
+    the new candidate total would exceed it.
+    """
+    from decimal import Decimal as _Dec
+
+    run_uuid = _parse_uuid(run_id, "run_id")
+    candidate_uuid = _parse_uuid(candidate_id, "candidate_id")
+
+    run_repo = RunRepository(session)
+    candidate_repo = CandidateRepository(session)
+
+    run = await run_repo.get_by_id(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail="Candidates can only be edited while the run is awaiting approval.",
+        )
+
+    # Business membership gate
+    from sqlalchemy import select as _select_uc
+    _uc_mem_q = await session.execute(
+        _select_uc(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _uc_mem_q.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
+    # Validate amount > 0
+    if request.amount is not None and request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0.")
+
+    # Budget cap guard: compute whether the edit would breach the cap
+    if request.amount is not None and run.budget_cap is not None:
+        all_candidates = await candidate_repo.get_by_run(run_uuid)
+        current = next((c for c in all_candidates if c.id == candidate_uuid), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Candidate not found.")
+        current_total = sum(float(c.amount) for c in all_candidates)
+        new_total = current_total - float(current.amount) + request.amount
+        if new_total > float(run.budget_cap):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This edit would push the run total (₦{new_total:,.2f}) over the "
+                    f"budget cap (₦{float(run.budget_cap):,.2f})."
+                ),
+            )
+
+    # Validate institution code if being changed
+    if request.institution_code:
+        inst_repo = InstitutionRepository(session)
+        institutions, _ = await inst_repo.get_all_active(limit=10_000)
+        valid_codes = {i.institution_code for i in institutions}
+        if request.institution_code not in valid_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown institution code: '{request.institution_code}'.",
+            )
+
+    updated = await candidate_repo.update_fields(
+        candidate_id=candidate_uuid,
+        run_id=run_uuid,
+        amount=_Dec(str(request.amount)) if request.amount is not None else None,
+        beneficiary_name=request.beneficiary_name,
+        account_number=request.account_number,
+        institution_code=request.institution_code,
+    )
+    await session.commit()
+
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Candidate not found, or it has already been approved and cannot be edited.",
+        )
+
+    return _serialize_candidate(updated)

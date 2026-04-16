@@ -93,6 +93,9 @@ class RunResponse(BaseModel):
     status: str
     created_at: str
     risk_tolerance: Optional[float] = None
+    budget_cap: Optional[float] = None
+    assigned_to_id: Optional[str] = None
+    assigned_to: Optional[dict] = None  # {id, name, email}
     plan_steps: Optional[list] = None
     candidates: Optional[list[CandidateResponse]] = None
     candidate_count: int = 0
@@ -347,91 +350,8 @@ async def create_run(
         except ValueError:
             pass  # Invalid UUID — ignore silently, auto-assign will take over
 
-    # ── Wallet debit ────────────────────────────────────────────────────────
-    # If a budget_cap is specified, deduct it from the wallet atomically.
-    # run_repo.create() calls flush() (not commit()), so run.id is available
-    # here.  The wallet debit and the run creation are in the same DB
-    # transaction — a balance failure rolls back the run row too.
-    _wallet_balance_after: float | None = None
-    if request.budget_cap is not None:
-        from src.infrastructure.database.repositories.wallet_repository import (
-            WalletRepository as _WalletRepo,
-            InsufficientBalanceError as _InsufficientBalance,
-            LOW_BALANCE_THRESHOLD as _LOW_THRESHOLD,
-        )
-        _wallet_repo = _WalletRepo(session)
-        try:
-            _debit_tx, _ = await _wallet_repo.debit(
-                business_id=business_uuid,
-                amount=Decimal(str(request.budget_cap)),
-                reference=f"run_debit_{run.id}",
-                description=f"Run: {request.objective[:100]}",
-                run_id=run.id,
-            )
-            _wallet_balance_after = float(_debit_tx.balance_after)
-        except _InsufficientBalance as exc:
-            raise HTTPException(
-                status_code=402,
-                detail=str(exc),
-            )
-        except ValueError as exc:
-            # Wallet doesn't exist yet (no top-up has ever happened)
-            raise HTTPException(
-                status_code=402,
-                detail="Your organisation wallet has no balance. Please top up before creating a run.",
-            )
-    # ────────────────────────────────────────────────────────────────────────
-
     await session.commit()
     await session.refresh(run)
-
-    # Fire low-balance alert (email + in-app) after commit so balance is final
-    if _wallet_balance_after is not None:
-        from src.infrastructure.database.repositories.wallet_repository import LOW_BALANCE_THRESHOLD as _LBT
-        if Decimal(str(_wallet_balance_after)) < _LBT:
-            try:
-                import asyncio as _asyncio
-                from src.services.email_service import send_wallet_low_balance_email as _send_lb
-                _owner_result = await session.execute(
-                    _select(BusinessMemberModel, UserModel)
-                    .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
-                    .where(
-                        BusinessMemberModel.business_id == business_uuid,
-                        BusinessMemberModel.role == "owner",
-                        BusinessMemberModel.is_active.is_(True),
-                    )
-                    .limit(1)
-                )
-                _owner_row = _owner_result.first()
-                if _owner_row:
-                    _, _owner_user = _owner_row
-
-                    # In-app notification
-                    _notif_repo = NotificationRepository(session)
-                    await _notif_repo.create(
-                        user_id=_owner_user.id,
-                        business_id=business_uuid,
-                        title="Wallet balance is low",
-                        message=(
-                            f"Your wallet balance (₦{_wallet_balance_after:,.2f}) is below the "
-                            f"₦{float(_LBT):,.2f} threshold. Top up to avoid disrupting payout runs."
-                        ),
-                        type="warning",
-                        resource_type="wallet",
-                    )
-                    await session.commit()
-
-                    # Email
-                    _asyncio.create_task(
-                        _send_lb(
-                            to=_owner_user.email,
-                            display_name=_owner_user.display_name or _owner_user.email,
-                            balance=_wallet_balance_after,
-                            threshold=float(_LBT),
-                        )
-                    )
-            except Exception as _lb_exc:
-                logger.warning("[Wallet] Could not send low-balance alert: %s", _lb_exc)
 
     run_id = str(run.id)
 
@@ -620,6 +540,8 @@ async def create_run(
             status=final_status,
             created_at=run.created_at.isoformat(),
             risk_tolerance=float(run.risk_tolerance),
+            budget_cap=float(run.budget_cap) if run.budget_cap is not None else None,
+            assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
             plan_steps=state.get("plan_steps"),
             candidates=candidate_responses or None,
             candidate_count=len(candidate_responses),
@@ -653,7 +575,10 @@ async def list_runs(
 ):
     from sqlalchemy import select as _select_biz
     membership_result = await session.execute(
-        _select_biz(BusinessMemberModel).where(BusinessMemberModel.user_id == current_user.id)
+        _select_biz(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.is_active.is_(True),
+        )
     )
     membership = membership_result.scalars().first()
     if not membership:
@@ -700,6 +625,18 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    # Business membership gate — ensure caller belongs to this run's business
+    from sqlalchemy import select as _select_mem
+    _mem_q = await session.execute(
+        _select_mem(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
     db_plan_steps = [
         {
             "agent_type": s.agent_type,
@@ -723,12 +660,30 @@ async def get_run(
     db_candidates = await candidate_repo.get_by_run(run_uuid)
     candidate_responses = _candidates_to_response(db_candidates)
 
+    # Load assigned approver user info if set
+    assigned_to: dict | None = None
+    if run.assigned_to_id:
+        from sqlalchemy import select as _sat
+        at_result = await session.execute(
+            _sat(UserModel).where(UserModel.id == run.assigned_to_id)
+        )
+        at_user = at_result.scalar_one_or_none()
+        if at_user:
+            assigned_to = {
+                "id": str(at_user.id),
+                "name": at_user.display_name or at_user.email,
+                "email": at_user.email,
+            }
+
     return RunResponse(
         run_id=run_id,
         objective=run.objective,
         status=run.status,
         created_at=run.created_at.isoformat(),
         risk_tolerance=float(run.risk_tolerance),
+        budget_cap=float(run.budget_cap) if run.budget_cap is not None else None,
+        assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
+        assigned_to=assigned_to,
         plan_steps=plan_steps or None,
         candidates=candidate_responses or None,
         candidate_count=len(candidate_responses),
@@ -752,6 +707,17 @@ async def get_run_status(
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    from sqlalchemy import select as _select_mem2
+    _mem_q2 = await session.execute(
+        _select_mem2(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q2.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
 
     transactions_count = await transaction_repo.count_by_run(run_uuid)
     candidates_count = await candidate_repo.count_by_run(run_uuid)
@@ -793,6 +759,18 @@ async def upload_candidates_csv(
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    from sqlalchemy import select as _select_mem3
+    _mem_q3 = await session.execute(
+        _select_mem3(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q3.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
     if run.status not in ("pending", "awaiting_approval"):
         raise HTTPException(
             status_code=400,
@@ -965,6 +943,17 @@ async def get_run_steps(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    from sqlalchemy import select as _select_mem4
+    _mem_q4 = await session.execute(
+        _select_mem4(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q4.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
+
     step_repo = PlanStepRepository(session)
     steps = await step_repo.get_by_run(run_uuid)
 
@@ -1004,6 +993,17 @@ async def get_run_step_detail(
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    from sqlalchemy import select as _select_mem5
+    _mem_q5 = await session.execute(
+        _select_mem5(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == current_user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q5.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
 
     step_repo = PlanStepRepository(session)
     steps = await step_repo.get_by_run(run_uuid)
@@ -1067,6 +1067,17 @@ async def stream_run_events(
     run = await run_repo.get_by_id(run_uuid)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    from sqlalchemy import select as _select_mem6
+    _mem_q6 = await session.execute(
+        _select_mem6(BusinessMemberModel).where(
+            BusinessMemberModel.user_id == _user.id,
+            BusinessMemberModel.business_id == run.business_id,
+            BusinessMemberModel.is_active.is_(True),
+        )
+    )
+    if not _mem_q6.scalars().first():
+        raise HTTPException(status_code=403, detail="You do not have access to this run")
 
     async def _event_generator():
         event_repo = RunEventRepository(session)

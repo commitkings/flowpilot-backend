@@ -161,6 +161,66 @@ class CandidateRepository:
         await self._session.execute(stmt)
         await self._session.flush()
 
+    async def update_fields(
+        self,
+        candidate_id: UUID,
+        run_id: UUID,
+        *,
+        amount: Optional[Decimal] = None,
+        beneficiary_name: Optional[str] = None,
+        account_number: Optional[str] = None,
+        institution_code: Optional[str] = None,
+    ) -> Optional["PayoutCandidateModel"]:
+        """Edit core candidate fields while the run is awaiting approval.
+
+        Clears risk scoring and lookup state so the execution agent
+        re-verifies the updated details before disbursement.
+        Only affects candidates that are still pending or rejected
+        (already-approved candidates cannot be edited).
+        """
+        values: dict = {}
+        if amount is not None:
+            values["amount"] = amount
+        if beneficiary_name is not None:
+            values["beneficiary_name"] = beneficiary_name
+        if account_number is not None:
+            values["account_number"] = account_number
+        if institution_code is not None:
+            values["institution_code"] = institution_code
+
+        if not values:
+            stmt = select(PayoutCandidateModel).where(
+                PayoutCandidateModel.id == candidate_id,
+                PayoutCandidateModel.run_id == run_id,
+            )
+            result = await self._session.execute(stmt)
+            return result.scalar_one_or_none()
+
+        # Reset risk + lookup so the execution agent re-scores this candidate
+        values.update({
+            "risk_score": None,
+            "risk_decision": None,
+            "risk_reasons": [],
+            "lookup_status": "pending",
+            "lookup_account_name": None,
+            "lookup_match_score": None,
+            "approval_status": "pending",
+        })
+
+        stmt = (
+            update(PayoutCandidateModel)
+            .where(
+                PayoutCandidateModel.id == candidate_id,
+                PayoutCandidateModel.run_id == run_id,
+                PayoutCandidateModel.approval_status.in_(["pending", "rejected"]),
+            )
+            .values(**values)
+            .returning(PayoutCandidateModel)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.scalar_one_or_none()
+
     async def count_by_run(self, run_id: UUID) -> int:
         stmt = (
             select(func.count())

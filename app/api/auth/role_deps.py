@@ -35,7 +35,8 @@ def require_role(*allowed_roles: str):
     ) -> BusinessMemberModel:
         result = await session.execute(
             select(BusinessMemberModel).where(
-                BusinessMemberModel.user_id == current_user.id
+                BusinessMemberModel.user_id == current_user.id,
+                BusinessMemberModel.is_active.is_(True),
             )
         )
         membership = result.scalars().first()
