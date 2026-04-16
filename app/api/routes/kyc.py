@@ -32,6 +32,9 @@ from src.infrastructure.database.flowpilot_models import (
     KycSubmissionModel,
     UserModel,
 )
+from src.infrastructure.database.repositories.business_repository import (
+    _generate_virtual_account_number,
+)
 from src.infrastructure.database.repositories.notification_repository import (
     NotificationRepository,
 )
@@ -99,10 +102,21 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                     .where(KycSubmissionModel.business_id == bid)
                     .values(status="verified", verified_at=now, updated_at=now)
                 )
+
+                # Assign virtual account on KYC approval (first-time only)
+                biz_result = await session.execute(
+                    select(BusinessModel).where(BusinessModel.id == bid)
+                )
+                biz = biz_result.scalar_one_or_none()
+                va_updates: dict = {"kyc_status": "verified", "updated_at": now}
+                if biz and not biz.virtual_account_number:
+                    va_updates["virtual_account_number"] = _generate_virtual_account_number(bid)
+                    va_updates["virtual_account_bank"] = "FlowPilot Microfinance Bank"
+                    va_updates["virtual_account_name"] = business_name[:30]
                 await session.execute(
                     update(BusinessModel)
                     .where(BusinessModel.id == bid)
-                    .values(kyc_status="verified", updated_at=now)
+                    .values(**va_updates)
                 )
 
                 owner_result = await session.execute(

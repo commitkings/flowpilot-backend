@@ -61,11 +61,7 @@ class BusinessRepository:
         self._s.add(business)
         await self._s.flush()  # assigns business.id
 
-        # Assign a virtual account for wallet top-up via bank transfer
-        business.virtual_account_number = _generate_virtual_account_number(business.id)
-        business.virtual_account_bank = "FlowPilot Microfinance Bank"
-        business.virtual_account_name = business_name[:30]
-        await self._s.flush()
+        # Virtual account is assigned after KYC is verified, not at creation.
 
         config = BusinessConfigModel(
             business_id=business.id,
