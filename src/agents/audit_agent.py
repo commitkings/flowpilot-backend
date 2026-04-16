@@ -34,6 +34,48 @@ _RISK_REASON_PLAIN: dict[str, str] = {
         "We could not load enough bank transaction history for the period you chose, "
         "so the review leaned more on the payout details themselves."
     ),
+    "data quality penalty": (
+        "We had limited transaction history available, which reduced confidence "
+        "in the overall assessment."
+    ),
+}
+
+# Maps risk feature names to plain-language explanations for the executive summary.
+# Templates use {pct} for the percentage contribution of this factor.
+_RISK_FACTOR_PLAIN: dict[str, str] = {
+    "amount_z_score": (
+        "The payment amount stood out compared to what we normally see"
+    ),
+    "is_new_beneficiary": (
+        "This is a first-time recipient in your system"
+    ),
+    "duplicate_similarity": (
+        "This payment looks very similar to another one in the same batch"
+    ),
+    "velocity_7d": (
+        "This account has received payments recently (within 7 days)"
+    ),
+    "velocity_30d": (
+        "This account has had multiple payments in the last 30 days"
+    ),
+    "amount_vs_cap": (
+        "The amount takes up a large share of the budget for this run"
+    ),
+    "round_number_bias": (
+        "The amount is a suspiciously round number"
+    ),
+    "name_inconsistency": (
+        "Different names have been used for this account in the past"
+    ),
+    "days_since_last_payout": (
+        "This account was paid very recently"
+    ),
+    "account_age_factor": (
+        "This is a relatively new account in your system"
+    ),
+    "data_quality_penalty": (
+        "We had limited transaction history available to cross-check against"
+    ),
 }
 
 
@@ -261,6 +303,30 @@ def _build_deterministic_executive_summary(bundle: dict[str, Any]) -> str:
         ]
         if driver_text:
             candidate_parts.append(f"The main reasons were: {driver_text}")
+
+        # ── Render top factor breakdown from risk_narrative ──
+        factor_breakdown = detail.get("risk_factor_breakdown") or []
+        if factor_breakdown:
+            top_lines = []
+            for factor in factor_breakdown[:3]:
+                feat = factor.get("feature", "")
+                pct = factor.get("contribution_pct", 0)
+                plain = _RISK_FACTOR_PLAIN.get(feat, feat.replace("_", " "))
+                top_lines.append(f"{plain}, which contributed about {pct}% of the score")
+            if top_lines:
+                candidate_parts.append(
+                    "What drove this score: " + ". ".join(top_lines) + "."
+                )
+
+        # ── Append contextual notes from risk narrative ──
+        narrative_notes = detail.get("risk_narrative_notes") or {}
+        single_note = narrative_notes.get("single_candidate_note")
+        dq_note = narrative_notes.get("data_quality_note")
+        if single_note:
+            candidate_parts.append(single_note)
+        if dq_note:
+            candidate_parts.append(dq_note)
+
         tolerance_explanation = str(detail.get("tolerance_explanation") or "").strip()
         if tolerance_explanation:
             candidate_parts.append(tolerance_explanation)
@@ -386,6 +452,10 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
         )
         exec_status = exec_result.get("execution_status", "not_executed")
 
+        # ── Extract risk narrative from RiskAgent ──
+        risk_narrative = c.get("risk_narrative") or {}
+        top_factors = risk_narrative.get("top_factors") or []
+
         candidate_details.append(
             {
                 "name": name,
@@ -410,6 +480,13 @@ def _build_executive_summary_bundle(state: AgentState) -> dict[str, Any]:
                 "execution_status": exec_status,
                 "approved_after_review": cid in approved_ids,
                 "rejected_after_review": cid in rejected_ids,
+                # ── Risk narrative data for executive summary ──
+                "risk_factor_breakdown": top_factors,
+                "risk_narrative_notes": {
+                    "score_context": risk_narrative.get("score_context"),
+                    "single_candidate_note": risk_narrative.get("single_candidate_note"),
+                    "data_quality_note": risk_narrative.get("data_quality_note"),
+                },
             }
         )
 

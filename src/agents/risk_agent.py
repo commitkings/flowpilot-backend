@@ -38,12 +38,13 @@ DEFAULT_RISK_WEIGHTS: dict[str, float] = {
     "is_new_beneficiary": 0.15,  # First-time recipient
     "duplicate_similarity": 0.15,  # Possible double-payment
     "velocity_7d": 0.10,  # Rapid repeated payments (7 days)
-    "velocity_30d": 0.05,  # Monthly velocity
+    "velocity_30d": 0.03,  # Monthly velocity
     "amount_vs_cap": 0.10,  # How close to budget limit
-    "round_number_bias": 0.05,  # Suspiciously round amount
+    "round_number_bias": 0.02,  # Suspiciously round amount
     "name_inconsistency": 0.10,  # Name changed for same account
     "days_since_last_payout": 0.05,  # Recency factor (inverse)
     "account_age_factor": 0.05,  # Account maturity (inverse for new)
+    "data_quality_penalty": 0.05,  # Penalty when upstream data is unavailable
 }
 
 DEFAULT_RISK_THRESHOLDS: dict[str, float] = {
@@ -88,7 +89,7 @@ Your role is to REVIEW and EXPLAIN the score. The system enforces the computed s
 You may request a micro-adjustment of ±0.05 if you identify factors the model missed, but you MUST provide written justification in adjustment_reason. Adjustments without justification are silently discarded.
 
 ## Risk Criteria Explained:
-- **amount_z_score**: Z-score > 2.0 is notable, > 3.0 is high risk (unusually large/small amount)
+- **amount_z_score**: Z-score > 2.0 is notable, > 3.0 is high risk (unusually large/small amount). NOTE: For single-candidate batches, the system automatically uses historical-amount comparison instead of batch z-score.
 - **is_new_beneficiary**: First-time payment to this account — slightly elevated risk
 - **duplicate_similarity**: Jaccard similarity > 0.7 = likely duplicate, > 0.95 = near-certain
 - **velocity_7d / velocity_30d**: Multiple payouts to same account in short window
@@ -97,6 +98,7 @@ You may request a micro-adjustment of ±0.05 if you identify factors the model m
 - **name_inconsistency**: Different names used for same account historically
 - **days_since_last_payout**: Very recent payout to same account (< 7 days)
 - **account_age_factor**: New accounts (first seen < 30 days ago) get slight premium
+- **data_quality_penalty**: Applied when upstream transaction data is unavailable (scoring with limited context)
 
 ## Memory-Aware Risk Assessment (Phase 7):
 For each candidate, call `get_beneficiary_reputation` to check their historical payout reputation.
@@ -339,11 +341,22 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         if not candidates:
             return {"features": [], "note": "No candidates to analyze"}
 
+        # ── Single-candidate detection ──────────────────────────────────
+        single_candidate_mode = len(candidates) == 1
+
         # Compute batch-level statistics
         amounts = [c.get("amount", 0.0) for c in candidates]
         mean_amount = sum(amounts) / len(amounts) if amounts else 0.0
         variance = sum((a - mean_amount) ** 2 for a in amounts) / max(len(amounts), 1)
         std_dev = math.sqrt(variance) if variance > 0 else 1.0
+
+        # ── Data quality penalty ────────────────────────────────────────
+        dq_flags = state.get("data_quality_flags", [])
+        has_data_quality_issue = any(
+            f.get("flag") == "transaction_data_unavailable" for f in dq_flags
+        )
+        # 0.8 when scoring blind (upstream data unavailable), 0.0 when data is fine
+        data_quality_penalty_value = 0.8 if has_data_quality_issue else 0.0
 
         features_list = []
 
@@ -356,6 +369,26 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
 
             # Amount z-score
             z_score = (amount - mean_amount) / std_dev if std_dev > 0 else 0.0
+
+            # ── Single-candidate fallback for amount_z_score ────────────
+            # When there's only 1 candidate, the batch z-score is always 0
+            # (no peer to deviate from). Use budget-cap ratio as a proxy
+            # so the 20% weight isn't dead.
+            if single_candidate_mode:
+                if budget_cap and float(budget_cap) > 0:
+                    # How much of the budget this single payment consumes
+                    cap_ratio = amount / float(budget_cap)
+                    # Moderate baseline: full-budget use maps to ~0.5 risk,
+                    # overbudget maps higher, small amounts map lower
+                    amount_z_normalized = min(1.0, max(0.0, cap_ratio * 0.5))
+                else:
+                    # No budget cap at all — use a gentle baseline (0.15)
+                    # so the feature isn't entirely dead
+                    amount_z_normalized = 0.15
+                z_score_label = "single_candidate_proxy"
+            else:
+                amount_z_normalized = _normalize_z_score(abs(z_score))
+                z_score_label = "batch_z_score"
 
             # Duplicate detection within batch
             max_dup_score = 0.0
@@ -408,11 +441,17 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "amount": amount,
                 # Raw values for display
                 "z_score": round(z_score, 3),
+                "z_score_method": z_score_label,
+                "single_candidate_mode": single_candidate_mode,
                 "amount_deviation": (
                     "high"
                     if abs(z_score) > 3.0
                     else "moderate"
                     if abs(z_score) > 2.0
+                    else "normal"
+                ) if not single_candidate_mode else (
+                    "high" if amount_z_normalized > 0.5
+                    else "moderate" if amount_z_normalized > 0.25
                     else "normal"
                 ),
                 "duplicate_similarity": round(max_dup_score, 3),
@@ -426,13 +465,15 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "is_round_number": is_round,
                 "round_pattern": round_pattern,
                 "is_new_beneficiary": is_new_beneficiary,
+                "data_quality_degraded": has_data_quality_issue,
                 # Normalized values for scoring
                 "normalized": {
-                    "amount_z_score": round(_normalize_z_score(abs(z_score)), 3),
+                    "amount_z_score": round(amount_z_normalized, 3),
                     "duplicate_similarity": round(max_dup_score, 3),
                     "amount_vs_cap": round(budget_ratio, 3) if budget_ratio else 0.0,
                     "round_number_bias": round_risk,
                     "is_new_beneficiary": 1.0 if is_new_beneficiary else 0.0,
+                    "data_quality_penalty": round(data_quality_penalty_value, 3),
                 },
             }
 
@@ -446,10 +487,16 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 "mean_amount": round(mean_amount, 2),
                 "std_deviation": round(std_dev, 2),
                 "total_candidates": len(candidates),
+                "single_candidate_mode": single_candidate_mode,
+                "data_quality_degraded": has_data_quality_issue,
                 "risk_tolerance": risk_tolerance,
                 "budget_cap": float(budget_cap) if budget_cap else None,
             },
-            "note": "Use compute_velocity_features for historical 7d/30d velocity data.",
+            "note": (
+                "Single-candidate mode: amount_z_score uses budget-cap ratio proxy instead of batch z-score. "
+                if single_candidate_mode
+                else ""
+            ) + "Use compute_velocity_features for historical 7d/30d velocity data.",
         }
 
     # ─── Tool 3: compute_velocity_features ─────────────────────────────────
@@ -721,6 +768,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             "account_age_factor": normalized.get(
                 "account_age_factor", 0.5
             ),  # Default medium for unknown
+            "data_quality_penalty": normalized.get("data_quality_penalty", 0.0),
         }
 
         # Compute weighted score
@@ -888,6 +936,72 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
         # Add guardrail reasons
         reasons.extend(guardrail_reasons)
 
+        # ── Build structured risk narrative for audit/executive summary ──
+        normalized_feats = features.get("normalized", {})
+        all_feature_values = {
+            "amount_z_score": normalized_feats.get("amount_z_score", 0.0),
+            "is_new_beneficiary": 1.0 if features.get("is_new_beneficiary", False) else 0.0,
+            "duplicate_similarity": normalized_feats.get("duplicate_similarity", 0.0),
+            "velocity_7d": normalized_feats.get("velocity_7d", 0.0),
+            "velocity_30d": normalized_feats.get("velocity_30d", 0.0),
+            "amount_vs_cap": normalized_feats.get("amount_vs_cap", 0.0),
+            "round_number_bias": normalized_feats.get("round_number_bias", 0.0),
+            "name_inconsistency": normalized_feats.get("name_inconsistency", 0.0),
+            "days_since_last_payout": normalized_feats.get("days_since_last_payout", 0.0),
+            "account_age_factor": normalized_feats.get("account_age_factor", 0.0),
+            "data_quality_penalty": normalized_feats.get("data_quality_penalty", 0.0),
+        }
+
+        # Compute each feature's contribution and percentage of total
+        factor_contributions = []
+        total_weighted = max(final_score, 0.001)  # avoid div-by-zero
+        for feat_name, weight in risk_weights.items():
+            feat_val = all_feature_values.get(feat_name, 0.0)
+            contribution = feat_val * weight
+            if contribution > 0.005:  # skip negligible
+                pct = round(contribution / total_weighted * 100)
+                factor_contributions.append({
+                    "feature": feat_name,
+                    "value": round(feat_val, 3),
+                    "weight": weight,
+                    "contribution": round(contribution, 4),
+                    "contribution_pct": pct,
+                })
+
+        # Sort by contribution descending
+        factor_contributions.sort(key=lambda x: x["contribution"], reverse=True)
+
+        # Score context
+        if final_decision == "allow":
+            score_context = (
+                f"The score of {final_score:.2f} is at or below the {allow_max:.2f} threshold, "
+                f"so this recipient was cleared automatically."
+            )
+        elif final_decision == "review":
+            score_context = (
+                f"The score of {final_score:.2f} is above the {allow_max:.2f} automatic threshold "
+                f"but below the {review_max:.2f} block threshold, so this recipient needed human review."
+            )
+        else:
+            score_context = (
+                f"The score of {final_score:.2f} exceeded the {review_max:.2f} block threshold, "
+                f"so this recipient was held back."
+            )
+
+        risk_narrative = {
+            "top_factors": factor_contributions[:5],
+            "score_context": score_context,
+            "single_candidate_note": (
+                "This was the only recipient in the batch, so the amount was compared "
+                "against the budget cap rather than other recipients in the same run."
+            ) if features.get("single_candidate_mode") else None,
+            "data_quality_note": (
+                "We had limited transaction history available to cross-check against, "
+                "which added a small penalty to the overall score."
+            ) if features.get("data_quality_degraded") else None,
+            "guardrails_triggered": guardrail_reasons if guardrail_reasons else None,
+        }
+
         # Update candidate in state
         for c in candidates:
             if c.get("candidate_id") == candidate_id:
@@ -895,6 +1009,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                 c["risk_reasons"] = reasons
                 c["risk_decision"] = final_decision
                 c["risk_features"] = features.get("normalized", {})
+                c["risk_narrative"] = risk_narrative
                 break
 
         return {
@@ -907,6 +1022,7 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
             "adjustment_applied": round(adjustment, 4),
             "guardrails_triggered": len(guardrail_reasons) > 0,
             "guardrail_reasons": guardrail_reasons,
+            "risk_narrative": risk_narrative,
             "note": "risk_score is computed deterministically. LLM-supplied score was ignored.",
         }
 
