@@ -4,137 +4,88 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <meta name="color-scheme" content="light dark">
-  <meta name="supported-color-schemes" content="light dark">
-  <title>KYC Documents Received — FlowPilot</title>
+  <title>KYC documents received</title>
   <style>
-    :root { color-scheme: light dark; supported-color-schemes: light dark; }
-    @media (prefers-color-scheme: dark) {
-      .light-logo { display: none !important; }
-      .dark-logo { display: block !important; }
+    @media only screen and (max-width:600px) {
+      .outer-pad { padding: 24px 12px 32px !important; }
+      .logo-pad  { padding: 24px 24px 18px !important; }
+      .body-pad  { padding: 0 24px 32px !important; }
+      .foot-pad  { padding: 16px 24px 20px !important; }
+      .h1        { font-size: 18px !important; }
     }
   </style>
 </head>
-<body style="margin:0;padding:0;background-color:#f4f2ef;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<body style="margin:0;padding:0;background-color:#f0ede8;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
 
-  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f4f2ef;font-size:1px;">
-    We've received your KYC documents for {{ business_name }}. We'll get back to you in about 10 minutes.
+  <!-- Preheader -->
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
+    We've received your KYC documents for {{ business_name }}. We'll get back to you in about 10 minutes. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
 
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-         style="background-color:#f4f2ef;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
     <tr>
-      <td align="center" style="padding:40px 16px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-               style="max-width:580px;">
+      <td align="center" class="outer-pad" style="padding:48px 16px 40px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
 
-          <!-- LOGO HEADER -->
+          <!-- Top accent bar -->
           <tr>
-            <td align="center" style="background-color:#ffffff;border-radius:14px 14px 0 0;
-                        padding:28px 40px 24px;border-top:3px solid #e86727;">
-              <img src="{{ logo_url }}" alt="FlowPilot" height="32" class="light-logo"
+            <td style="height:4px;background-color:#e86727;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
+          </tr>
+
+          <!-- Logo -->
+          <tr>
+            <td align="center" class="logo-pad" style="background-color:#ffffff;padding:28px 40px 20px;">
+              <img src="https://i.postimg.cc/ZqzNQW8H/flowpilot-logo-darkblue.png" alt="FlowPilot" height="28"
                    style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;" />
-              <!--[if !mso]><!-->
-              <img src="{{ logo_dark_url }}" alt="FlowPilot" height="32" class="dark-logo"
-                   style="display:none;border:0;outline:none;text-decoration:none;margin:0 auto;" />
-              <!--<![endif]-->
             </td>
           </tr>
 
-          <!-- BODY -->
+          <!-- Body -->
           <tr>
-            <td style="background-color:#ffffff;padding:32px 40px 12px;">
+            <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
+              <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;font-size:0;line-height:0;">&nbsp;</div>
 
-              <!-- Status badge -->
-              <div style="display:inline-block;background-color:#fef3e2;border:1px solid #f5b942;
-                           border-radius:50px;padding:4px 14px;margin-bottom:20px;">
-                <span style="font-size:12px;font-weight:700;color:#b45309;letter-spacing:0.04em;">
-                  UNDER REVIEW
-                </span>
-              </div>
-
-              <h1 style="margin:0 0 6px;font-size:22px;font-weight:700;color:#16213a;line-height:1.3;letter-spacing:-0.3px;">
-                KYC documents received, {{ first_name }}.
-              </h1>
-              <p style="margin:0 0 24px;font-size:14px;color:#9a9389;font-weight:600;letter-spacing:0.02em;">
-                {{ business_name }}
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">KYC documents received</h1>
+              <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
+                Hi {{ first_name }}, we've received your verification documents for <strong style="color:#0f172a;">{{ business_name }}</strong> and our team is reviewing them. You'll hear back in about 10 minutes.
               </p>
 
-              <p style="margin:0 0 20px;font-size:15px;color:#4a4540;line-height:1.7;">
-                We've received your verification documents and our team is reviewing them now.
-                You'll hear back from us in about <strong style="color:#16213a;">10 minutes</strong>.
-              </p>
-
-              <!-- What was submitted -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-                     style="background-color:#f9f7f4;border-radius:10px;padding:0;margin-bottom:28px;">
+              <!-- Documents submitted card -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
-                  <td style="padding:20px 24px;">
-                    <p style="margin:0 0 12px;font-size:12px;font-weight:700;color:#9a9389;letter-spacing:0.08em;text-transform:uppercase;">
-                      Documents Submitted
-                    </p>
+                  <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
+                    <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#e86727;">Documents submitted</p>
                     {% for doc in submitted_docs %}
-                    <p style="margin:0 0 6px;font-size:14px;color:#4a4540;line-height:1.5;">
-                      <span style="color:#e86727;margin-right:6px;">✓</span>{{ doc }}
-                    </p>
+                    <p style="margin:0 0 4px;font-size:13px;color:#64748b;line-height:1.6;">{{ doc }}</p>
                     {% endfor %}
                   </td>
                 </tr>
               </table>
 
-              <p style="margin:0 0 28px;font-size:14px;color:#4a4540;line-height:1.7;">
-                Once verified, you'll be able to create payout runs and use the full FlowPilot platform.
-                We'll send you another email as soon as the review is complete.
-              </p>
-
-              <!-- CTA -->
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0"
-                     style="margin-bottom:28px;">
+              <!-- CTA button -->
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                 <tr>
-                  <td style="border-radius:50px;background-color:#1e2d40;">
-                    <a href="{{ dashboard_url }}"
-                       style="display:inline-block;padding:14px 34px;font-size:14px;
-                              font-weight:700;color:#ffffff;text-decoration:none;
-                              border-radius:50px;letter-spacing:0.02em;">
-                      Go to Dashboard
+                  <td style="border-radius:8px;background-color:#e86727;">
+                    <a href="{{ dashboard_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      Go to dashboard &rarr;
                     </a>
                   </td>
                 </tr>
               </table>
 
-              <p style="margin:0 0 28px;font-size:13px;color:#9a9389;line-height:1.65;">
-                Questions? Reach us at
-                <a href="mailto:support@flowpilot.club"
-                   style="color:#e86727;text-decoration:none;font-weight:600;">
-                  support@flowpilot.club
-                </a>
-              </p>
             </td>
           </tr>
 
-          <!-- Divider -->
+          <!-- Footer -->
           <tr>
-            <td style="background-color:#ffffff;padding:0 40px;">
-              <div style="height:1px;background-color:#ede9e3;font-size:0;line-height:0;">&nbsp;</div>
-            </td>
-          </tr>
-
-          <!-- FOOTER -->
-          <tr>
-            <td style="background-color:#ffffff;border-radius:0 0 14px 14px;padding:20px 40px 28px;">
+            <td class="foot-pad" style="background-color:#f7f5f2;border-radius:0 0 12px 12px;padding:18px 40px 22px;border-top:1px solid #ede9e3;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                 <tr>
                   <td align="center">
-                    <p style="margin:0 0 6px;font-size:12px;color:#9a9389;line-height:1.6;">
-                      Need help?&nbsp;
-                      <a href="mailto:support@flowpilot.club"
-                         style="color:#e86727;text-decoration:none;font-weight:600;">
-                        contact support@flowpilot.club
-                      </a>
+                    <p style="margin:0 0 4px;font-size:12px;color:#94a3b8;line-height:1.6;">
+                      <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;">support@flowpilot.club</a>
                     </p>
-                    <p style="margin:0;font-size:11px;color:#b8b0a6;line-height:1.6;">
-                      &copy; 2026 FlowPilot &middot; Automate your payouts.
-                    </p>
+                    <p style="margin:0;font-size:11px;color:#b0aaa4;line-height:1.6;">&copy; 2026 FlowPilot &middot; Automate your payouts.</p>
                   </td>
                 </tr>
               </table>

@@ -6,84 +6,106 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <title>Wallet top-up confirmed</title>
   <style>
-    @media (prefers-color-scheme: dark) {
-      .light-logo { display: none !important; }
-      .dark-logo { display: block !important; }
+    @media only screen and (max-width:600px) {
+      .outer-pad { padding: 24px 12px 32px !important; }
+      .logo-pad  { padding: 24px 24px 18px !important; }
+      .body-pad  { padding: 0 24px 32px !important; }
+      .foot-pad  { padding: 16px 24px 20px !important; }
+      .h1        { font-size: 18px !important; }
     }
   </style>
 </head>
-<body style="margin:0;padding:0;background-color:#f4f2ef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-  <div style="display:none;max-height:0;overflow:hidden;color:#f4f2ef;font-size:1px;">
-    ₦{{ amount }} has been added to your FlowPilot wallet. New balance: ₦{{ new_balance }}. &nbsp;&zwnj;&nbsp;
+<body style="margin:0;padding:0;background-color:#f0ede8;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+  <!-- Preheader -->
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
+    &#8358;{{ amount }} has been added to your FlowPilot wallet. New balance: &#8358;{{ new_balance }}. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f2ef;">
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
     <tr>
-      <td align="center" style="padding:40px 16px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;">
+      <td align="center" class="outer-pad" style="padding:48px 16px 40px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
+
+          <!-- Top accent bar -->
+          <tr>
+            <td style="height:4px;background-color:#e86727;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
+          </tr>
+
           <!-- Logo -->
           <tr>
-            <td align="center" style="background-color:#ffffff;border-radius:14px 14px 0 0;padding:32px 40px 24px;">
-              <img class="light-logo" src="{{ logo_url }}" alt="FlowPilot" width="140" style="display:block;" />
-              <img class="dark-logo" src="{{ logo_dark_url }}" alt="FlowPilot" width="140" style="display:none;" />
+            <td align="center" class="logo-pad" style="background-color:#ffffff;padding:28px 40px 20px;">
+              <img src="https://i.postimg.cc/ZqzNQW8H/flowpilot-logo-darkblue.png" alt="FlowPilot" height="28"
+                   style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;" />
             </td>
           </tr>
-          <!-- Icon + heading -->
+
+          <!-- Body -->
           <tr>
-            <td style="background-color:#ffffff;padding:0 40px 24px;text-align:center;">
-              <div style="display:inline-flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:16px;background-color:#e8f5e9;margin-bottom:16px;">
-                <span style="font-size:28px;">✅</span>
-              </div>
-              <h1 style="margin:0 0 8px;font-size:22px;font-weight:800;color:#0f172a;letter-spacing:-0.5px;">Wallet topped up</h1>
-              <p style="margin:0;font-size:15px;color:#64748b;">Hi {{ first_name }}, your FlowPilot wallet has been credited.</p>
-            </td>
-          </tr>
-          <!-- Amount card -->
-          <tr>
-            <td style="background-color:#ffffff;padding:0 40px 32px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;">
+            <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
+              <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;font-size:0;line-height:0;">&nbsp;</div>
+
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">Wallet top-up confirmed</h1>
+              <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
+                Hi {{ first_name }}, your FlowPilot wallet has been credited.
+              </p>
+
+              <!-- Amount card -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
-                  <td style="padding:24px;">
+                  <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                       <tr>
-                        <td style="padding-bottom:12px;border-bottom:1px solid #e2e8f0;">
-                          <span style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#94a3b8;">Amount credited</span><br />
-                          <span style="font-size:28px;font-weight:900;color:#16a34a;letter-spacing:-1px;">₦{{ amount }}</span>
-                        </td>
+                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Amount credited</td>
+                        <td style="font-size:13px;font-weight:700;color:#e86727;text-align:right;padding-bottom:8px;">&#8358;{{ amount }}</td>
                       </tr>
                       <tr>
-                        <td style="padding-top:12px;">
-                          <span style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#94a3b8;">New wallet balance</span><br />
-                          <span style="font-size:22px;font-weight:800;color:#0f172a;">₦{{ new_balance }}</span>
-                        </td>
+                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">New balance</td>
+                        <td style="font-size:13px;font-weight:700;color:#0f172a;text-align:right;padding-bottom:8px;">&#8358;{{ new_balance }}</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size:13px;color:#64748b;">Reference</td>
+                        <td style="font-size:12px;font-family:monospace;color:#64748b;text-align:right;">{{ reference }}</td>
                       </tr>
                     </table>
                   </td>
                 </tr>
               </table>
+
+              <!-- CTA button -->
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+                <tr>
+                  <td style="border-radius:8px;background-color:#e86727;">
+                    <a href="{{ wallet_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      View wallet &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
             </td>
           </tr>
-          <!-- Reference -->
-          <tr>
-            <td style="background-color:#ffffff;padding:0 40px 32px;">
-              <p style="margin:0;font-size:13px;color:#64748b;">Payment reference: <span style="font-weight:700;color:#334155;font-family:monospace;">{{ reference }}</span></p>
-            </td>
-          </tr>
-          <!-- CTA -->
-          <tr>
-            <td align="center" style="background-color:#ffffff;padding:0 40px 40px;">
-              <a href="{{ wallet_url }}" style="display:inline-block;background-color:#4f46e5;color:#ffffff;font-size:15px;font-weight:700;text-decoration:none;padding:14px 32px;border-radius:100px;">View Wallet</a>
-            </td>
-          </tr>
+
           <!-- Footer -->
           <tr>
-            <td align="center" style="background-color:#f4f2ef;border-radius:0 0 14px 14px;padding:24px 40px;">
-              <p style="margin:0;font-size:12px;color:#94a3b8;">If you did not initiate this top-up, please contact support immediately.</p>
-              <p style="margin:8px 0 0;font-size:12px;color:#cbd5e1;">© FlowPilot. All rights reserved.</p>
+            <td class="foot-pad" style="background-color:#f7f5f2;border-radius:0 0 12px 12px;padding:18px 40px 22px;border-top:1px solid #ede9e3;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td align="center">
+                    <p style="margin:0 0 4px;font-size:12px;color:#94a3b8;line-height:1.6;">
+                      <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;">support@flowpilot.club</a>
+                    </p>
+                    <p style="margin:0;font-size:11px;color:#b0aaa4;line-height:1.6;">&copy; 2026 FlowPilot &middot; Automate your payouts.</p>
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
+
         </table>
       </td>
     </tr>
   </table>
+
 </body>
 </html>
