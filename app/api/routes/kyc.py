@@ -817,16 +817,8 @@ async def submit_individual_kyc_level2(
                 level_name="Address",
             )
         )
-    asyncio.create_task(
-        _auto_verify_individual_kyc(
-            business_id=str(biz.id),
-            level=2,
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-        )
     )
-
-    return {"status": "pending", "message": "Address verification submitted."}
+    return {"status": "pending", "message": "Address verification submitted and queued for review."}
 
 
 @router.post("/individual/level3")
@@ -912,13 +904,4 @@ async def submit_individual_kyc_level3(
                 level_name="Government ID",
             )
         )
-    asyncio.create_task(
-        _auto_verify_individual_kyc(
-            business_id=str(biz.id),
-            level=3,
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-        )
-    )
-
-    return {"status": "pending", "message": "Government ID submitted for Level 3 verification."}
+    return {"status": "pending", "message": "Government ID submitted for Level 3 review."}
