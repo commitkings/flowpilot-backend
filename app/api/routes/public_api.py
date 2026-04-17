@@ -6,36 +6,47 @@ All list endpoints return a standard pagination envelope:
     { data: [...], total: int, limit: int, offset: int, has_more: bool }
 
 Required scope per endpoint group:
-    runs:read        — GET /runs, GET /runs/{run_id}
-    runs:write       — POST /runs  (trigger a new run via API)
-    transactions:read — GET /transactions
-    audit:read       — GET /audit
-    approvals:write  — POST /runs/{run_id}/approve, POST /runs/{run_id}/reject
+    runs:read          — GET /runs, GET /runs/{run_id}, GET /runs/{run_id}/candidates
+    runs:write         — POST /runs  (trigger a new run via API)
+    transactions:read  — GET /transactions
+    audit:read         — GET /audit
+    recipients:read    — GET /recipients
+    recipients:write   — POST /recipients, DELETE /recipients/{id}
+    wallet:read        — GET /wallet/balance
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime, timezone, date
+from decimal import Decimal
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as _sa_update, delete as _sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.api_key_auth import ApiKeyContext, get_api_key_context, require_scope
-from src.infrastructure.database.connection import get_db_session
+from src.infrastructure.database.connection import get_db_session, get_session_factory
 from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
+    AiCreditTransactionModel,
     AuditLogModel,
+    BusinessMemberModel,
     BusinessModel,
     BusinessConfigModel,
     PayoutCandidateModel,
     ReconciledTransactionModel,
+    SavedRecipientModel,
     ScheduledRunModel,
     UserModel,
+    WalletModel,
 )
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 async def _require_kyc_verified(business_id: uuid.UUID, session: AsyncSession) -> None:
@@ -49,6 +60,7 @@ async def _require_kyc_verified(business_id: uuid.UUID, session: AsyncSession) -
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Business KYC verification is required before using this endpoint.",
         )
+
 
 router = APIRouter(prefix="/public/v1", tags=["public-api"])
 
@@ -86,7 +98,6 @@ def _ser_run(run: AgentRunModel) -> dict:
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "approved_at": run.approved_at.isoformat() if run.approved_at else None,
-        # Relation IDs — full user objects are available on the single-run endpoint
         "created_by": str(run.created_by) if run.created_by else None,
         "approved_by": str(run.approved_by) if run.approved_by else None,
         "assigned_to_id": str(run.assigned_to_id) if run.assigned_to_id else None,
@@ -94,7 +105,6 @@ def _ser_run(run: AgentRunModel) -> dict:
 
 
 def _ser_run_detail(run: AgentRunModel, created_by_user: dict | None, approved_by_user: dict | None, assigned_to_user: dict | None) -> dict:
-    """Serialize a run for the public API single-run response (full user objects)."""
     base = _ser_run(run)
     base["created_by_user"] = created_by_user
     base["approved_by_user"] = approved_by_user
@@ -163,8 +173,24 @@ def _ser_audit(entry: AuditLogModel) -> dict:
     }
 
 
+def _ser_recipient(r: SavedRecipientModel) -> dict:
+    return {
+        "id": str(r.id),
+        "name": r.name,
+        "account_number": r.account_number,
+        "institution_code": r.institution_code,
+        "email": r.email,
+        "notes": r.notes,
+        "tags": r.tags or [],
+        "payment_count": r.payment_count,
+        "last_paid_at": r.last_paid_at.isoformat() if r.last_paid_at else None,
+        "created_at": r.created_at.isoformat(),
+        "updated_at": r.updated_at.isoformat(),
+    }
+
+
 # --------------------------------------------------------------------------- #
-# Runs
+# Runs — list & get
 # --------------------------------------------------------------------------- #
 
 @router.get("/runs")
@@ -199,7 +225,7 @@ async def get_run(
     ctx: ApiKeyContext = Depends(require_scope("runs:read")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Get a single run by ID, including full user details for creator, approver, and assignee."""
+    """Get a single run by ID, including full user details."""
     result = await session.execute(
         select(AgentRunModel).where(
             AgentRunModel.id == run_id,
@@ -239,7 +265,6 @@ async def list_candidates(
     offset: int = Query(0, ge=0),
 ) -> dict:
     """List payout candidates for a run."""
-    # Verify the run belongs to this business
     run_result = await session.execute(
         select(AgentRunModel).where(
             AgentRunModel.id == run_id,
@@ -272,45 +297,235 @@ async def list_candidates(
 
 
 # --------------------------------------------------------------------------- #
-# Approvals
+# Runs — create
 # --------------------------------------------------------------------------- #
 
-class ApprovalAction(BaseModel):
-    notes: Optional[str] = Field(None, max_length=500)
+class CreateRunCandidateInput(BaseModel):
+    beneficiary_name: str = Field(..., min_length=1, max_length=255)
+    account_number: str = Field(..., min_length=5, max_length=20)
+    institution_code: str = Field(..., min_length=1, max_length=10)
+    amount: float = Field(..., gt=0, description="Amount in NGN")
+    currency: str = Field("NGN", max_length=3)
+    purpose: Optional[str] = Field(None, max_length=255)
+    beneficiary_email: Optional[str] = Field(None, max_length=255)
 
 
-@router.post("/runs/{run_id}/approve", status_code=status.HTTP_200_OK)
-async def approve_run(
-    run_id: uuid.UUID,
-    body: ApprovalAction = ApprovalAction(),
-    ctx: ApiKeyContext = Depends(require_scope("approvals:write")),
-    session: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Disabled: approval must go through the secured internal workflow."""
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail=(
-            "Public API approval is disabled. "
-            "Use the internal approval workflow endpoint."
-        ),
+class CreateRunRequest(BaseModel):
+    objective: str = Field(..., min_length=1, max_length=2000,
+                           description="Describe what this payout run should do.")
+    date_from: Optional[str] = Field(None, description="ISO date string YYYY-MM-DD — start of the transaction date range.")
+    date_to: Optional[str] = Field(None, description="ISO date string YYYY-MM-DD — end of the transaction date range.")
+    risk_tolerance: float = Field(0.35, ge=0.0, le=1.0,
+                                  description="0.0 = block all risky, 1.0 = allow all. Default 0.35.")
+    budget_cap: Optional[float] = Field(None, gt=0, description="Maximum total payout amount for this run (NGN).")
+    candidates: Optional[List[CreateRunCandidateInput]] = Field(
+        None, description="Pre-seeded recipient list. If omitted the AI planner discovers candidates from the objective."
     )
 
 
-@router.post("/runs/{run_id}/reject", status_code=status.HTTP_200_OK)
-async def reject_run(
-    run_id: uuid.UUID,
-    body: ApprovalAction = ApprovalAction(),
-    ctx: ApiKeyContext = Depends(require_scope("approvals:write")),
+async def _run_pipeline_bg(run_id: uuid.UUID, state: dict) -> None:
+    """Background task: execute the AI pipeline with a dedicated DB session."""
+    factory = get_session_factory()
+    async with factory() as bg_session:
+        try:
+            from src.agents.orchestrator import RunOrchestrator
+            from src.agents.event_publisher import EventPublisher
+            publisher = EventPublisher(run_id, bg_session)
+            orch = RunOrchestrator(bg_session, publisher=publisher)
+            await orch.execute_run(run_id, state)
+        except Exception as exc:
+            logger.error("[PublicAPI] Background run %s failed: %s", run_id, exc)
+
+
+@router.post("/runs", status_code=status.HTTP_201_CREATED)
+async def create_run(
+    body: CreateRunRequest,
+    ctx: ApiKeyContext = Depends(require_scope("runs:write")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Disabled: rejection must go through the secured internal workflow."""
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail=(
-            "Public API rejection is disabled. "
-            "Use the internal approval workflow endpoint."
-        ),
+    """
+    Create a new payout run. The AI planning and risk-scoring agents are triggered
+    automatically after creation. The run starts in **pending** status and transitions
+    through planning → scoring → awaiting_approval → executing → completed.
+
+    Returns immediately — poll GET /runs/{run_id} or subscribe to webhooks to track progress.
+    Requires **runs:write** scope. Business KYC must be verified.
+    """
+    await _require_kyc_verified(ctx.business_id, session)
+
+    # Resolve business owner for created_by (required FK)
+    owner_result = await session.execute(
+        select(BusinessMemberModel)
+        .where(
+            BusinessMemberModel.business_id == ctx.business_id,
+            BusinessMemberModel.role == "owner",
+            BusinessMemberModel.is_active.is_(True),
+        )
+        .limit(1)
     )
+    owner = owner_result.scalars().first()
+    if not owner:
+        raise HTTPException(status_code=422, detail="No active owner found for this business.")
+
+    # Check AI credits
+    biz_result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == ctx.business_id)
+    )
+    biz = biz_result.scalar_one_or_none()
+    if not biz:
+        raise HTTPException(status_code=404, detail="Business not found.")
+
+    # Wallet pre-flight
+    wallet_result = await session.execute(
+        select(WalletModel).where(WalletModel.business_id == ctx.business_id)
+    )
+    wallet = wallet_result.scalar_one_or_none()
+    wallet_balance = wallet.balance if wallet else Decimal("0")
+
+    if body.candidates:
+        total_amount = sum(Decimal(str(c.amount)) for c in body.candidates)
+        if wallet_balance < total_amount:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient wallet balance. Required: ₦{total_amount:,.2f}, available: ₦{wallet_balance:,.2f}.",
+            )
+    elif body.budget_cap is not None:
+        if wallet_balance < Decimal(str(body.budget_cap)):
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient wallet balance for requested budget cap of ₦{body.budget_cap:,.2f}.",
+            )
+
+    # Atomic AI credit deduction
+    credit_update = await session.execute(
+        _sa_update(BusinessModel)
+        .where(
+            BusinessModel.id == ctx.business_id,
+            BusinessModel.ai_credit_balance > 0,
+        )
+        .values(ai_credit_balance=BusinessModel.ai_credit_balance - 1)
+        .returning(BusinessModel.id)
+        .execution_options(synchronize_session=False)
+    )
+    if credit_update.fetchone() is None:
+        raise HTTPException(
+            status_code=402,
+            detail="No AI processing credits remaining. Purchase a credit bundle to create new runs.",
+        )
+
+    # Parse optional date range
+    date_from: date | None = None
+    date_to: date | None = None
+    if body.date_from:
+        try:
+            date_from = date.fromisoformat(body.date_from)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_from — use YYYY-MM-DD.")
+    if body.date_to:
+        try:
+            date_to = date.fromisoformat(body.date_to)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_to — use YYYY-MM-DD.")
+
+    # Create run record
+    from src.config.settings import Settings as _S
+    run = AgentRunModel(
+        business_id=ctx.business_id,
+        created_by=owner.user_id,
+        objective=body.objective,
+        merchant_id=_S.INTERSWITCH_MERCHANT_ID,
+        date_from=date_from,
+        date_to=date_to,
+        risk_tolerance=Decimal(str(body.risk_tolerance)),
+        budget_cap=Decimal(str(body.budget_cap)) if body.budget_cap is not None else None,
+        status="pending",
+    )
+    session.add(run)
+    await session.flush()  # Get run.id before adding candidates
+
+    # Create candidate records
+    candidate_dicts: list[dict] = []
+    if body.candidates:
+        for c in body.candidates:
+            cand = PayoutCandidateModel(
+                run_id=run.id,
+                business_id=ctx.business_id,
+                beneficiary_name=c.beneficiary_name,
+                account_number=c.account_number,
+                institution_code=c.institution_code,
+                beneficiary_email=c.beneficiary_email,
+                amount=Decimal(str(c.amount)),
+                currency=c.currency or "NGN",
+                purpose=c.purpose,
+                approval_status="pending",
+                execution_status="not_started",
+            )
+            session.add(cand)
+        await session.flush()
+
+        # Re-query to get persisted IDs
+        cand_result = await session.execute(
+            select(PayoutCandidateModel).where(PayoutCandidateModel.run_id == run.id)
+        )
+        for p in cand_result.scalars().all():
+            candidate_dicts.append({
+                "candidate_id": str(p.id),
+                "institution_code": p.institution_code,
+                "beneficiary_name": p.beneficiary_name,
+                "account_number": p.account_number,
+                "beneficiary_email": p.beneficiary_email,
+                "amount": float(p.amount),
+                "currency": p.currency,
+                "purpose": p.purpose,
+            })
+
+    # AI credit audit log
+    credit_log = AiCreditTransactionModel(
+        business_id=ctx.business_id,
+        run_id=run.id,
+        type="debit",
+        credits=1,
+        description=f"API run: {body.objective[:80]}",
+    )
+    session.add(credit_log)
+    await session.commit()
+    await session.refresh(run)
+
+    # Build initial orchestrator state
+    state: dict = {
+        "run_id": str(run.id),
+        "business_id": str(ctx.business_id),
+        "objective": body.objective,
+        "constraints": None,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "risk_tolerance": body.risk_tolerance,
+        "budget_cap": body.budget_cap,
+        "merchant_id": _S.INTERSWITCH_MERCHANT_ID,
+        "plan_steps": [],
+        "transactions": [],
+        "reconciled_ledger": {},
+        "unresolved_references": [],
+        "resolved_references": [],
+        "scored_candidates": candidate_dicts,
+        "forecast": None,
+        "candidate_lookup_results": [],
+        "candidate_execution_results": [],
+        "batch_details": None,
+        "approved_candidate_ids": [],
+        "rejected_candidate_ids": [],
+        "audit_report": None,
+        "current_step": "created",
+        "error": None,
+        "audit_entries": [],
+        "reasoning_log": [],
+    }
+
+    # Fire the AI pipeline as a background task — return immediately
+    asyncio.create_task(_run_pipeline_bg(run.id, state))
+    logger.info("[PublicAPI] Created run %s via API key, pipeline launched.", run.id)
+
+    return _ser_run(run)
 
 
 # --------------------------------------------------------------------------- #
@@ -359,7 +574,6 @@ async def list_audit(
     offset: int = Query(0, ge=0),
 ) -> dict:
     """List audit log entries for your organisation's runs."""
-    # Join with agent_run to enforce business_id isolation
     base = (
         select(AuditLogModel)
         .join(AgentRunModel, AuditLogModel.run_id == AgentRunModel.id)
@@ -384,6 +598,130 @@ async def list_audit(
 
 
 # --------------------------------------------------------------------------- #
+# Recipients
+# --------------------------------------------------------------------------- #
+
+class CreateRecipientBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    account_number: str = Field(..., min_length=5, max_length=32)
+    institution_code: str = Field(..., min_length=1, max_length=16)
+    email: Optional[str] = Field(None, max_length=256)
+    notes: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+
+
+@router.get("/recipients")
+async def list_recipients(
+    ctx: ApiKeyContext = Depends(require_scope("recipients:read")),
+    session: AsyncSession = Depends(get_db_session),
+    search: Optional[str] = Query(None, max_length=256, description="Filter by name or account number"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """List saved recipients for your organisation."""
+    from sqlalchemy import or_
+    base = select(SavedRecipientModel).where(
+        SavedRecipientModel.business_id == ctx.business_id
+    )
+    if search:
+        term = f"%{search}%"
+        base = base.where(
+            or_(
+                SavedRecipientModel.name.ilike(term),
+                SavedRecipientModel.account_number.ilike(term),
+            )
+        )
+
+    total_result = await session.execute(
+        select(func.count()).select_from(base.subquery())
+    )
+    total = total_result.scalar_one()
+
+    rows_result = await session.execute(
+        base.order_by(SavedRecipientModel.name.asc()).limit(limit).offset(offset)
+    )
+    recipients = rows_result.scalars().all()
+
+    return paginate([_ser_recipient(r) for r in recipients], total, limit, offset)
+
+
+@router.post("/recipients", status_code=status.HTTP_201_CREATED)
+async def create_recipient(
+    body: CreateRecipientBody,
+    ctx: ApiKeyContext = Depends(require_scope("recipients:write")),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Create a saved recipient. Useful for syncing your HR or payee system."""
+    recipient = SavedRecipientModel(
+        business_id=ctx.business_id,
+        name=body.name,
+        account_number=body.account_number,
+        institution_code=body.institution_code,
+        email=body.email,
+        notes=body.notes,
+        tags=body.tags,
+    )
+    session.add(recipient)
+    await session.commit()
+    await session.refresh(recipient)
+    return _ser_recipient(recipient)
+
+
+@router.delete("/recipients/{recipient_id}", status_code=status.HTTP_200_OK)
+async def delete_recipient(
+    recipient_id: uuid.UUID,
+    ctx: ApiKeyContext = Depends(require_scope("recipients:write")),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Delete a saved recipient by ID."""
+    result = await session.execute(
+        select(SavedRecipientModel).where(
+            SavedRecipientModel.id == recipient_id,
+            SavedRecipientModel.business_id == ctx.business_id,
+        )
+    )
+    if not result.scalars().first():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recipient not found")
+
+    await session.execute(
+        _sa_delete(SavedRecipientModel).where(SavedRecipientModel.id == recipient_id)
+    )
+    await session.commit()
+    return {"status": "deleted", "id": str(recipient_id)}
+
+
+# --------------------------------------------------------------------------- #
+# Wallet
+# --------------------------------------------------------------------------- #
+
+@router.get("/wallet/balance")
+async def get_wallet_balance(
+    ctx: ApiKeyContext = Depends(require_scope("wallet:read")),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """
+    Return the current wallet balance for your organisation.
+    Useful for checking funds before creating a run.
+    """
+    wallet_result = await session.execute(
+        select(WalletModel).where(WalletModel.business_id == ctx.business_id)
+    )
+    wallet = wallet_result.scalar_one_or_none()
+
+    biz_result = await session.execute(
+        select(BusinessModel).where(BusinessModel.id == ctx.business_id)
+    )
+    biz = biz_result.scalar_one_or_none()
+
+    return {
+        "balance": float(wallet.balance) if wallet else 0.0,
+        "currency": wallet.currency if wallet else "NGN",
+        "ai_credit_balance": biz.ai_credit_balance if biz else 0,
+        "updated_at": wallet.updated_at.isoformat() if wallet and hasattr(wallet, "updated_at") else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Organisation profile
 # --------------------------------------------------------------------------- #
 
@@ -392,11 +730,7 @@ async def get_org_profile(
     ctx: ApiKeyContext = Depends(require_scope("runs:read")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return the organisation profile associated with this API key.
-
-    Includes virtual account details for wallet top-up, KYC status, and basic
-    configuration such as daily payout limits.
-    """
+    """Return the organisation profile associated with this API key."""
     biz_result = await session.execute(
         select(BusinessModel).where(BusinessModel.id == ctx.business_id)
     )
@@ -415,11 +749,9 @@ async def get_org_profile(
         "business_type": biz.business_type,
         "kyc_status": biz.kyc_status,
         "is_active": biz.is_active,
-        # Virtual account — fund wallet via bank transfer
         "virtual_account_number": biz.virtual_account_number,
         "virtual_account_bank": biz.virtual_account_bank,
         "virtual_account_name": biz.virtual_account_name,
-        # Financial limits from config
         "daily_payout_limit": float(config.daily_payout_limit) if config and config.daily_payout_limit else None,
         "single_payout_cap": float(config.single_payout_cap) if config and config.single_payout_cap else None,
         "risk_appetite": config.risk_appetite if config else None,
