@@ -1,11 +1,14 @@
 version: "3.8"
 
 services:
-  flowpilot:
+  # ── API Service ────────────────────────────────────────────────────────────
+  # Handles all HTTP requests. Lightweight — no background loops or agent work.
+  api:
     build: .
     env_file: .env
     ports:
       - "8000:8000"
+    command: uvicorn app.api.app:app --host 0.0.0.0 --port 8000
     depends_on:
       db:
         condition: service_healthy
@@ -14,7 +17,72 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=api
+    restart: unless-stopped
 
+  # ── Worker Service ─────────────────────────────────────────────────────────
+  # Runs all scheduled background tasks (cron loops, reminders, webhook health,
+  # API key expiry checks). Uses ARQ/Celery over Redis.
+  # Scale independently from the API when task volume grows.
+  worker:
+    build: .
+    env_file: .env
+    command: python -m app.worker
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=worker
+    restart: unless-stopped
+
+  # ── Agent Worker ───────────────────────────────────────────────────────────
+  # Runs the AI agent pipeline (plan → reconcile → risk-score → execute).
+  # Can be scaled horizontally: run multiple replicas to handle concurrent
+  # payout runs without impacting API latency.
+  agent-worker:
+    build: .
+    env_file: .env
+    command: python -m app.agent_worker
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=agent_worker
+    restart: unless-stopped
+
+  # ── Payment Service (Monnify) ──────────────────────────────────────────────
+  # Dedicated service for payment provider integration.
+  # Isolated so provider-specific failures do not affect other services.
+  # Uncomment and configure when Monnify migration is ready.
+  #
+  # payment-service:
+  #   build: .
+  #   env_file: .env
+  #   command: python -m app.payment_service
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   environment:
+  #     - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - SERVICE_ROLE=payment_service
+  #     - MONNIFY_API_KEY=${MONNIFY_API_KEY}
+  #     - MONNIFY_SECRET_KEY=${MONNIFY_SECRET_KEY}
+  #     - MONNIFY_CONTRACT_CODE=${MONNIFY_CONTRACT_CODE}
+  #     - MONNIFY_BASE_URL=${MONNIFY_BASE_URL:-https://api.monnify.com}
+  #   restart: unless-stopped
+
+  # ── Database ───────────────────────────────────────────────────────────────
   db:
     image: postgres:17
     environment:
@@ -31,6 +99,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Redis ──────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
