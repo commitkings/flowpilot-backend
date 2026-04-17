@@ -3,15 +3,19 @@ KYC tier limits — defines monthly payout allowance, single transaction cap,
 and maximum wallet balance for each account type × KYC level combination.
 
 Limits (all in NGN):
-  Individual L1 (NIN / BVN):              monthly 300k,  single 50k,   wallet 500k
-  Individual L2 (+ proof of address):     monthly 1m,    single 200k,  wallet 2m
-  Individual L3 (+ government photo ID):  monthly 3m,    single 500k,  wallet 5m
+  Individual L1 (NIN / BVN):              monthly 500k,   single 100k,  wallet 1m
+  Individual L2 (+ proof of address):     monthly 2m,     single 500k,  wallet 4m
+  Individual L3 (+ government photo ID):  monthly 5m,     single 1.5m,  wallet 10m
 
-  Business L1 (BVN + CAC):               monthly 1.5m,  single 300k,  wallet 3m
-  Business L2 (+ TIN + proof of address): monthly 10m,   single 2m,    wallet 20m
-  Business L3 (full docs):                monthly 50m,   single 5m,    wallet 100m
+  Business L1 (BVN + CAC):               monthly 5m,     single 2m,    wallet 10m
+  Business L2 (+ TIN + proof of address): monthly 30m,    single 10m,   wallet 60m
+  Business L3 (full docs):                monthly 100m,   single 20m,   wallet 200m
 
 Beyond Level 3, users must contact support.
+
+Rationale: FlowPilot is a bulk payroll platform. Limits are sized so that
+Business L1 covers small teams (≤25 staff), L2 covers mid-size payroll
+(≤100 staff), and L3 covers large/enterprise payroll (≤500 staff).
 """
 
 from decimal import Decimal
@@ -23,7 +27,7 @@ SUPPORT_EMAIL = "support@flowpilot.ng"
 
 class LimitTier(TypedDict):
     monthly: Decimal   # max cumulative successful payouts in a calendar month
-    single: Decimal    # max amount for a single payout
+    single: Decimal    # max amount for a single payout run (batch total)
     wallet: Decimal    # max wallet balance allowed
 
 
@@ -31,36 +35,36 @@ class LimitTier(TypedDict):
 KYC_LIMITS: dict[str, dict[int, LimitTier]] = {
     "individual": {
         1: {
-            "monthly": Decimal("300000"),
-            "single": Decimal("50000"),
-            "wallet": Decimal("500000"),
+            "monthly": Decimal("500000"),
+            "single":  Decimal("100000"),
+            "wallet":  Decimal("1000000"),
         },
         2: {
-            "monthly": Decimal("1000000"),
-            "single": Decimal("200000"),
-            "wallet": Decimal("2000000"),
+            "monthly": Decimal("2000000"),
+            "single":  Decimal("500000"),
+            "wallet":  Decimal("4000000"),
         },
         3: {
-            "monthly": Decimal("3000000"),
-            "single": Decimal("500000"),
-            "wallet": Decimal("5000000"),
+            "monthly": Decimal("5000000"),
+            "single":  Decimal("1500000"),
+            "wallet":  Decimal("10000000"),
         },
     },
     "business": {
         1: {
-            "monthly": Decimal("1500000"),
-            "single": Decimal("300000"),
-            "wallet": Decimal("3000000"),
+            "monthly": Decimal("5000000"),
+            "single":  Decimal("2000000"),
+            "wallet":  Decimal("10000000"),
         },
         2: {
-            "monthly": Decimal("10000000"),
-            "single": Decimal("2000000"),
-            "wallet": Decimal("20000000"),
+            "monthly": Decimal("30000000"),
+            "single":  Decimal("10000000"),
+            "wallet":  Decimal("60000000"),
         },
         3: {
-            "monthly": Decimal("50000000"),
-            "single": Decimal("5000000"),
-            "wallet": Decimal("100000000"),
+            "monthly": Decimal("100000000"),
+            "single":  Decimal("20000000"),
+            "wallet":  Decimal("200000000"),
         },
     },
 }
