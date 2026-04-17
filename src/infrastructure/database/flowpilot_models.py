@@ -1846,6 +1846,9 @@ class ScheduledRunModel(Base):
     last_reminded_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
+    # Stores the full payout configuration (date range, recipients, risk tolerance, etc.)
+    # so the edit form can be pre-populated.
+    run_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
     )

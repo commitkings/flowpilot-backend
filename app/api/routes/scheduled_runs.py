@@ -80,6 +80,14 @@ class CreateScheduledRunRequest(BaseModel):
     # Required for one_time — ISO 8601 UTC datetime for the single execution
     run_at: Optional[datetime] = None
 
+    # Optional payout configuration — stored so the edit form can pre-populate
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    risk_tolerance: Optional[float] = None
+    budget_cap: Optional[float] = None
+    assigned_approver_id: Optional[str] = None
+    candidates: Optional[list] = None
+
     @model_validator(mode="after")
     def _validate_by_type(self) -> "CreateScheduledRunRequest":
         if self.run_type == "recurring":
@@ -106,6 +114,8 @@ class PatchScheduledRunRequest(BaseModel):
     is_active: Optional[bool] = None
     # For one-time runs: reschedule to a new future datetime
     run_at: Optional[datetime] = None
+    # Payout config update
+    run_config: Optional[dict] = None
 
 
 def _serialize(r: ScheduledRunModel) -> dict:
@@ -120,6 +130,7 @@ def _serialize(r: ScheduledRunModel) -> dict:
         "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
         "last_reminded_at": r.last_reminded_at.isoformat() if r.last_reminded_at else None,
         "is_active": r.is_active,
+        "run_config": r.run_config,
         "created_at": r.created_at.isoformat(),
     }
 
@@ -139,6 +150,25 @@ async def list_scheduled_runs(
     )
     runs = result.scalars().all()
     return {"scheduled_runs": [_serialize(r) for r in runs]}
+
+
+@router.get("/runs/scheduled/{run_id}")
+async def get_scheduled_run(
+    run_id: uuid.UUID,
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    business_id = await _get_business_id(current_user, session)
+    result = await session.execute(
+        select(ScheduledRunModel).where(
+            ScheduledRunModel.id == run_id,
+            ScheduledRunModel.business_id == business_id,
+        )
+    )
+    run = result.scalars().first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Scheduled run not found")
+    return _serialize(run)
 
 
 @router.post("/runs/scheduled", status_code=status.HTTP_201_CREATED)
@@ -172,6 +202,14 @@ async def create_scheduled_run(
         next_run = body.run_at
         cron_expression = None
 
+    run_config: dict = {}
+    if body.date_from: run_config["date_from"] = body.date_from
+    if body.date_to: run_config["date_to"] = body.date_to
+    if body.risk_tolerance is not None: run_config["risk_tolerance"] = body.risk_tolerance
+    if body.budget_cap is not None: run_config["budget_cap"] = body.budget_cap
+    if body.assigned_approver_id: run_config["assigned_approver_id"] = body.assigned_approver_id
+    if body.candidates: run_config["candidates"] = body.candidates
+
     scheduled = ScheduledRunModel(
         business_id=business_id,
         created_by=current_user.id,
@@ -182,6 +220,7 @@ async def create_scheduled_run(
         frequency_label=body.frequency_label,
         next_run_at=next_run,
         is_active=True,
+        run_config=run_config or None,
     )
     session.add(scheduled)
     await session.commit()
@@ -281,6 +320,9 @@ async def update_scheduled_run(
             )
         values["cron_expression"] = body.cron_expression
         values["next_run_at"] = _next_run_from_cron(body.cron_expression)
+
+    if body.run_config is not None:
+        values["run_config"] = body.run_config
 
     # One-time: reschedule to a new future datetime
     if body.run_at is not None:
