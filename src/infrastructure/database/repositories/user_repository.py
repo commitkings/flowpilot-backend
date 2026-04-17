@@ -29,6 +29,8 @@ class UserRepository:
         display_name: str,
         avatar_url: Optional[str] = None,
         email_verified_at: Optional[datetime] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
     ) -> UserModel:
         """Create or update a user from an OAuth provider callback.
 
@@ -87,6 +89,10 @@ class UserRepository:
             "last_login_at": now,
             "is_active": True,
         }
+        if first_name:
+            insert_values["first_name"] = first_name
+        if last_name:
+            insert_values["last_name"] = last_name
         if email_verified_at is not None:
             insert_values["email_verified_at"] = email_verified_at
 

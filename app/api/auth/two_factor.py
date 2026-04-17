@@ -272,14 +272,10 @@ async def disable_2fa(
 
 @router.post("/verify")
 async def verify_mfa(
-    request: Request,
     body: VerifyMfaRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
     """Exchange a valid mfa_token + TOTP code for a full access token."""
-    ip = request.client.host if request.client else "unknown"
-    if not await _rate_ok(f"2fa-verify:{ip}", limit=10, window=60):
-        raise _TOO_MANY_2FA
     payload = decode_mfa_token(body.mfa_token)
     if not payload:
         raise HTTPException(
@@ -330,7 +326,7 @@ async def backup_code_login(
     The used backup code is removed from the stored list (single-use).
     """
     ip = request.client.host if request.client else "unknown"
-    if not await _rate_ok(f"2fa-backup:{ip}", limit=5, window=900):  # 5 per 15 min
+    if not await _rate_ok(f"2fa-backup:{ip}", limit=5, window_seconds=900):  # 5 per 15 min
         raise _TOO_MANY_2FA
     payload = decode_mfa_token(body.mfa_token)
     if not payload:

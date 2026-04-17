@@ -181,9 +181,12 @@ async def register_with_password(
             detail="An account with this email already exists",
         )
 
+    parts = body.name.strip().split(None, 1)
     new_user = UserModel(
         email=normalized,
         display_name=body.name.strip(),
+        first_name=parts[0] if parts else None,
+        last_name=parts[1] if len(parts) > 1 else None,
         password_hash=hash_password(body.password),
         is_active=True,
     )
@@ -664,6 +667,8 @@ async def google_callback(
         display_name=google_user.get("name", google_email),
         avatar_url=google_user.get("picture"),
         email_verified_at=datetime.now(_tz.utc),
+        first_name=google_user.get("given_name"),
+        last_name=google_user.get("family_name"),
     )
 
     # Reject disabled accounts
@@ -777,13 +782,6 @@ async def change_password(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid two-factor authentication code",
             )
-
-    errors = validate_password(body.new_password)
-    if errors:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=errors,
-        )
 
     repo = UserRepository(session)
     pw_hash = hash_password(body.new_password)

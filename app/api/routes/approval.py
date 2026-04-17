@@ -472,7 +472,15 @@ async def approve_candidates(
                 headers={"X-KYC-Status": "not_submitted"},
             )
 
-    # ── 4. Atomic CAS: awaiting_approval → executing ───────────────────────
+    # ── 4a. Idempotency guard: reject if this run already has a payout batch ──
+    existing_batches = await batch_repo.get_by_run(run_uuid)
+    if existing_batches:
+        raise HTTPException(
+            status_code=409,
+            detail="Run already has a payout batch — cannot re-execute",
+        )
+
+    # ── 4b. Atomic CAS: awaiting_approval → executing ──────────────────────
     acquired = await run_repo.transition_status(run_uuid, "awaiting_approval", "executing")
     if not acquired:
         run_fresh = await run_repo.get_by_id(run_uuid)
@@ -598,14 +606,6 @@ async def approve_candidates(
                     ))
             except Exception as _lb_exc:
                 logger.warning("[Wallet] Low-balance alert failed after approval debit: %s", _lb_exc)
-
-    # Idempotency guard: reject if this run already has a payout batch
-    existing_batches = await batch_repo.get_by_run(run_uuid)
-    if existing_batches:
-        raise HTTPException(
-            status_code=409,
-            detail="Run already has a payout batch — cannot re-execute",
-        )
 
     run = await run_repo.get_by_id(run_uuid)
 
