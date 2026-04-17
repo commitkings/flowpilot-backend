@@ -48,10 +48,18 @@ router = APIRouter(prefix="/developer", tags=["developer"])
 VALID_SCOPES = {
     "runs:read",
     "runs:write",
-    "transactions:read",
-    "audit:read",
     "approvals:read",
     "approvals:write",
+    "transactions:read",
+    "audit:read",
+    "wallet:read",
+    "wallet:write",
+    "recipients:read",
+    "recipients:write",
+    "scheduled_runs:read",
+    "scheduled_runs:write",
+    "webhooks:read",
+    "webhooks:write",
 }
 
 VALID_EVENTS = {
