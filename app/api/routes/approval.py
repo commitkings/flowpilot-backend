@@ -489,8 +489,9 @@ async def approve_candidates(
             detail=f"Run is not awaiting approval (status: {run_fresh.status if run_fresh else 'unknown'})",
         )
 
-    # ── 5. Wallet debit — debit approved total + 0.2 % platform fee ─────────
-    _PLATFORM_FEE_RATE = Decimal("0.002")
+    # ── 5. Wallet debit — debit approved total + 0.6 % platform fee (min ₦50) ─
+    _PLATFORM_FEE_RATE = Decimal("0.006")
+    _PLATFORM_FEE_MIN = Decimal("50.00")
     _wallet_balance_after: float | None = None
     if total_approved > 0:
         from src.infrastructure.database.repositories.wallet_repository import (
@@ -500,7 +501,7 @@ async def approve_candidates(
         )
         _wallet_repo = _WalletRepo(session)
         _total_decimal = Decimal(str(total_approved))
-        _fee_amount = (_total_decimal * _PLATFORM_FEE_RATE).quantize(Decimal("0.01"))
+        _fee_amount = max(_PLATFORM_FEE_MIN, (_total_decimal * _PLATFORM_FEE_RATE).quantize(Decimal("0.01")))
         try:
             # Debit payout amount
             _debit_tx, _ = await _wallet_repo.debit(
@@ -518,7 +519,7 @@ async def approve_candidates(
                     business_id=run.business_id,
                     amount=_fee_amount,
                     reference=f"platform_fee_{run_id}",
-                    description=f"Platform fee (0.2%): {run.objective[:60]}",
+                    description=f"Platform fee (0.6%, min ₦50): {run.objective[:60]}",
                     run_id=run_uuid,
                 )
                 _wallet_balance_after = float(_fee_tx.balance_after)

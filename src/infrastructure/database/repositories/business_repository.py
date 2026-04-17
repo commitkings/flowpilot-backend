@@ -59,6 +59,7 @@ class BusinessRepository:
             account_type=account_type,
             business_type=business_type,
             interswitch_merchant_id=interswitch_merchant_id,
+            ai_credit_balance=5,
         )
         self._s.add(business)
         await self._s.flush()  # assigns business.id

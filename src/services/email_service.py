@@ -975,6 +975,29 @@ async def send_api_key_reveal_otp_email(
     )
 
 
+async def send_pin_reset_otp_email(
+    to: str,
+    display_name: str,
+    code: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Send a 6-digit OTP to reset the approval PIN."""
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    html = _render(
+        "verify_email.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        code=code,
+    )
+    return await _send(
+        to=to,
+        subject="Reset your FlowPilot approval PIN — verification code",
+        html=html,
+    )
+
+
 async def send_account_deletion_code_email(
     to: str,
     display_name: str,
