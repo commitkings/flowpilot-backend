@@ -193,7 +193,13 @@ class WalletRepository:
             balance_after=wallet.balance,
         )
         self._session.add(tx)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError:
+            # Race on the unique reference constraint — another request won
+            await self._session.rollback()
+            existing = await self._existing_tx(reference)
+            return existing, False  # type: ignore[return-value]
 
         return tx, True
 
