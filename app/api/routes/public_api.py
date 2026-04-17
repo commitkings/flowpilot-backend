@@ -286,28 +286,14 @@ async def approve_run(
     ctx: ApiKeyContext = Depends(require_scope("approvals:write")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Approve a run that is awaiting approval."""
-    await _require_kyc_verified(ctx.business_id, session)
-    result = await session.execute(
-        select(AgentRunModel).where(
-            AgentRunModel.id == run_id,
-            AgentRunModel.business_id == ctx.business_id,
-        )
+    """Disabled: approval must go through the secured internal workflow."""
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            "Public API approval is disabled. "
+            "Use the internal approval workflow endpoint."
+        ),
     )
-    run = result.scalars().first()
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    if run.status != "awaiting_approval":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Run is not awaiting approval (current status: {run.status})",
-        )
-
-    run.status = "executing"
-    run.approved_at = datetime.now(timezone.utc)
-    await session.commit()
-
-    return {"run_id": str(run_id), "status": run.status, "approved_at": run.approved_at.isoformat()}
 
 
 @router.post("/runs/{run_id}/reject", status_code=status.HTTP_200_OK)
@@ -317,30 +303,14 @@ async def reject_run(
     ctx: ApiKeyContext = Depends(require_scope("approvals:write")),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Reject a run that is awaiting approval."""
-    await _require_kyc_verified(ctx.business_id, session)
-    result = await session.execute(
-        select(AgentRunModel).where(
-            AgentRunModel.id == run_id,
-            AgentRunModel.business_id == ctx.business_id,
-        )
+    """Disabled: rejection must go through the secured internal workflow."""
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            "Public API rejection is disabled. "
+            "Use the internal approval workflow endpoint."
+        ),
     )
-    run = result.scalars().first()
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    if run.status != "awaiting_approval":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Run is not awaiting approval (current status: {run.status})",
-        )
-
-    run.status = "cancelled"
-    run.cancelled_at = datetime.now(timezone.utc)
-    if body.notes:
-        run.error_message = body.notes
-    await session.commit()
-
-    return {"run_id": str(run_id), "status": run.status}
 
 
 # --------------------------------------------------------------------------- #

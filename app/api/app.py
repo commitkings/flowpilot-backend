@@ -8,27 +8,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api.routes.runs import router as runs_router
 from app.api.routes.account import router as account_router
-from app.api.routes.approval import router as approval_router
-from app.api.routes.approvals_queue import router as approvals_queue_router
-from app.api.routes.audit import router as audit_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.institutions import router as institutions_router
 from app.api.routes.notifications import router as notifications_router
-from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.org import router as org_router
 from app.api.routes.team import router as team_router
 from app.api.routes.transactions import router as transactions_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.developer import router as developer_router
 from app.api.routes.org_config import router as org_config_router
-from app.api.routes.scheduled_runs import router as scheduled_runs_router
 from app.api.routes.public_api import router as public_api_router
-from app.api.routes.kyc import router as kyc_router
-from app.api.routes.wallet import router as wallet_router
 from app.api.routes.files import router as files_router
 from app.api.routes.recipients import router as recipients_router
+from app.api.routes.monnify_webhooks import router as monnify_webhooks_router
 from app.api.auth import auth_router, two_factor_router
 from app.api.auth.approval_pin import router as approval_pin_router
 from app.api.middleware import LoggingMiddleware
@@ -60,18 +53,21 @@ def _validate_payout_config() -> None:
             "Set PAYOUT_MODE=live with valid credentials to enable real payouts."
         )
 
+    if Settings.is_production() and Settings.has_weak_jwt_secret():
+        raise RuntimeError(
+            "Weak JWT_SECRET detected in production. "
+            "Set a strong secret (>=32 chars) and restart."
+        )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("FlowPilot API starting up")
     _validate_payout_config()
     await init_db()
-    from src.services.scheduler import start_scheduler, stop_scheduler
-    start_scheduler()
     try:
         yield
     finally:
-        stop_scheduler()
         await close_db()
         logger.info("FlowPilot API shutting down")
 
@@ -79,7 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 _is_prod = Settings.is_production()
 app = FastAPI(
     title="FlowPilot",
-    description="Multi-agent fintech execution system powered by Interswitch APIs",
+    description="Multi-agent fintech execution system powered by Monnify APIs",
     version="0.1.0",
     lifespan=lifespan,
     docs_url=None if _is_prod else "/docs",
@@ -128,17 +124,8 @@ app.include_router(two_factor_router, prefix="/api/v1/auth", tags=["2fa"])
 app.include_router(approval_pin_router, prefix="/api/v1", tags=["approval-pin"])
 app.include_router(account_router, prefix="/api/v1", tags=["account"])
 app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
-# IMPORTANT: scheduled_runs_router must be included BEFORE runs_router.
-# The runs router has GET /runs/{run_id} which would match /runs/scheduled
-# as run_id="scheduled" and raise a 400, shadowing the correct route.
-app.include_router(scheduled_runs_router, prefix="/api/v1", tags=["scheduled-runs"])
-app.include_router(runs_router, prefix="/api/v1", tags=["runs"])
-app.include_router(approval_router, prefix="/api/v1", tags=["approval"])
-app.include_router(approvals_queue_router, prefix="/api/v1", tags=["approvals-queue"])
-app.include_router(audit_router, prefix="/api/v1", tags=["audit"])
 app.include_router(institutions_router, prefix="/api/v1", tags=["institutions"])
 app.include_router(notifications_router, prefix="/api/v1", tags=["notifications"])
-app.include_router(onboarding_router, prefix="/api/v1", tags=["onboarding"])
 app.include_router(org_router, prefix="/api/v1", tags=["org"])
 app.include_router(team_router, prefix="/api/v1", tags=["team"])
 app.include_router(transactions_router, prefix="/api/v1", tags=["transactions"])
@@ -146,10 +133,9 @@ app.include_router(dashboard_router, prefix="/api/v1", tags=["dashboard"])
 app.include_router(developer_router, prefix="/api/v1", tags=["developer"])
 app.include_router(org_config_router, prefix="/api/v1", tags=["org-config"])
 app.include_router(public_api_router, prefix="/api/v1", tags=["public-api"])
-app.include_router(kyc_router, prefix="/api/v1", tags=["kyc"])
-app.include_router(wallet_router, prefix="/api/v1", tags=["wallet"])
 app.include_router(files_router, prefix="/api/v1", tags=["files"])
 app.include_router(recipients_router, prefix="/api/v1", tags=["recipients"])
+app.include_router(monnify_webhooks_router, prefix="/api/v1", tags=["monnify-webhooks"])
 
 # Serve uploaded files (avatars, etc.)
 from fastapi.staticfiles import StaticFiles

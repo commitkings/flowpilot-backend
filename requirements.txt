@@ -35,3 +35,6 @@ qrcode[pil]==8.0
 
 # Scheduled runs
 croniter==3.0.3
+
+# Task Queues
+arq==0.26.1

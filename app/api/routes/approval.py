@@ -11,6 +11,7 @@ from app.api.auth.role_deps import require_role
 from app.api.routes.runs import _parse_uuid, _running_states
 from src.services.email_service import send_run_completed_email
 from src.infrastructure.database.repositories.notification_repository import NotificationRepository
+from src.services.compliance_service import ComplianceService, TravelRuleViolationError
 from src.agents.orchestrator import RunOrchestrator, _map_transactions
 from src.agents.event_publisher import EventPublisher
 from src.agents.state import AgentState
@@ -385,6 +386,8 @@ async def approve_candidates(
     selected_candidates = [
         candidates_by_id[str(cid)] for cid in candidate_ids if str(cid) in candidates_by_id
     ]
+    if len(selected_candidates) != len(candidate_ids):
+        raise HTTPException(status_code=400, detail="One or more candidate_ids are invalid for this run.")
     total_approved = sum(float(c.amount) for c in selected_candidates)
 
     if run.budget_cap is not None and total_approved > float(run.budget_cap):
@@ -395,6 +398,19 @@ async def approve_candidates(
                 f"(₦{float(run.budget_cap):,.2f}). Reduce the selection or increase the budget cap."
             ),
         )
+
+    # ── 3a. Travel Rule hard-block compliance gate ──────────────────────────
+    compliance_service = ComplianceService(session)
+    try:
+        for candidate in selected_candidates:
+            await compliance_service.enforce_and_record(
+                run_id=run_uuid,
+                business_id=run.business_id,
+                candidate_id=candidate.id,
+            )
+    except TravelRuleViolationError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # ── 3b. KYC payout limits — single transaction cap + monthly cap ────────
     from decimal import Decimal as _D
@@ -491,6 +507,7 @@ async def approve_candidates(
 
     # ── 5. Wallet debit — debit approved total + 0.2 % platform fee ─────────
     _PLATFORM_FEE_RATE = Decimal("0.002")
+    _MIN_PLATFORM_FEE = Decimal("50.00")
     _wallet_balance_after: float | None = None
     if total_approved > 0:
         from src.infrastructure.database.repositories.wallet_repository import (
@@ -501,6 +518,8 @@ async def approve_candidates(
         _wallet_repo = _WalletRepo(session)
         _total_decimal = Decimal(str(total_approved))
         _fee_amount = (_total_decimal * _PLATFORM_FEE_RATE).quantize(Decimal("0.01"))
+        if _fee_amount < _MIN_PLATFORM_FEE:
+            _fee_amount = _MIN_PLATFORM_FEE
         try:
             # Debit payout amount
             _debit_tx, _ = await _wallet_repo.debit(

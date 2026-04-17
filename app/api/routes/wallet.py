@@ -198,6 +198,14 @@ async def topup_wallet(
     _=Depends(require_role("owner")),
     _kyc=Depends(require_verified_kyc),
 ):
+    if Settings.PAYOUT_PROVIDER == "monnify":
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Direct wallet top-up endpoint is disabled. "
+                "Fund your reserved Monnify account; wallet credits are applied via webhook."
+            ),
+        )
     try:
         business_uuid = uuid.UUID(business_id)
     except ValueError:

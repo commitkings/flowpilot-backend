@@ -35,9 +35,6 @@ from src.infrastructure.database.flowpilot_models import (
     UserModel,
 )
 from src.config.kyc_limits import KYC_LIMITS, SUPPORT_EMAIL, get_limits
-from src.infrastructure.database.repositories.business_repository import (
-    _generate_virtual_account_number,
-)
 from src.infrastructure.database.repositories.notification_repository import (
     NotificationRepository,
 )
@@ -45,6 +42,7 @@ from src.infrastructure.storage import s3_client
 from src.infrastructure.storage.s3_client import validate_document, get_presigned_url
 from src.services import email_service
 from src.config.settings import Settings
+from src.services.payment_service import PaymentService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/kyc", tags=["kyc"])
@@ -106,7 +104,6 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                     .values(status="verified", verified_at=now, updated_at=now)
                 )
 
-                # Assign virtual account on KYC approval (first-time only)
                 biz_result = await session.execute(
                     select(BusinessModel).where(BusinessModel.id == bid)
                 )
@@ -116,10 +113,6 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                     "kyc_level": 1,  # Business full submission = Level 1
                     "updated_at": now,
                 }
-                if biz and not biz.virtual_account_number:
-                    va_updates["virtual_account_number"] = _generate_virtual_account_number(bid)
-                    va_updates["virtual_account_bank"] = "FlowPilot Microfinance Bank"
-                    va_updates["virtual_account_name"] = business_name[:30]
                 await session.execute(
                     update(BusinessModel)
                     .where(BusinessModel.id == bid)
@@ -414,18 +407,9 @@ async def submit_kyc(
         )
     )
 
-    asyncio.create_task(
-        _auto_verify_kyc(
-            business_id=str(biz.id),
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-            business_name=biz.business_name,
-        )
-    )
-
     return {
         "status": "pending",
-        "message": "KYC documents submitted. You'll be notified once the review is complete.",
+        "message": "KYC documents submitted and queued for verification.",
         "submitted_docs": submitted_docs,
     }
 
@@ -596,11 +580,6 @@ async def _auto_verify_individual_kyc(
                         "kyc_status": "verified",
                         "updated_at": now,
                     }
-                    # Assign virtual account on first KYC approval
-                    if not biz.virtual_account_number:
-                        biz_updates["virtual_account_number"] = _generate_virtual_account_number(bid)
-                        biz_updates["virtual_account_bank"] = "FlowPilot Microfinance Bank"
-                        biz_updates["virtual_account_name"] = (biz.business_name or "Individual")[:30]
                     await session.execute(
                         update(BusinessModel).where(BusinessModel.id == bid).values(**biz_updates)
                     )
@@ -708,16 +687,50 @@ async def submit_individual_kyc_level1(
             level_name=f"Identity ({id_type.upper()})",
         )
     )
-    asyncio.create_task(
-        _auto_verify_individual_kyc(
-            business_id=str(biz.id),
-            level=1,
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-        )
-    )
+    # Real verification with Monnify
+    payment_service = PaymentService()
+    passed = False
+    try:
+        if id_type == "bvn":
+            match_status = await payment_service.bvn_match(
+                bvn=id_value,
+                name=user.display_name or user.email,
+                date_of_birth=(user.date_of_birth.isoformat() if user.date_of_birth else "1990-01-01"),
+            )
+            passed = match_status in ("EXACT_MATCH", "PARTIAL_MATCH")
+        else:
+            nin = await payment_service.nin_lookup(
+                nin=id_value,
+                date_of_birth=(user.date_of_birth.isoformat() if user.date_of_birth else "1990-01-01"),
+            )
+            passed = bool(nin)
+    except Exception as exc:
+        logger.warning("Monnify KYC verification failed for business=%s: %s", biz.id, exc)
+        passed = False
 
-    return {"status": "pending", "message": f"{id_type.upper()} submitted for verification."}
+    now2 = datetime.now(timezone.utc)
+    ind.level_1_status = "verified" if passed else "rejected"
+    ind.level_1_verified_at = now2 if passed else None
+    if passed:
+        biz.kyc_level = max(getattr(biz, "kyc_level", 0) or 0, 1)
+        biz.kyc_status = "verified"
+        if id_type == "bvn" and biz.virtual_account_reference:
+            try:
+                await payment_service.attach_bvn(
+                    account_reference=biz.virtual_account_reference or f"fp-{biz.id}",
+                    bvn=id_value,
+                )
+            except Exception as exc:
+                logger.warning("Failed attaching BVN to reserved account for %s: %s", biz.id, exc)
+    else:
+        biz.kyc_status = "rejected"
+    biz.updated_at = now2
+    await session.commit()
+
+    return {
+        "status": ind.level_1_status,
+        "message": f"{id_type.upper()} verification {ind.level_1_status}.",
+    }
 
 
 @router.post("/individual/level2")
@@ -793,16 +806,7 @@ async def submit_individual_kyc_level2(
             level_name="Address",
         )
     )
-    asyncio.create_task(
-        _auto_verify_individual_kyc(
-            business_id=str(biz.id),
-            level=2,
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-        )
-    )
-
-    return {"status": "pending", "message": "Address verification submitted."}
+    return {"status": "pending", "message": "Address verification submitted and queued for review."}
 
 
 @router.post("/individual/level3")
@@ -886,13 +890,4 @@ async def submit_individual_kyc_level3(
             level_name="Government ID",
         )
     )
-    asyncio.create_task(
-        _auto_verify_individual_kyc(
-            business_id=str(biz.id),
-            level=3,
-            owner_email=user.email,
-            owner_name=user.display_name or user.email,
-        )
-    )
-
-    return {"status": "pending", "message": "Government ID submitted for Level 3 verification."}
+    return {"status": "pending", "message": "Government ID submitted for Level 3 review."}

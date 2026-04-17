@@ -257,6 +257,8 @@ def _build_execution_tools(
             exec_result = {
                 "candidate_id": candidate_id,
                 "execution_status": exec_status,
+                "provider": "monnify",
+                "provider_status": item_status or "PENDING",
                 "client_reference": candidate_id,
                 "provider_reference": provider_ref,
                 "response_message": resp_item.get("responseMessage", ""),
@@ -303,6 +305,8 @@ def _build_execution_tools(
             exec_result = {
                 "candidate_id": candidate_id,
                 "execution_status": "failed",
+                "provider": "monnify",
+                "provider_status": "FAILED",
                 "client_reference": candidate_id,
                 "provider_reference": None,
                 "response_message": str(e),

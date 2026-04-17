@@ -921,6 +921,7 @@ async def send_receipt_email(
     total_deducted: float,
     fee_rate_pct: float,
     successful_count: int,
+    fee_rule_label: str = "0.2% or ₦50 (whichever is higher)",
     approved_by: Optional[str] = None,
 ) -> bool:
     """Send a payment receipt to a recipient or vendor email address.
@@ -940,6 +941,7 @@ async def send_receipt_email(
         platform_fee=f"{platform_fee:,.2f}",
         total_deducted=f"{total_deducted:,.2f}",
         fee_rate_pct=f"{fee_rate_pct:.1f}",
+        fee_rule_label=fee_rule_label,
         successful_count=successful_count,
         approved_by=approved_by,
     )

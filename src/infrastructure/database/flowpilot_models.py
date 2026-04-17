@@ -232,6 +232,8 @@ class BusinessModel(Base):
         String(128), server_default=text("'FlowPilot Microfinance Bank'"), nullable=True
     )
     virtual_account_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    virtual_account_bank_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    virtual_account_reference: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )
@@ -769,6 +771,10 @@ class PayoutCandidateModel(Base):
     )
     client_reference: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
     provider_reference: Mapped[Optional[str]] = mapped_column(String(100))
+    provider: Mapped[Optional[str]] = mapped_column(String(32))
+    provider_status: Mapped[Optional[str]] = mapped_column(String(32))
+    monnify_reference: Mapped[Optional[str]] = mapped_column(String(100))
+    monnify_status: Mapped[Optional[str]] = mapped_column(String(20))
     transaction_reference: Mapped[Optional[str]] = mapped_column(String(255))
     executed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 
@@ -813,6 +819,7 @@ class PayoutCandidateModel(Base):
         Index("payout_candidate_institution_code_idx", "institution_code"),
         Index("payout_candidate_batch_id_idx", "batch_id"),
         Index("payout_candidate_approved_by_idx", "approved_by"),
+        Index("payout_candidate_provider_reference_idx", "provider_reference"),
         Index(
             "payout_candidate_risk_reasons_idx",
             "risk_reasons",
@@ -2106,6 +2113,8 @@ class WalletTransactionModel(Base):
     # Unique key for idempotency — prevents double-processing the same operation
     reference: Mapped[str] = mapped_column(String(255), unique=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
+    provider: Mapped[Optional[str]] = mapped_column(String(32))
+    provider_reference: Mapped[Optional[str]] = mapped_column(String(255))
     # Set when this debit is linked to a specific run
     run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
@@ -2218,6 +2227,66 @@ class SavedRecipientModel(Base):
     )
 
     business: Mapped["BusinessModel"] = relationship()
+
+
+# --------------------------------------------------------------------------- #
+# payout_compliance_record — FATF Travel Rule data snapshot (Rule 16)
+# --------------------------------------------------------------------------- #
+class PayoutComplianceRecordModel(Base):
+    __tablename__ = "payout_compliance_record"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    candidate_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("payout_candidate.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    originator_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    originator_wallet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    originator_bvn: Mapped[str] = mapped_column(String(20), nullable=False)
+    originator_address: Mapped[str] = mapped_column(Text, nullable=False)
+    beneficiary_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    beneficiary_account_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    beneficiary_bank_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    beneficiary_bank_name: Mapped[Optional[str]] = mapped_column(String(128))
+    beneficiary_address: Mapped[Optional[str]] = mapped_column(Text)
+    validation_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'passed'")
+    )
+    blocking_reason: Mapped[Optional[str]] = mapped_column(Text)
+    validated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "validation_status IN ('passed', 'blocked')",
+            name="payout_compliance_record_validation_status_check",
+        ),
+        Index("payout_compliance_record_run_id_idx", "run_id"),
+        Index("payout_compliance_record_business_id_idx", "business_id"),
+    )
 
 
 # =========================================================================== #

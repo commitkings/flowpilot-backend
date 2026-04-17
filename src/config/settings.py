@@ -137,7 +137,7 @@ class Settings:
         return url
 
     # ------------------------------------------------------------------
-    # Interswitch API
+    # Interswitch API (legacy)
     # ------------------------------------------------------------------
     INTERSWITCH_BASE_URL: str = os.getenv("INTERSWITCH_BASE_URL", "https://qa.interswitchng.com")
     INTERSWITCH_PAYOUTS_BASE_URL: str = os.getenv(
@@ -171,6 +171,17 @@ class Settings:
 
     _VALID_PAYOUT_MODES = ("simulated", "lookup_only", "live")
     PAYOUT_MODE: str = os.getenv("PAYOUT_MODE", "simulated")
+    PAYOUT_PROVIDER: str = os.getenv("PAYOUT_PROVIDER", "monnify").lower()
+
+    # ------------------------------------------------------------------
+    # Monnify API
+    # ------------------------------------------------------------------
+    MONNIFY_BASE_URL: str = os.getenv("MONNIFY_BASE_URL", "https://sandbox.monnify.com")
+    MONNIFY_API_KEY: Optional[str] = os.getenv("MONNIFY_API_KEY")
+    MONNIFY_SECRET_KEY: Optional[str] = os.getenv("MONNIFY_SECRET_KEY")
+    MONNIFY_CONTRACT_CODE: Optional[str] = os.getenv("MONNIFY_CONTRACT_CODE")
+    MONNIFY_SOURCE_ACCOUNT_NUMBER: Optional[str] = os.getenv("MONNIFY_SOURCE_ACCOUNT_NUMBER")
+    INTERNAL_SERVICE_TOKEN: Optional[str] = os.getenv("INTERNAL_SERVICE_TOKEN")
 
     @classmethod
     def get_interswitch_access_token(cls) -> Optional[str]:
@@ -185,6 +196,12 @@ class Settings:
     @classmethod
     def is_payout_configured(cls) -> bool:
         """Check if wallet-based payout credentials are set."""
+        if cls.PAYOUT_PROVIDER == "monnify":
+            return bool(
+                cls.MONNIFY_API_KEY
+                and cls.MONNIFY_SECRET_KEY
+                and cls.MONNIFY_CONTRACT_CODE
+            )
         return cls.is_interswitch_configured() and bool(cls.INTERSWITCH_WALLET_ID and cls.INTERSWITCH_WALLET_PIN)
 
     @classmethod
@@ -319,6 +336,14 @@ class Settings:
     @classmethod
     def is_production(cls) -> bool:
         return cls.ENVIRONMENT.lower() == "production"
+
+    @classmethod
+    def has_weak_jwt_secret(cls) -> bool:
+        secret = cls.JWT_SECRET or ""
+        return (
+            secret == "flowpilot-dev-secret-change-me"
+            or len(secret) < 32
+        )
 
 
 @lru_cache()

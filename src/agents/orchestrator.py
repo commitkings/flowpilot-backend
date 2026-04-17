@@ -824,6 +824,8 @@ class RunOrchestrator:
                     execution_status=exec_status,
                     client_reference=er.get("client_reference"),
                     provider_reference=er.get("provider_reference"),
+                    provider=er.get("provider", "monnify"),
+                    provider_status=er.get("provider_status", exec_status.upper()),
                     batch_id=batch_id if was_submitted else None,
                     executed_at=now if was_submitted else None,
                 )

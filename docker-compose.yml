@@ -3,12 +3,42 @@ version: "3.8"
 services:
   # ── API Service ────────────────────────────────────────────────────────────
   # Handles all HTTP requests. Lightweight — no background loops or agent work.
-  api:
+  gateway:
     build: .
     env_file: .env
     ports:
       - "8000:8000"
-    command: uvicorn app.api.app:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.gateway_service:app --host 0.0.0.0 --port 8000
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      core-api:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      wallet-service:
+        condition: service_started
+      kyc-service:
+        condition: service_started
+      orchestration-service:
+        condition: service_started
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=gateway
+      - CORE_API_URL=http://core-api:8500
+      - PAYMENT_SERVICE_URL=http://payment-service:8100
+      - WALLET_SERVICE_URL=http://wallet-service:8200
+      - KYC_SERVICE_URL=http://kyc-service:8300
+      - ORCHESTRATION_SERVICE_URL=http://orchestration-service:8400
+    restart: unless-stopped
+
+  core-api:
+    build: .
+    env_file: .env
+    command: uvicorn app.api.app:app --host 0.0.0.0 --port 8500
     depends_on:
       db:
         condition: service_healthy
@@ -17,7 +47,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
-      - SERVICE_ROLE=api
+      - SERVICE_ROLE=core_api
     restart: unless-stopped
 
   # ── Worker Service ─────────────────────────────────────────────────────────
@@ -61,27 +91,70 @@ services:
   # ── Payment Service (Monnify) ──────────────────────────────────────────────
   # Dedicated service for payment provider integration.
   # Isolated so provider-specific failures do not affect other services.
-  # Uncomment and configure when Monnify migration is ready.
-  #
-  # payment-service:
-  #   build: .
-  #   env_file: .env
-  #   command: python -m app.payment_service
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   environment:
-  #     - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - SERVICE_ROLE=payment_service
-  #     - MONNIFY_API_KEY=${MONNIFY_API_KEY}
-  #     - MONNIFY_SECRET_KEY=${MONNIFY_SECRET_KEY}
-  #     - MONNIFY_CONTRACT_CODE=${MONNIFY_CONTRACT_CODE}
-  #     - MONNIFY_BASE_URL=${MONNIFY_BASE_URL:-https://api.monnify.com}
-  #   restart: unless-stopped
+  payment-service:
+    build: .
+    env_file: .env
+    command: uvicorn app.payment_service:app --host 0.0.0.0 --port 8100
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=payment_service
+      - MONNIFY_API_KEY=${MONNIFY_API_KEY}
+      - MONNIFY_SECRET_KEY=${MONNIFY_SECRET_KEY}
+      - MONNIFY_CONTRACT_CODE=${MONNIFY_CONTRACT_CODE}
+      - MONNIFY_BASE_URL=${MONNIFY_BASE_URL:-https://api.monnify.com}
+    restart: unless-stopped
 
+  wallet-service:
+    build: .
+    env_file: .env
+    command: uvicorn app.wallet_service:app --host 0.0.0.0 --port 8200
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=wallet_service
+    restart: unless-stopped
+
+  kyc-service:
+    build: .
+    env_file: .env
+    command: uvicorn app.kyc_service:app --host 0.0.0.0 --port 8300
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=kyc_service
+    restart: unless-stopped
+
+  orchestration-service:
+    build: .
+    env_file: .env
+    command: uvicorn app.orchestration_service:app --host 0.0.0.0 --port 8400
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+      - REDIS_URL=redis://redis:6379/0
+      - SERVICE_ROLE=orchestration_service
+    restart: unless-stopped
+  
   # ── Database ───────────────────────────────────────────────────────────────
   db:
     image: postgres:17

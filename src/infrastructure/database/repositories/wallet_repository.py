@@ -120,7 +120,8 @@ class WalletRepository:
         if existing:
             return existing, False
 
-        wallet = await self.get_or_create(business_id)
+        await self.get_or_create(business_id)
+        wallet = await self._get_locked(business_id)
         balance_before = wallet.balance
         wallet.balance += amount
         wallet.updated_at = datetime.now(timezone.utc)

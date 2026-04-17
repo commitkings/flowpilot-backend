@@ -20,12 +20,21 @@ def get_payout_gateway() -> PayoutGateway:
 
     mode = Settings.PAYOUT_MODE.lower()
 
-    if mode == "live":
+    provider = Settings.PAYOUT_PROVIDER
+
+    if mode == "live" and provider == "monnify":
+        from src.infrastructure.external_services.monnify.gateway import (
+            MonnifyPayoutGateway,
+        )
+
+        _cached_gateway = MonnifyPayoutGateway()
+        logger.info("PayoutGateway: LIVE mode via Monnify")
+    elif mode == "live":
         from src.infrastructure.external_services.interswitch.live_gateway import (
             LivePayoutGateway,
         )
         _cached_gateway = LivePayoutGateway()
-        logger.info("PayoutGateway: LIVE mode — real Interswitch calls enabled")
+        logger.warning("PayoutGateway: LIVE mode via legacy Interswitch")
     elif mode == "lookup_only":
         from src.infrastructure.external_services.interswitch.hybrid_gateway import (
             HybridPayoutGateway,

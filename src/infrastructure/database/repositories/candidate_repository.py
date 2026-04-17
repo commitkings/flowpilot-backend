@@ -138,6 +138,8 @@ class CandidateRepository:
         execution_status: str,
         client_reference: str | None = None,
         provider_reference: str | None = None,
+        provider: str | None = None,
+        provider_status: str | None = None,
         transaction_reference: str | None = None,
         batch_id: UUID | None = None,
         executed_at=None,
@@ -147,6 +149,12 @@ class CandidateRepository:
             values["client_reference"] = client_reference
         if provider_reference is not None:
             values["provider_reference"] = provider_reference
+            values["monnify_reference"] = provider_reference
+        if provider is not None:
+            values["provider"] = provider
+        if provider_status is not None:
+            values["provider_status"] = provider_status
+            values["monnify_status"] = provider_status
         if transaction_reference is not None:
             values["transaction_reference"] = transaction_reference
         if batch_id is not None:

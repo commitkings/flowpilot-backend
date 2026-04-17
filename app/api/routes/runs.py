@@ -1728,7 +1728,8 @@ async def send_receipt_email_endpoint(
     successful = [c for c in all_candidates if c.execution_status == "success"]
     payout_total = float(sum(c.amount for c in successful))
     platform_fee_rate = float(run.platform_fee_rate) if run.platform_fee_rate else 0.002
-    platform_fee = float(run.platform_fee_amount) if run.platform_fee_amount else round(payout_total * platform_fee_rate, 2)
+    computed_fee = round(payout_total * platform_fee_rate, 2)
+    platform_fee = float(run.platform_fee_amount) if run.platform_fee_amount else max(computed_fee, 50.0)
     total_deducted = payout_total + platform_fee
 
     receipt_date = (run.approved_at or run.started_at or _dt.datetime.now(_dt.timezone.utc)).strftime(
@@ -1747,6 +1748,7 @@ async def send_receipt_email_endpoint(
         platform_fee=platform_fee,
         total_deducted=total_deducted,
         fee_rate_pct=platform_fee_rate * 100,
+        fee_rule_label="0.2% or ₦50 (whichever is higher)",
         successful_count=len(successful),
         approved_by=approved_by_name,
     )

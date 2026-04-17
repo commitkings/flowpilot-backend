@@ -20,6 +20,7 @@ from src.infrastructure.database.repositories.notification_repository import (
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_welcome_email
+from src.services.payment_service import PaymentService
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,30 @@ async def complete_onboarding(
     )
 
     logger.info("Onboarding complete for user=%s business=%s", current_user.id, business.id)
+
+    # Create reserved account via Monnify for wallet funding
+    try:
+        payment_service = PaymentService()
+        account_reference = f"fp-{business.id}"
+        account_name = (
+            body.business_name if body.account_type == "business" else current_user.display_name
+        )
+        va_response = await payment_service.create_reserved_account(
+            account_reference=account_reference,
+            account_name=account_name,
+            customer_email=current_user.email,
+        )
+        va_body = va_response.get("responseBody", {})
+        accounts = va_body.get("accounts", [])
+        account = accounts[0] if accounts else {}
+        business.virtual_account_number = account.get("accountNumber")
+        business.virtual_account_bank = account.get("bankName")
+        business.virtual_account_bank_code = account.get("bankCode")
+        business.virtual_account_reference = va_body.get("reservedAccountCode") or account_reference
+        business.virtual_account_name = account_name
+        await session.commit()
+    except Exception as exc:
+        logger.warning("Monnify reserved account creation failed for %s: %s", business.id, exc)
 
     # Create welcome notification
     notif_repo = NotificationRepository(session)
