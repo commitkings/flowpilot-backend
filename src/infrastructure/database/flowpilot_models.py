@@ -2170,6 +2170,56 @@ class AiCreditTransactionModel(Base):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Saved recipient — persisted beneficiary address book per business
+# --------------------------------------------------------------------------- #
+class SavedRecipientModel(Base):
+    __tablename__ = "saved_recipient"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("business.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    account_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    institution_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tags: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    payment_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    last_paid_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("saved_recipient_business_id_idx", "business_id"),
+        Index(
+            "saved_recipient_business_account_idx",
+            "business_id",
+            "account_number",
+            "institution_code",
+        ),
+    )
+
+    business: Mapped["BusinessModel"] = relationship()
+
+
 # =========================================================================== #
 #  Backward-compatibility aliases (for existing imports)
 # =========================================================================== #

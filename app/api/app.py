@@ -28,6 +28,7 @@ from app.api.routes.public_api import router as public_api_router
 from app.api.routes.kyc import router as kyc_router
 from app.api.routes.wallet import router as wallet_router
 from app.api.routes.files import router as files_router
+from app.api.routes.recipients import router as recipients_router
 from app.api.auth import auth_router, two_factor_router
 from app.api.auth.approval_pin import router as approval_pin_router
 from app.api.middleware import LoggingMiddleware
@@ -148,6 +149,7 @@ app.include_router(public_api_router, prefix="/api/v1", tags=["public-api"])
 app.include_router(kyc_router, prefix="/api/v1", tags=["kyc"])
 app.include_router(wallet_router, prefix="/api/v1", tags=["wallet"])
 app.include_router(files_router, prefix="/api/v1", tags=["files"])
+app.include_router(recipients_router, prefix="/api/v1", tags=["recipients"])
 
 # Serve uploaded files (avatars, etc.)
 from fastapi.staticfiles import StaticFiles
