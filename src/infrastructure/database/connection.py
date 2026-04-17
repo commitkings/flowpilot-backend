@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import AsyncGenerator
 
@@ -23,6 +24,7 @@ def get_engine():
             max_overflow=Settings.DATABASE_MAX_OVERFLOW,
             pool_timeout=Settings.DATABASE_POOL_TIMEOUT,
             echo=Settings.DATABASE_ECHO,
+            pool_pre_ping=True,
         )
     return _engine
 
@@ -63,6 +65,12 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
             await session.commit()
+        except asyncio.CancelledError:
+            # Request was cancelled (e.g. client disconnect or middleware timeout).
+            # Roll back and invalidate the underlying connection so it isn't reused.
+            await session.rollback()
+            await session.close()
+            raise
         except Exception:
             await session.rollback()
             raise
