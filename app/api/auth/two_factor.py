@@ -48,6 +48,8 @@ from src.services.email_service import (
     send_2fa_disabled_email,
     send_2fa_enabled_email,
     send_2fa_enforced_email,
+    send_login_notification_email,
+    check_notification_pref,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,12 +215,12 @@ async def enable_2fa(
     )
     await session.commit()
 
-    # Security notification email
-    await send_2fa_enabled_email(
-        to=current_user.email,
-        display_name=current_user.display_name,
-        frontend_url=Settings.FRONTEND_URL,
-    )
+    if check_notification_pref(current_user, "security_alerts"):
+        await send_2fa_enabled_email(
+            to=current_user.email,
+            display_name=current_user.display_name,
+            frontend_url=Settings.FRONTEND_URL,
+        )
 
     return {"backup_codes": plain_codes}
 
@@ -261,17 +263,19 @@ async def disable_2fa(
     )
     await session.commit()
 
-    await send_2fa_disabled_email(
-        to=current_user.email,
-        display_name=current_user.display_name,
-        frontend_url=Settings.FRONTEND_URL,
-    )
+    if check_notification_pref(current_user, "security_alerts"):
+        await send_2fa_disabled_email(
+            to=current_user.email,
+            display_name=current_user.display_name,
+            frontend_url=Settings.FRONTEND_URL,
+        )
 
     return {"message": "Two-factor authentication disabled."}
 
 
 @router.post("/verify")
 async def verify_mfa(
+    request: Request,
     body: VerifyMfaRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -310,6 +314,24 @@ async def verify_mfa(
 
     token = create_access_token(user.id, user.email)
     memberships = await repo.get_memberships(user.id)
+
+    if check_notification_pref(user, "login_alerts"):
+        import asyncio as _aio
+        from datetime import datetime as _dt, timezone as _tz2
+        _fwd = request.headers.get("x-forwarded-for")
+        _ip = (_fwd.split(",")[0].strip() if _fwd else (request.client.host if request.client else None))
+        _ua = request.headers.get("user-agent")
+        _aio.create_task(
+            send_login_notification_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                email=user.email,
+                login_time=_dt.now(_tz2.utc).strftime("%d %b %Y, %I:%M %p UTC"),
+                ip_address=_ip,
+                user_agent=_ua,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+        )
 
     from app.api.auth.routes import _user_response
     return {"token": token, "user": _user_response(user, memberships)}
@@ -367,6 +389,24 @@ async def backup_code_login(
 
     token = create_access_token(user.id, user.email)
     memberships = await repo.get_memberships(user.id)
+
+    if check_notification_pref(user, "login_alerts"):
+        import asyncio as _aio
+        from datetime import datetime as _dt, timezone as _tz2
+        _fwd = request.headers.get("x-forwarded-for")
+        _ip = (_fwd.split(",")[0].strip() if _fwd else (request.client.host if request.client else None))
+        _ua = request.headers.get("user-agent")
+        _aio.create_task(
+            send_login_notification_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                email=user.email,
+                login_time=_dt.now(_tz2.utc).strftime("%d %b %Y, %I:%M %p UTC"),
+                ip_address=_ip,
+                user_agent=_ua,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+        )
 
     from app.api.auth.routes import _user_response
     return {"token": token, "user": _user_response(user, memberships)}

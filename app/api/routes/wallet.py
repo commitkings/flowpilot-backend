@@ -279,17 +279,18 @@ async def topup_wallet(
                 await session.commit()
 
                 # Email
-                from src.services.email_service import send_wallet_topup_email
+                from src.services.email_service import send_wallet_topup_email, check_notification_pref as _cnp_w
                 import asyncio as _asyncio
-                _asyncio.create_task(
-                    send_wallet_topup_email(
-                        to=owner_user.email,
-                        display_name=owner_user.display_name or owner_user.email,
-                        amount=float(amount),
-                        new_balance=new_balance,
-                        reference=request.reference,
+                if _cnp_w(owner_user, "wallet_alerts"):
+                    _asyncio.create_task(
+                        send_wallet_topup_email(
+                            to=owner_user.email,
+                            display_name=owner_user.display_name or owner_user.email,
+                            amount=float(amount),
+                            new_balance=new_balance,
+                            reference=request.reference,
+                        )
                     )
-                )
         except Exception as exc:
             logger.warning("[Wallet] Could not send top-up notification: %s", exc)
 

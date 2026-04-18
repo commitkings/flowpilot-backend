@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <title>Wallet top-up confirmed</title>
+  <title>New sign-in to your FlowPilot account</title>
   <style>
     @media (prefers-color-scheme: dark) {
       .light-logo { display: none !important; }
@@ -23,7 +23,7 @@
 
   <!-- Preheader -->
   <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
-    &#8358;{{ amount }} has been added to your FlowPilot wallet. New balance: &#8358;{{ new_balance }}. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
+    A new sign-in was detected on your FlowPilot account. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
 
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
@@ -53,43 +53,90 @@
             <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
               <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;font-size:0;line-height:0;">&nbsp;</div>
 
-              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">Wallet top-up confirmed</h1>
+              <!-- Icon -->
+              <div style="width:48px;height:48px;border-radius:12px;background-color:#fff7f0;border:1px solid #fde8d4;display:flex;align-items:center;justify-content:center;margin-bottom:20px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td style="width:48px;height:48px;border-radius:12px;background-color:#fff7f0;border:1px solid #fde8d4;text-align:center;vertical-align:middle;">
+                      <span style="font-size:22px;">🔐</span>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">New sign-in detected</h1>
               <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
-                Hi {{ first_name }}, your FlowPilot wallet has been credited.
+                Hi {{ first_name }}, we noticed a successful sign-in to your FlowPilot account.
               </p>
 
-              <!-- Amount card -->
+              <!-- Details card -->
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
                   <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                       <tr>
-                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Amount credited</td>
-                        <td style="font-size:13px;font-weight:700;color:#e86727;text-align:right;padding-bottom:8px;">&#8358;{{ amount }}</td>
+                        <td style="padding:4px 0;">
+                          <span style="font-size:12px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;">Time</span>
+                        </td>
+                        <td style="padding:4px 0;text-align:right;">
+                          <span style="font-size:13px;color:#0f172a;font-weight:500;">{{ login_time }}</span>
+                        </td>
                       </tr>
                       <tr>
-                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">New balance</td>
-                        <td style="font-size:13px;font-weight:700;color:#0f172a;text-align:right;padding-bottom:8px;">&#8358;{{ new_balance }}</td>
+                        <td style="padding:4px 0;padding-top:8px;">
+                          <span style="font-size:12px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;">Account</span>
+                        </td>
+                        <td style="padding:4px 0;padding-top:8px;text-align:right;">
+                          <span style="font-size:13px;color:#0f172a;font-weight:500;">{{ email }}</span>
+                        </td>
                       </tr>
                       <tr>
-                        <td style="font-size:13px;color:#64748b;">Reference</td>
-                        <td style="font-size:12px;font-family:monospace;color:#64748b;text-align:right;">{{ reference }}</td>
+                        <td style="padding:4px 0;padding-top:8px;">
+                          <span style="font-size:12px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;">Device</span>
+                        </td>
+                        <td style="padding:4px 0;padding-top:8px;text-align:right;">
+                          <span style="font-size:13px;color:#0f172a;font-weight:500;">{{ device }}</span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:4px 0;padding-top:8px;">
+                          <span style="font-size:12px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;">Location</span>
+                        </td>
+                        <td style="padding:4px 0;padding-top:8px;text-align:right;">
+                          <span style="font-size:13px;color:#0f172a;font-weight:500;">{{ location }}</span>
+                        </td>
                       </tr>
                     </table>
                   </td>
                 </tr>
               </table>
 
+              <!-- Warning note -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+                <tr>
+                  <td style="background-color:#fffbeb;border-radius:8px;border:1px solid #fde68a;padding:14px 16px;">
+                    <p style="margin:0;font-size:13px;color:#92400e;line-height:1.6;">
+                      <strong>Not you?</strong> If you didn't sign in, secure your account immediately by resetting your password and enabling two-factor authentication.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+
               <!-- CTA button -->
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
                 <tr>
                   <td style="border-radius:8px;background-color:#e86727;">
-                    <a href="{{ wallet_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      View wallet &rarr;
+                    <a href="{{ settings_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      Review account security &rarr;
                     </a>
                   </td>
                 </tr>
               </table>
+
+              <p style="font-size:12px;color:#94a3b8;line-height:1.6;margin:0;">
+                You can turn off these login notifications in your
+                <a href="{{ notifications_url }}" style="color:#e86727;text-decoration:none;">notification settings</a>.
+              </p>
 
             </td>
           </tr>
@@ -103,7 +150,6 @@
                     <p style="margin:0 0 4px;font-size:12px;color:#94a3b8;line-height:1.6;">
                       <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;">support@flowpilot.club</a>
                     </p>
-                    <p style="margin:0 0 4px;font-size:11px;color:#b0aaa4;line-height:1.6;">Manage your <a href="{{ notifications_url }}" style="color:#94a3b8;text-decoration:underline;">notification preferences</a>.</p>
                     <p style="margin:0;font-size:11px;color:#b0aaa4;line-height:1.6;">&copy; 2026 FlowPilot &middot; Automate your payouts.</p>
                   </td>
                 </tr>

@@ -92,6 +92,19 @@ async def _send(
         return False
 
 
+# ── Notification preference helper ───────────────────────────────────────────
+
+
+def check_notification_pref(user, key: str) -> bool:
+    """Return True if `key` is enabled in the user's notification preferences.
+
+    Defaults to True when the key is absent or preferences are null — preserving
+    existing behaviour for users who have never set their preferences.
+    """
+    prefs = getattr(user, "notification_preferences", None) or {}
+    return bool(prefs.get(key, True))
+
+
 # ── Public send functions ─────────────────────────────────────────────────────
 
 
@@ -203,6 +216,7 @@ async def send_run_awaiting_approval_email(
         objective=objective,
         candidate_count=candidate_count,
         approve_url=approve_url,
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -234,6 +248,7 @@ async def send_run_completed_email(
         approved_count=approved_count,
         run_url=run_url,
         is_success=status == "completed",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     subject = (
         f"Your payout run completed — {approved_count} transaction{'s' if approved_count != 1 else ''} processed"
@@ -561,6 +576,7 @@ async def send_api_key_expiry_warning(
         key_prefix=key_prefix,
         days_remaining=days_remaining,
         settings_url=f"{base}/dashboard/settings?tab=developer",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -596,6 +612,7 @@ async def send_kyc_submitted_email(
         single_limit=single_limit,
         wallet_limit=wallet_limit,
         dashboard_url=f"{base}/dashboard",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -631,6 +648,7 @@ async def send_kyc_verified_email(
         wallet_limit=wallet_limit,
         max_monthly_limit=max_monthly_limit,
         dashboard_url=f"{base}/dashboard",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -662,6 +680,7 @@ async def send_individual_kyc_submitted_email(
         level_name=level_name,
         review_time=review_time,
         dashboard_url=f"{base}/dashboard",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     level_subjects = {
         1: "Identity verification received — we'll verify your details shortly",
@@ -703,6 +722,7 @@ async def send_individual_kyc_verified_email(
         at_max_level=at_max_level,
         support_email=support_email,
         dashboard_url=f"{base}/dashboard",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     level_subjects = {
         1: "Level 1 verified ✓ — You can now send payouts",
@@ -769,6 +789,7 @@ async def send_scheduled_run_reminder_email(
         fires_at=fires_at,
         frequency_label=frequency_label,
         schedules_url=f"{base}/dashboard/runs?tab=scheduled",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -800,6 +821,7 @@ async def send_wallet_topup_email(
         new_balance=f"{new_balance:,.2f}",
         reference=reference,
         wallet_url=f"{base}/dashboard/wallet",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -829,6 +851,7 @@ async def send_wallet_low_balance_email(
         balance=f"{balance:,.2f}",
         threshold=f"{threshold:,.2f}",
         wallet_url=f"{base}/dashboard/wallet",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
         to=to,
@@ -996,6 +1019,103 @@ async def send_pin_reset_otp_email(
     return await _send(
         to=to,
         subject="Reset your FlowPilot approval PIN — verification code",
+        html=html,
+    )
+
+
+def _parse_device(ua: Optional[str]) -> str:
+    """Return a human-readable browser + OS label from a User-Agent string."""
+    if not ua:
+        return "Unknown device"
+    u = ua.lower()
+    # OS
+    if "iphone" in u:
+        os = "iPhone"
+    elif "ipad" in u:
+        os = "iPad"
+    elif "android" in u:
+        os = "Android"
+    elif "windows" in u:
+        os = "Windows"
+    elif "macintosh" in u or "mac os x" in u:
+        os = "macOS"
+    elif "linux" in u:
+        os = "Linux"
+    else:
+        os = "Unknown OS"
+    # Browser (check Edge before Chrome; check Safari last since many UAs contain it)
+    if "edg/" in u or "edge/" in u:
+        browser = "Edge"
+    elif "opr/" in u or "opera" in u:
+        browser = "Opera"
+    elif "chrome/" in u:
+        browser = "Chrome"
+    elif "firefox/" in u:
+        browser = "Firefox"
+    elif "safari/" in u:
+        browser = "Safari"
+    else:
+        browser = "Unknown browser"
+    return f"{browser} on {os}"
+
+
+async def _get_location(ip: Optional[str]) -> str:
+    """Resolve a human-readable location from an IP address via ip-api.com.
+
+    Returns 'Local network' for private/loopback IPs; 'Unknown' on any failure.
+    """
+    if not ip:
+        return "Unknown"
+    # Private / loopback ranges — no external lookup needed
+    if ip in ("127.0.0.1", "::1") or ip.startswith(("192.168.", "10.", "172.")):
+        return "Local network"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                f"http://ip-api.com/json/{ip}",
+                params={"fields": "status,country,regionName,city"},
+            )
+        data = resp.json()
+        if data.get("status") == "success":
+            parts = [data.get("city"), data.get("regionName"), data.get("country")]
+            return ", ".join(p for p in parts if p) or "Unknown"
+    except Exception:
+        pass
+    return "Unknown"
+
+
+async def send_login_notification_email(
+    to: str,
+    display_name: str,
+    email: str,
+    login_time: str,
+    ip_address: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Notify the user that a successful sign-in occurred on their account.
+
+    Template: src/templates/emails/login_notification.html
+    """
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    device = _parse_device(user_agent)
+    location = await _get_location(ip_address)
+    html = _render(
+        "login_notification.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        email=email,
+        login_time=login_time,
+        device=device,
+        location=location,
+        settings_url=f"{base}/dashboard/settings?tab=security",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
+    )
+    return await _send(
+        to=to,
+        subject="New sign-in to your FlowPilot account",
         html=html,
     )
 
