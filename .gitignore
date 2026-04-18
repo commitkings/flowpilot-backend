@@ -83,8 +83,6 @@ architecture/
 *.log
 *.tmp
 *.bak
-docs/
-docs/
 .cursor
 .cursorrules
 .cursorignore
