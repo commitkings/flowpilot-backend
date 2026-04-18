@@ -18,6 +18,7 @@
 7. [Implementation Phases](#7-implementation-phases)
 8. [Migration Strategy](#8-migration-strategy)
 9. [Financial Security & Integrity Gaps](#9-financial-security--integrity-gaps)
+10. [Data Masking & Database-Level Security](#10-data-masking--database-level-security)
 
 ---
 
@@ -2296,6 +2297,617 @@ This gives you a fast indexed lookup at registration time and an admin UI to man
 | 17 | Webhook signature timing attack | ⚠️ PARTIAL | LOW | Phase 4 |
 | 18 | Dead letter queue for background tasks | ❌ MISSING | MEDIUM | Phase 4 |
 | 19 | Disposable/temporary email rejection | ❌ MISSING | HIGH | Phase 1 |
+
+---
+
+## 10. Data Masking & Database-Level Security
+
+This section defines the PostgreSQL role hierarchy, column-level encryption strategy, masked views, and application integration pattern. The goal: **even a full DB dump exposes no usable PII or financial identity data** without the encryption key, and even a compromised app-user credential cannot read raw sensitive columns.
+
+---
+
+### 10.1 Database Role Hierarchy
+
+Four roles with strictly decreasing privilege:
+
+```
+postgres (superuser — only for migrations & role management)
+    │
+    ├── fp_admin   (ops/DBA — full table access, can decrypt, used for internal tooling)
+    │
+    ├── fp_app     (FastAPI application — writes to tables, reads from masked views)
+    │
+    ├── fp_audit   (CBN auditor / internal compliance — read-only, sees masked PII,
+    │               full financial data, full audit_log)
+    │
+    └── fp_analytics  (BI/reporting — fully anonymised, no PII at all)
+```
+
+**Role creation:**
+
+```sql
+-- Application role (used by FastAPI connection pool)
+CREATE ROLE fp_app LOGIN PASSWORD '...' NOINHERIT;
+
+-- Admin role (used by migration scripts, ops tooling — never the live app)
+CREATE ROLE fp_admin LOGIN PASSWORD '...' NOINHERIT;
+
+-- Audit role (read-only — given to CBN auditors on request, revoked after)
+CREATE ROLE fp_audit LOGIN PASSWORD '...' NOINHERIT;
+
+-- Analytics role (fully anonymised — BI tools, dashboards)
+CREATE ROLE fp_analytics LOGIN PASSWORD '...' NOINHERIT;
+```
+
+**Default privilege pattern:**
+
+```sql
+-- Revoke all public access to every table
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
+
+-- fp_app: write to tables, read from masked views only
+GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fp_app;
+REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM fp_app;
+-- SELECT granted per-view below (masked views only)
+
+-- fp_admin: unrestricted
+GRANT ALL ON ALL TABLES IN SCHEMA public TO fp_admin;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO fp_admin;
+
+-- fp_audit: read-only on all tables + audit log
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO fp_audit;
+
+-- fp_analytics: read-only on anonymised views only (granted below)
+```
+
+> **Note:** `fp_app` writes to raw tables (INSERT/UPDATE/DELETE) but can only SELECT from masked views. This means the application always receives masked data on reads unless it explicitly calls a privileged decrypt function.
+
+---
+
+### 10.2 Sensitive Column Registry
+
+Every column containing PII or financial identity data, with its masking strategy:
+
+| Table | Column | Classification | At-Rest Storage | fp_app sees | fp_audit sees | fp_admin sees |
+|---|---|---|---|---|---|---|
+| `user` | `email` | PII — Contact | Plaintext | Full value | `ab***@***.com` | Full value |
+| `user` | `password_hash` | Credential | Bcrypt hash | `[HASH]` (never returned) | `[HASH]` | `[HASH]` |
+| `user_profile` | `phone` | PII — Contact | Plaintext | `+234***4567` | `+234***4567` | Full value |
+| `user_profile` | `date_of_birth` | PII — Sensitive | Plaintext | Year only (`1990`) | `1990-**-**` | Full value |
+| `user_mfa` | `totp_secret` | Credential | pgcrypto encrypted | `[ENCRYPTED]` | `[ENCRYPTED]` | Decrypt via function |
+| `user_mfa` | `backup_codes_hash` | Credential | Bcrypt hash | `[HASH]` | `[HASH]` | `[HASH]` |
+| `user_mfa` | `approval_pin_hash` | Credential | Bcrypt hash | `[HASH]` | `[HASH]` | `[HASH]` |
+| `kyc_submission` | `bvn` | PII — Sensitive (CBN) | pgcrypto encrypted | `[REDACTED]` | `BVN-***45` | Decrypt via function |
+| `kyc_submission` | `nin` | PII — Sensitive (NIMC) | pgcrypto encrypted | `[REDACTED]` | `NIN-***78` | Decrypt via function |
+| `kyc_submission` | `rc_number` | PII — Business ID | Plaintext | Full value | Full value | Full value |
+| `kyc_document` | `s3_key` | PII — Document path | Plaintext | `[REDACTED]` | Partial path | Full value |
+| `payee_bank_account` | `account_number` | Financial identity | pgcrypto encrypted | `****3456` (last 4) | `****3456` | Decrypt via function |
+| `business_virtual_account` | `virtual_account_number` | Financial identity | Plaintext | Full value (own business) | Full value | Full value |
+| `ledger_entry` | `sender_account` | Financial identity | Plaintext | Masked (last 4) | Full value | Full value |
+| `ledger_entry` | `receiver_account` | Financial identity | Plaintext | Masked (last 4) | Full value | Full value |
+| `user_oauth_provider` | `external_id` | PII — External ID | Plaintext | `[REDACTED]` | `[REDACTED]` | Full value |
+
+---
+
+### 10.3 Column-Level Encryption with pgcrypto
+
+For fields marked **pgcrypto encrypted** (BVN, NIN, account number, TOTP secret), the value is stored encrypted in the database. The encryption key is **never stored in the database** — it lives in an environment secret (AWS Secrets Manager / GCP Secret Manager).
+
+**Enable extension:**
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+```
+
+**Encrypt on write (done in application layer before INSERT):**
+
+```python
+# src/infrastructure/crypto.py
+import os
+from sqlalchemy import text
+
+ENCRYPTION_KEY = os.environ["DB_FIELD_ENCRYPTION_KEY"]  # 32-byte AES key
+
+async def encrypt_field(session: AsyncSession, plaintext: str) -> str:
+    """Return pgp_sym_encrypt ciphertext as hex string."""
+    result = await session.execute(
+        text("SELECT pgp_sym_encrypt(:val, :key)"),
+        {"val": plaintext, "key": ENCRYPTION_KEY}
+    )
+    return result.scalar_one()
+
+async def decrypt_field(session: AsyncSession, ciphertext: str) -> str:
+    """Decrypt — only called in admin-privileged context."""
+    result = await session.execute(
+        text("SELECT pgp_sym_decrypt(:val::bytea, :key)"),
+        {"val": ciphertext, "key": ENCRYPTION_KEY}
+    )
+    return result.scalar_one()
+```
+
+**Store encrypted:**
+
+```python
+# In KYC submission service
+encrypted_bvn = await encrypt_field(session, raw_bvn)
+encrypted_nin = await encrypt_field(session, raw_nin)
+kyc = KycSubmissionModel(bvn=encrypted_bvn, nin=encrypted_nin, ...)
+```
+
+**Decrypt only when needed (admin context):**
+
+```python
+# Only reachable by fp_admin role or internal service — never a public endpoint
+async def get_bvn_for_verification(kyc_id: UUID, session: AsyncSession) -> str:
+    kyc = await session.get(KycSubmissionModel, kyc_id)
+    return await decrypt_field(session, kyc.bvn)
+```
+
+**PostgreSQL-side decrypt function (accessible only to fp_admin):**
+
+```sql
+-- Only fp_admin can call this function
+CREATE OR REPLACE FUNCTION decrypt_sensitive(ciphertext TEXT, key TEXT)
+RETURNS TEXT
+LANGUAGE sql
+SECURITY DEFINER  -- runs as owner (postgres), not caller
+AS $$
+    SELECT pgp_sym_decrypt(ciphertext::bytea, key);
+$$;
+
+REVOKE EXECUTE ON FUNCTION decrypt_sensitive FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION decrypt_sensitive TO fp_admin;
+-- fp_app and fp_audit do NOT have EXECUTE on this function
+```
+
+---
+
+### 10.4 Masked Views
+
+Each sensitive table gets a parallel `_masked` view. `fp_app` is granted SELECT only on these views, not the underlying tables.
+
+**`v_user_masked` — for fp_app:**
+
+```sql
+CREATE VIEW v_user_masked AS
+SELECT
+    id,
+    email,                     -- app needs full email for login/notifications
+    role,
+    business_id,
+    is_active,
+    email_verified,
+    last_login_at,
+    created_at,
+    updated_at
+    -- password_hash, external_id intentionally excluded
+FROM "user";
+
+GRANT SELECT ON v_user_masked TO fp_app;
+```
+
+**`v_user_profile_masked` — for fp_app:**
+
+```sql
+CREATE VIEW v_user_profile_masked AS
+SELECT
+    id,
+    user_id,
+    first_name,
+    last_name,
+    job_title,
+    department,
+    avatar_url,
+    timezone,
+    has_taken_tour,
+    -- phone masked: show country code + last 4 digits
+    CASE
+        WHEN phone IS NOT NULL
+        THEN REGEXP_REPLACE(phone, '(\+\d{3})\d+(\d{4})', '\1****\2')
+        ELSE NULL
+    END AS phone,
+    -- date_of_birth: year only for app layer
+    EXTRACT(YEAR FROM date_of_birth)::INT AS birth_year
+    -- full date_of_birth excluded
+FROM user_profile;
+
+GRANT SELECT ON v_user_profile_masked TO fp_app;
+```
+
+**`v_kyc_masked` — for fp_app:**
+
+```sql
+CREATE VIEW v_kyc_masked AS
+SELECT
+    id,
+    business_id,
+    submission_type,
+    status,
+    rejection_reason,
+    submitted_at,
+    reviewed_at,
+    reviewer_id,
+    rc_number,              -- non-sensitive, public record
+    cac_status,
+    -- BVN and NIN are stored encrypted; return a fixed redacted marker
+    '[REDACTED]' AS bvn,
+    '[REDACTED]' AS nin
+FROM kyc_submission;
+
+GRANT SELECT ON v_kyc_masked TO fp_app;
+```
+
+**`v_payee_bank_account_masked` — for fp_app:**
+
+```sql
+CREATE VIEW v_payee_bank_account_masked AS
+SELECT
+    id,
+    payee_id,
+    bank_code,
+    bank_name,
+    account_name,
+    -- show last 4 digits only (account_number is pgcrypto encrypted in DB)
+    -- app decrypts then masks before returning to client
+    '****' AS account_number_display,
+    account_number AS account_number_encrypted,  -- app decrypts only when initiating payout
+    currency,
+    is_verified,
+    verified_at,
+    created_at
+FROM payee_bank_account;
+
+GRANT SELECT ON v_payee_bank_account_masked TO fp_app;
+```
+
+**`v_ledger_masked` — for fp_app:**
+
+```sql
+CREATE VIEW v_ledger_masked AS
+SELECT
+    id,
+    entry_type,
+    direction,
+    amount,
+    currency,
+    -- mask account identifiers to last 4
+    CASE
+        WHEN sender_account IS NOT NULL
+        THEN '****' || RIGHT(sender_account, 4)
+        ELSE NULL
+    END AS sender_account,
+    CASE
+        WHEN receiver_account IS NOT NULL
+        THEN '****' || RIGHT(receiver_account, 4)
+        ELSE NULL
+    END AS receiver_account,
+    sender_name,
+    receiver_name,
+    narration,
+    reference,
+    client_reference,
+    status,
+    business_id,
+    run_id,
+    payout_id,
+    created_at
+FROM ledger_entry;
+
+GRANT SELECT ON v_ledger_masked TO fp_app;
+```
+
+**`v_audit_anonymised` — for fp_analytics (fully anonymised):**
+
+```sql
+CREATE VIEW v_audit_anonymised AS
+SELECT
+    DATE_TRUNC('day', created_at) AS event_date,
+    event_type,
+    resource_type,
+    -- no user_id, no business_id, no IP
+    COUNT(*) AS event_count
+FROM audit_log
+GROUP BY 1, 2, 3;
+
+GRANT SELECT ON v_audit_anonymised TO fp_analytics;
+```
+
+**Audit role — full access to financial data, masked PII:**
+
+```sql
+CREATE VIEW v_ledger_audit AS
+SELECT
+    id,
+    entry_type,
+    direction,
+    amount,
+    currency,
+    sender_account,     -- full account for audit trail
+    receiver_account,   -- full account for audit trail
+    sender_name,
+    receiver_name,
+    narration,
+    reference,
+    client_reference,
+    status,
+    business_id,
+    run_id,
+    created_at
+FROM ledger_entry;
+
+GRANT SELECT ON v_ledger_audit TO fp_audit;
+
+-- Audit sees masked (partial) BVN/NIN — enough to verify identity, not full exposure
+CREATE VIEW v_kyc_audit AS
+SELECT
+    id,
+    business_id,
+    submission_type,
+    status,
+    rc_number,
+    -- show last 5 chars of encrypted BVN ciphertext as a reference token
+    -- (auditor can request full decrypt via formal process)
+    'BVN-***' || RIGHT(bvn, 5) AS bvn_ref,
+    'NIN-***' || RIGHT(nin, 5) AS nin_ref,
+    submitted_at,
+    reviewed_at
+FROM kyc_submission;
+
+GRANT SELECT ON v_kyc_audit TO fp_audit;
+```
+
+---
+
+### 10.5 Application Integration (SQLAlchemy)
+
+The FastAPI app connects using the `fp_app` DB user. SQLAlchemy models should map to **masked views for reads** and raw tables for writes.
+
+**Pattern — separate read model from write model:**
+
+```python
+# src/infrastructure/database/read_models.py
+# These map to masked views — used for all SELECT queries in services
+
+from sqlalchemy import Column, String, UUID, DateTime
+from sqlalchemy.orm import DeclarativeBase
+
+class ReadBase(DeclarativeBase):
+    pass
+
+class UserReadModel(ReadBase):
+    __tablename__ = "v_user_masked"
+    id = Column(UUID, primary_key=True)
+    email = Column(String)
+    role = Column(String)
+    business_id = Column(UUID)
+    is_active = Column(Boolean)
+    # ... other safe columns
+
+class KycReadModel(ReadBase):
+    __tablename__ = "v_kyc_masked"
+    id = Column(UUID, primary_key=True)
+    business_id = Column(UUID)
+    status = Column(String)
+    bvn = Column(String)   # always '[REDACTED]' from view
+    nin = Column(String)   # always '[REDACTED]' from view
+    # ...
+```
+
+**Pattern — privilege escalation for decrypt (admin endpoints only):**
+
+```python
+# src/infrastructure/database/admin_session.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+
+# Separate engine using fp_admin credentials
+# This engine is ONLY used in internal admin routes — never in public API routes
+admin_engine = create_async_engine(
+    settings.DATABASE_URL_ADMIN,  # uses fp_admin user
+    echo=False,
+    pool_size=2,
+    max_overflow=0,
+)
+
+async def get_admin_session() -> AsyncSession:
+    async with AsyncSession(admin_engine) as session:
+        yield session
+```
+
+```python
+# app/api/routes/admin/kyc.py  (internal route — not exposed publicly)
+from fastapi import Depends
+from src.infrastructure.database.admin_session import get_admin_session
+
+@router.get("/admin/kyc/{kyc_id}/bvn")
+async def get_bvn(
+    kyc_id: UUID,
+    session: AsyncSession = Depends(get_admin_session),
+    current_user = Depends(require_internal_admin),   # ops team only
+):
+    # Logs the access event to audit_log first
+    await audit_log_sensitive_access(
+        session, user_id=current_user.id, resource="kyc.bvn", resource_id=kyc_id
+    )
+    return {"bvn": await decrypt_field(session, kyc.bvn)}
+```
+
+---
+
+### 10.6 Encryption Key Management
+
+Never store the encryption key in:
+- The database
+- Application code / git
+- `.env` files committed to version control
+
+**Key lifecycle:**
+
+```
+1. Key lives in AWS Secrets Manager (or GCP Secret Manager)
+   secret name: "flowpilot/prod/db_field_encryption_key"
+
+2. App reads key at startup via boto3/google-cloud-secret-manager
+   — not at every request, cached in memory
+
+3. Key rotation:
+   a. Generate new key in Secrets Manager
+   b. Run migration script (fp_admin role):
+      - Decrypt every encrypted field with old key
+      - Re-encrypt with new key
+      - Update Secrets Manager to point to new key
+   c. Deploy new app version reading new key
+
+4. Separate keys per environment:
+   - prod: prod key (most restricted access)
+   - staging: staging key
+   - dev: dev key (can be simpler, stored in .env)
+```
+
+**Key strength:**
+
+```python
+# Generate a 32-byte AES-256 key
+import secrets
+key = secrets.token_hex(32)  # 64 hex chars = 32 bytes
+```
+
+---
+
+### 10.7 Audit Trail for Sensitive Data Access
+
+Every access to a decrypted sensitive field must be logged — this is a CBN AML/CFT requirement (Section 6.3 — audit trail for data access events).
+
+```sql
+-- Extend audit_log with a data_access_log table
+CREATE TABLE data_access_log (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    accessed_by     UUID NOT NULL REFERENCES "user"(id),
+    resource_type   TEXT NOT NULL,      -- 'kyc.bvn', 'kyc.nin', 'bank_account.number'
+    resource_id     UUID NOT NULL,
+    access_reason   TEXT,               -- required for BVN/NIN access
+    ip_address      INET,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Index for compliance queries: "who accessed user X's BVN in the last 30 days?"
+CREATE INDEX idx_data_access_resource ON data_access_log(resource_type, resource_id, created_at DESC);
+CREATE INDEX idx_data_access_user ON data_access_log(accessed_by, created_at DESC);
+```
+
+```python
+# Decorator for any service method that decrypts sensitive fields
+async def log_data_access(
+    session: AsyncSession,
+    *,
+    accessed_by: UUID,
+    resource_type: str,
+    resource_id: UUID,
+    access_reason: str,
+    ip_address: str,
+) -> None:
+    session.add(DataAccessLogModel(
+        accessed_by=accessed_by,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        access_reason=access_reason,
+        ip_address=ip_address,
+    ))
+    await session.flush()
+```
+
+---
+
+### 10.8 Row-Level Security (RLS) for Multi-Tenancy
+
+PostgreSQL RLS ensures that `fp_app` can never accidentally read another business's data, even if a query bug omits a `WHERE business_id = ?` clause. This is a defence-in-depth layer on top of application-level filtering.
+
+```sql
+-- Enable RLS on all multi-tenant tables
+ALTER TABLE "user" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wallet ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger_entry ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_run ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payout_candidate ENABLE ROW LEVEL SECURITY;
+
+-- The app sets a session variable on every connection checkout
+-- (done in SQLAlchemy event hook — see below)
+CREATE POLICY tenant_isolation ON "user"
+    FOR ALL
+    TO fp_app
+    USING (business_id = current_setting('app.current_business_id')::UUID);
+
+CREATE POLICY tenant_isolation ON ledger_entry
+    FOR ALL
+    TO fp_app
+    USING (business_id = current_setting('app.current_business_id')::UUID);
+
+-- Repeat for every multi-tenant table
+
+-- fp_admin bypasses RLS (BYPASSRLS privilege)
+ALTER ROLE fp_admin BYPASSRLS;
+ALTER ROLE fp_audit BYPASSRLS;
+```
+
+**SQLAlchemy connection event hook — set business_id on checkout:**
+
+```python
+# src/infrastructure/database/session.py
+from sqlalchemy import event, text
+
+@event.listens_for(engine.sync_engine, "connect")
+def set_search_path(dbapi_connection, connection_record):
+    pass  # schema setup if needed
+
+async def set_tenant_context(session: AsyncSession, business_id: UUID) -> None:
+    """Call this at the start of every request handler after auth."""
+    await session.execute(
+        text("SELECT set_config('app.current_business_id', :bid, true)"),
+        {"bid": str(business_id)}
+    )
+```
+
+**FastAPI middleware to set tenant context on every authenticated request:**
+
+```python
+# app/middleware/tenant.py
+@app.middleware("http")
+async def tenant_context_middleware(request: Request, call_next):
+    response = await call_next(request)
+    return response
+
+# In the dependency — called after JWT validation
+async def get_db_with_tenant(
+    business_id: UUID = Depends(get_current_business_id),
+    session: AsyncSession = Depends(get_session),
+) -> AsyncSession:
+    await set_tenant_context(session, business_id)
+    return session
+```
+
+---
+
+### 10.9 Implementation Checklist
+
+| # | Task | Phase | Owner |
+|---|---|---|---|
+| 1 | Create `fp_app`, `fp_admin`, `fp_audit`, `fp_analytics` DB roles | Phase 1 | DBA |
+| 2 | Enable `pgcrypto` extension | Phase 1 | DBA |
+| 3 | Add `DB_FIELD_ENCRYPTION_KEY` to Secrets Manager (prod/staging/dev) | Phase 1 | DevOps |
+| 4 | Implement `encrypt_field` / `decrypt_field` in `src/infrastructure/crypto.py` | Phase 1 | Backend |
+| 5 | Encrypt BVN/NIN on all existing `kyc_submission` rows (migration script) | Phase 1 | Backend |
+| 6 | Encrypt account numbers on all existing `payee_bank_account` rows | Phase 2 | Backend |
+| 7 | Create masked views (`v_user_masked`, `v_kyc_masked`, `v_payee_bank_account_masked`, `v_ledger_masked`) | Phase 1 | DBA |
+| 8 | Grant `fp_app` SELECT on masked views only; revoke from raw tables | Phase 1 | DBA |
+| 9 | Add `data_access_log` table | Phase 1 | Backend |
+| 10 | Add `log_data_access()` decorator to every decrypt call | Phase 1 | Backend |
+| 11 | Enable RLS on all multi-tenant tables | Phase 2 | DBA |
+| 12 | Add `set_tenant_context()` SQLAlchemy hook | Phase 2 | Backend |
+| 13 | Create separate `admin_engine` for privileged operations | Phase 1 | Backend |
+| 14 | Add `decrypt_sensitive` PostgreSQL function (fp_admin only) | Phase 1 | DBA |
+| 15 | Verify: `fp_app` SELECT on raw `kyc_submission` returns permission denied | Phase 1 | QA |
+| 16 | Add key rotation script to ops runbook | Phase 2 | DevOps |
+| 17 | Annual pen-test: attempt to read BVN from `fp_app` credentials | Ongoing | Security |
 
 ---
 
