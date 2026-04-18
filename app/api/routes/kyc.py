@@ -146,15 +146,17 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
         _biz_max = get_limits("business", max(KYC_LIMITS.get("business", {}).keys(), default=1))
         def _fmtb(n) -> str:
             return f"\u20a6{float(n):,.0f}"
-        await email_service.send_kyc_verified_email(
-            to=owner_email,
-            display_name=owner_name,
-            business_name=business_name,
-            monthly_limit=_fmtb(_biz_l1["monthly"]) if _biz_l1 else "₦1,500,000",
-            single_limit=_fmtb(_biz_l1["single"]) if _biz_l1 else "₦300,000",
-            wallet_limit=_fmtb(_biz_l1["wallet"]) if _biz_l1 else "₦3,000,000",
-            max_monthly_limit=_fmtb(_biz_max["monthly"]) if _biz_max else "₦50,000,000",
-        )
+        from src.services.email_service import check_notification_pref as _cnp_k
+        if _cnp_k(owner, "kyc_updates"):
+            await email_service.send_kyc_verified_email(
+                to=owner_email,
+                display_name=owner_name,
+                business_name=business_name,
+                monthly_limit=_fmtb(_biz_l1["monthly"]) if _biz_l1 else "₦1,500,000",
+                single_limit=_fmtb(_biz_l1["single"]) if _biz_l1 else "₦300,000",
+                wallet_limit=_fmtb(_biz_l1["wallet"]) if _biz_l1 else "₦3,000,000",
+                max_monthly_limit=_fmtb(_biz_max["monthly"]) if _biz_max else "₦50,000,000",
+            )
         logger.info("KYC auto-verified for business %s", business_id)
 
     except Exception as exc:
@@ -402,17 +404,19 @@ async def submit_kyc(
     _sub_l1 = get_limits("business", 1)
     def _fmts(n) -> str:
         return f"\u20a6{float(n):,.0f}"
-    asyncio.create_task(
-        email_service.send_kyc_submitted_email(
-            to=user.email,
-            display_name=user.display_name or user.email,
-            business_name=biz.business_name,
-            submitted_docs=submitted_docs,
-            monthly_limit=_fmts(_sub_l1["monthly"]) if _sub_l1 else "₦1,500,000",
-            single_limit=_fmts(_sub_l1["single"]) if _sub_l1 else "₦300,000",
-            wallet_limit=_fmts(_sub_l1["wallet"]) if _sub_l1 else "₦3,000,000",
+    from src.services.email_service import check_notification_pref as _cnp_ks
+    if _cnp_ks(user, "kyc_updates"):
+        asyncio.create_task(
+            email_service.send_kyc_submitted_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                business_name=biz.business_name,
+                submitted_docs=submitted_docs,
+                monthly_limit=_fmts(_sub_l1["monthly"]) if _sub_l1 else "₦1,500,000",
+                single_limit=_fmts(_sub_l1["single"]) if _sub_l1 else "₦300,000",
+                wallet_limit=_fmts(_sub_l1["wallet"]) if _sub_l1 else "₦3,000,000",
+            )
         )
-    )
 
     asyncio.create_task(
         _auto_verify_kyc(
@@ -628,17 +632,19 @@ async def _auto_verify_individual_kyc(
         _max_level = max(KYC_LIMITS.get("individual", {}).keys(), default=0)
         def _fmt(n) -> str:
             return f"\u20a6{float(n):,.0f}"
-        await email_service.send_individual_kyc_verified_email(
-            to=owner_email,
-            display_name=owner_name,
-            level=level,
-            level_name=_level_names.get(level, f"Level {level}"),
-            monthly_limit=_fmt(_limits["monthly"]) if _limits else "N/A",
-            single_limit=_fmt(_limits["single"]) if _limits else "N/A",
-            wallet_limit=_fmt(_limits["wallet"]) if _limits else "N/A",
-            at_max_level=(level >= _max_level),
-            support_email=SUPPORT_EMAIL,
-        )
+        from src.services.email_service import check_notification_pref as _cnp_kiv
+        if _cnp_kiv(owner, "kyc_updates"):
+            await email_service.send_individual_kyc_verified_email(
+                to=owner_email,
+                display_name=owner_name,
+                level=level,
+                level_name=_level_names.get(level, f"Level {level}"),
+                monthly_limit=_fmt(_limits["monthly"]) if _limits else "N/A",
+                single_limit=_fmt(_limits["single"]) if _limits else "N/A",
+                wallet_limit=_fmt(_limits["wallet"]) if _limits else "N/A",
+                at_max_level=(level >= _max_level),
+                support_email=SUPPORT_EMAIL,
+            )
         logger.info("Individual KYC Level %d auto-verified for business %s", level, business_id)
     except Exception as exc:
         logger.error("Individual KYC auto-verification failed (level %d, business %s): %s", level, business_id, exc)
@@ -700,14 +706,16 @@ async def submit_individual_kyc_level1(
     )
     await session.commit()
 
-    asyncio.create_task(
-        email_service.send_individual_kyc_submitted_email(
-            to=user.email,
-            display_name=user.display_name or user.email,
-            level=1,
-            level_name=f"Identity ({id_type.upper()})",
+    from src.services.email_service import check_notification_pref as _cnp_kis1
+    if _cnp_kis1(user, "kyc_updates"):
+        asyncio.create_task(
+            email_service.send_individual_kyc_submitted_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                level=1,
+                level_name=f"Identity ({id_type.upper()})",
+            )
         )
-    )
     asyncio.create_task(
         _auto_verify_individual_kyc(
             business_id=str(biz.id),
@@ -785,14 +793,16 @@ async def submit_individual_kyc_level2(
     )
     await session.commit()
 
-    asyncio.create_task(
-        email_service.send_individual_kyc_submitted_email(
-            to=user.email,
-            display_name=user.display_name or user.email,
-            level=2,
-            level_name="Address",
+    from src.services.email_service import check_notification_pref as _cnp_kis2
+    if _cnp_kis2(user, "kyc_updates"):
+        asyncio.create_task(
+            email_service.send_individual_kyc_submitted_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                level=2,
+                level_name="Address",
+            )
         )
-    )
     asyncio.create_task(
         _auto_verify_individual_kyc(
             business_id=str(biz.id),
@@ -878,14 +888,16 @@ async def submit_individual_kyc_level3(
     )
     await session.commit()
 
-    asyncio.create_task(
-        email_service.send_individual_kyc_submitted_email(
-            to=user.email,
-            display_name=user.display_name or user.email,
-            level=3,
-            level_name="Government ID",
+    from src.services.email_service import check_notification_pref as _cnp_kis3
+    if _cnp_kis3(user, "kyc_updates"):
+        asyncio.create_task(
+            email_service.send_individual_kyc_submitted_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                level=3,
+                level_name="Government ID",
+            )
         )
-    )
     asyncio.create_task(
         _auto_verify_individual_kyc(
             business_id=str(biz.id),

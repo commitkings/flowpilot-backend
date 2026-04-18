@@ -593,14 +593,16 @@ async def create_run(
                 )
 
                 for member, approver_user in assigned_members:
-                    await send_run_awaiting_approval_email(
-                        to=approver_user.email,
-                        run_id=run_id,
-                        objective=request.objective,
-                        candidate_count=candidate_count,
-                        approver_name=approver_user.display_name or approver_user.email,
-                        frontend_url=Settings.FRONTEND_URL,
-                    )
+                    from src.services.email_service import check_notification_pref as _cnp
+                    if _cnp(approver_user, "payout_updates"):
+                        await send_run_awaiting_approval_email(
+                            to=approver_user.email,
+                            run_id=run_id,
+                            objective=request.objective,
+                            candidate_count=candidate_count,
+                            approver_name=approver_user.display_name or approver_user.email,
+                            frontend_url=Settings.FRONTEND_URL,
+                        )
                     await _notify(session, approver_user.id, business_uuid,
                                   title="Approval needed",
                                   message=f'{candidate_count} candidate{"s" if candidate_count != 1 else ""} need your review on run "{request.objective[:50]}".',
@@ -1268,16 +1270,18 @@ async def nudge_approver(
 
     # Email — fire-and-forget
     try:
-        import asyncio as _asyncio
-        _asyncio.create_task(
-            send_run_awaiting_approval_email(
-                to=approver_user.email,
-                run_id=run_id,
-                objective=run.objective,
-                candidate_count=candidate_count,
-                approver_name=approver_user.display_name or approver_user.email,
+        from src.services.email_service import check_notification_pref as _cnp2
+        if _cnp2(approver_user, "payout_updates"):
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                send_run_awaiting_approval_email(
+                    to=approver_user.email,
+                    run_id=run_id,
+                    objective=run.objective,
+                    candidate_count=candidate_count,
+                    approver_name=approver_user.display_name or approver_user.email,
+                )
             )
-        )
     except Exception as exc:
         logger.warning("[Nudge] Could not send nudge email: %s", exc)
 
@@ -1501,13 +1505,15 @@ async def rerun_payout(
                     approver_user2 = _at2_result.scalar_one_or_none()
                     if approver_user2:
                         db_candidates2 = await candidate_repo.get_by_run(run_uuid)
-                        await send_run_awaiting_approval_email(
-                            to=approver_user2.email,
-                            run_id=run_id,
-                            objective=body.objective,
-                            candidate_count=len(db_candidates2),
-                            approver_name=approver_user2.display_name or approver_user2.email,
-                        )
+                        from src.services.email_service import check_notification_pref as _cnp3
+                        if _cnp3(approver_user2, "payout_updates"):
+                            await send_run_awaiting_approval_email(
+                                to=approver_user2.email,
+                                run_id=run_id,
+                                objective=body.objective,
+                                candidate_count=len(db_candidates2),
+                                approver_name=approver_user2.display_name or approver_user2.email,
+                            )
                 except Exception as exc:
                     logger.warning("[Rerun] Could not re-notify approver: %s", exc)
 

@@ -20,9 +20,21 @@ from src.infrastructure.cache import account_delete_store
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
     AgentRunModel,
+    AiCreditTransactionModel,
+    ApiKeyModel,
+    ApprovalRuleModel,
+    BlocklistEntryModel,
+    BusinessConfigModel,
     BusinessMemberModel,
     BusinessModel,
+    IndividualKycSubmissionModel,
+    KycSubmissionModel,
     ReconciledTransactionModel,
+    SavedRecipientModel,
+    ScheduledRunModel,
+    WalletModel,
+    WalletTransactionModel,
+    WebhookModel,
 )
 from src.infrastructure.database.repositories import AuditRepository
 from src.infrastructure.database.repositories.user_repository import UserRepository
@@ -181,6 +193,235 @@ async def export_account_data(
         for a in audit_rows
     ]
 
+    # ── Business config ───────────────────────────────────────────────────────
+    biz_config = (
+        await session.execute(
+            select(BusinessConfigModel).where(BusinessConfigModel.business_id == business_id)
+        )
+    ).scalars().first()
+
+    business_config_data = None
+    if biz_config:
+        business_config_data = {
+            "monthly_txn_volume_range": biz_config.monthly_txn_volume_range,
+            "avg_monthly_payouts_range": biz_config.avg_monthly_payouts_range,
+            "primary_bank": biz_config.primary_bank,
+            "primary_use_cases": biz_config.primary_use_cases,
+            "risk_appetite": biz_config.risk_appetite,
+            "default_risk_tolerance": str(biz_config.default_risk_tolerance) if biz_config.default_risk_tolerance is not None else None,
+            "default_budget_cap": str(biz_config.default_budget_cap) if biz_config.default_budget_cap is not None else None,
+            "daily_payout_limit": str(biz_config.daily_payout_limit) if biz_config.daily_payout_limit is not None else None,
+            "single_payout_cap": str(biz_config.single_payout_cap) if biz_config.single_payout_cap is not None else None,
+            "risk_alert_threshold": str(biz_config.risk_alert_threshold) if biz_config.risk_alert_threshold is not None else None,
+            "liquidity_alert_buffer": str(biz_config.liquidity_alert_buffer) if biz_config.liquidity_alert_buffer is not None else None,
+            "require_2fa": biz_config.require_2fa,
+            "preferences": biz_config.preferences or {},
+        }
+
+    # ── Saved recipients ──────────────────────────────────────────────────────
+    saved_recipients_rows = (
+        await session.execute(
+            select(SavedRecipientModel)
+            .where(SavedRecipientModel.business_id == business_id)
+            .order_by(SavedRecipientModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    saved_recipients = [
+        {
+            "name": r.name,
+            "account_number": r.account_number,
+            "institution_code": r.institution_code,
+            "email": r.email,
+            "notes": r.notes,
+            "tags": r.tags or [],
+        }
+        for r in saved_recipients_rows
+    ]
+
+    # ── API keys (metadata only — no secrets) ────────────────────────────────
+    api_keys_rows = (
+        await session.execute(
+            select(ApiKeyModel)
+            .where(ApiKeyModel.business_id == business_id)
+            .order_by(ApiKeyModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    api_keys_data = [
+        {
+            "name": k.name,
+            "key_prefix": k.key_prefix,
+            "scopes": k.scopes or [],
+            "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+            "revoked_at": k.revoked_at.isoformat() if k.revoked_at else None,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+        }
+        for k in api_keys_rows
+    ]
+
+    # ── Webhooks (no signing secrets) ─────────────────────────────────────────
+    webhooks_rows = (
+        await session.execute(
+            select(WebhookModel)
+            .where(WebhookModel.business_id == business_id)
+            .order_by(WebhookModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    webhooks_data = [
+        {
+            "url": wh.url,
+            "events": wh.events or [],
+            "is_active": wh.is_active,
+            "created_at": wh.created_at.isoformat() if wh.created_at else None,
+        }
+        for wh in webhooks_rows
+    ]
+
+    # ── Approval rules ────────────────────────────────────────────────────────
+    approval_rules_rows = (
+        await session.execute(
+            select(ApprovalRuleModel)
+            .where(ApprovalRuleModel.business_id == business_id)
+            .order_by(ApprovalRuleModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    approval_rules_data = [
+        {
+            "name": r.name,
+            "condition": r.condition,
+            "threshold": str(r.threshold),
+            "required_approvers": r.required_approvers,
+            "approver_roles": r.approver_roles or [],
+            "is_active": r.is_active,
+        }
+        for r in approval_rules_rows
+    ]
+
+    # ── Blocklist entries (active only) ───────────────────────────────────────
+    blocklist_rows = (
+        await session.execute(
+            select(BlocklistEntryModel)
+            .where(
+                BlocklistEntryModel.business_id == business_id,
+                BlocklistEntryModel.is_active.is_(True),
+            )
+            .order_by(BlocklistEntryModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    blocklist_data = [
+        {
+            "type": e.type,
+            "value": e.value,
+            "reason": e.reason,
+        }
+        for e in blocklist_rows
+    ]
+
+    # ── Scheduled runs ────────────────────────────────────────────────────────
+    scheduled_runs_rows = (
+        await session.execute(
+            select(ScheduledRunModel)
+            .where(ScheduledRunModel.business_id == business_id)
+            .order_by(ScheduledRunModel.created_at.desc())
+        )
+    ).scalars().all()
+
+    scheduled_runs_data = [
+        {
+            "name": sr.name,
+            "objective": sr.objective,
+            "run_type": sr.run_type,
+            "cron_expression": sr.cron_expression,
+            "frequency_label": sr.frequency_label,
+            "is_active": sr.is_active,
+            "run_config": sr.run_config or {},
+            "created_at": sr.created_at.isoformat() if sr.created_at else None,
+        }
+        for sr in scheduled_runs_rows
+    ]
+
+    # ── KYC status ────────────────────────────────────────────────────────────
+    kyc_submission = (
+        await session.execute(
+            select(KycSubmissionModel).where(KycSubmissionModel.business_id == business_id)
+        )
+    ).scalars().first()
+
+    kyc_data = None
+    if kyc_submission:
+        kyc_data = {
+            "status": kyc_submission.status,
+            "business_type": kyc_submission.business_type,
+            "registration_number": kyc_submission.registration_number,
+            "submitted_at": kyc_submission.submitted_at.isoformat() if getattr(kyc_submission, "submitted_at", None) else None,
+            "verified_at": kyc_submission.verified_at.isoformat() if getattr(kyc_submission, "verified_at", None) else None,
+        }
+
+    individual_kyc = (
+        await session.execute(
+            select(IndividualKycSubmissionModel).where(IndividualKycSubmissionModel.business_id == business_id)
+        )
+    ).scalars().first()
+
+    individual_kyc_data = None
+    if individual_kyc:
+        individual_kyc_data = {
+            "level_1_type": individual_kyc.level_1_type,
+            "level_1_status": individual_kyc.level_1_status,
+            "level_2_status": individual_kyc.level_2_status,
+            "level_3_status": individual_kyc.level_3_status,
+        }
+
+    # ── Wallet ────────────────────────────────────────────────────────────────
+    wallet = (
+        await session.execute(
+            select(WalletModel).where(WalletModel.business_id == business_id)
+        )
+    ).scalars().first()
+
+    wallet_data = None
+    if wallet:
+        recent_txns = (
+            await session.execute(
+                select(WalletTransactionModel)
+                .where(WalletTransactionModel.business_id == business_id)
+                .order_by(WalletTransactionModel.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        wallet_data = {
+            "balance": str(wallet.balance),
+            "currency": wallet.currency,
+            "recent_transactions": [
+                {
+                    "type": t.type,
+                    "amount": str(t.amount),
+                    "description": t.description,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in recent_txns
+            ],
+        }
+
+    # ── AI credits balance ────────────────────────────────────────────────────
+    from sqlalchemy import func as _func
+    credits_result = await session.execute(
+        select(
+            _func.coalesce(_func.sum(AiCreditTransactionModel.credits).filter(
+                AiCreditTransactionModel.type == "purchase"
+            ), 0).label("purchased"),
+            _func.coalesce(_func.sum(AiCreditTransactionModel.credits).filter(
+                AiCreditTransactionModel.type == "debit"
+            ), 0).label("spent"),
+        ).where(AiCreditTransactionModel.business_id == business_id)
+    )
+    credits_row = credits_result.first()
+    ai_credits_balance = int(credits_row.purchased) - int(credits_row.spent) if credits_row else 0
+
     export = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "user": {
@@ -193,6 +434,7 @@ async def export_account_data(
             "phone": current_user.phone,
             "timezone": current_user.timezone,
             "department": current_user.department,
+            "notification_preferences": getattr(current_user, "notification_preferences", None) or {},
             "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
             "last_login_at": current_user.last_login_at.isoformat() if current_user.last_login_at else None,
         },
@@ -201,7 +443,18 @@ async def export_account_data(
             for m in all_memberships
         ],
         "business": business_data,
+        "business_config": business_config_data,
         "team_members": team_members,
+        "saved_recipients": saved_recipients,
+        "api_keys": api_keys_data,
+        "webhooks": webhooks_data,
+        "approval_rules": approval_rules_data,
+        "blocklist_entries": blocklist_data,
+        "scheduled_runs": scheduled_runs_data,
+        "kyc": kyc_data,
+        "individual_kyc": individual_kyc_data,
+        "wallet": wallet_data,
+        "ai_credits_balance": ai_credits_balance,
         "runs": runs,
         "transactions": transactions,
         "audit_logs": audit_logs,
@@ -262,6 +515,18 @@ async def delete_account(
     membership = await _require_owner(session, current_user.id)
     business_id = membership.business_id
 
+    # ── Wallet must be empty before deletion ──────────────────────────────────
+    wallet_check = (
+        await session.execute(
+            select(WalletModel).where(WalletModel.business_id == business_id)
+        )
+    ).scalars().first()
+    if wallet_check and wallet_check.balance > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Your wallet has a balance of ₦{wallet_check.balance:,.2f}. Please withdraw all funds before deleting your organisation.",
+        )
+
     # ── Verify identity ───────────────────────────────────────────────────────
     if getattr(current_user, "totp_enabled_at", None) is not None:
         if not body.totp_code:
@@ -289,6 +554,8 @@ async def delete_account(
             )
 
     # ── Soft-delete ───────────────────────────────────────────────────────────
+    _now = datetime.now(timezone.utc)
+
     biz = (
         await session.execute(
             select(BusinessModel).where(BusinessModel.id == business_id)
@@ -306,6 +573,42 @@ async def delete_account(
     ).scalars().all()
     for m in members:
         m.is_active = False
+
+    # Revoke all API keys
+    api_keys = (
+        await session.execute(
+            select(ApiKeyModel).where(
+                ApiKeyModel.business_id == business_id,
+                ApiKeyModel.revoked_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    for k in api_keys:
+        k.revoked_at = _now
+
+    # Deactivate all webhooks
+    webhooks = (
+        await session.execute(
+            select(WebhookModel).where(
+                WebhookModel.business_id == business_id,
+                WebhookModel.is_active.is_(True),
+            )
+        )
+    ).scalars().all()
+    for wh in webhooks:
+        wh.is_active = False
+
+    # Pause all scheduled runs
+    sched_runs = (
+        await session.execute(
+            select(ScheduledRunModel).where(
+                ScheduledRunModel.business_id == business_id,
+                ScheduledRunModel.is_active.is_(True),
+            )
+        )
+    ).scalars().all()
+    for sr in sched_runs:
+        sr.is_active = False
 
     current_user.is_active = False
 
@@ -482,7 +785,6 @@ async def import_account_data(
             if normalized == normalize_email(current_user.email):
                 continue
 
-            # Check if already a member
             target_user = await user_repo.get_by_email(normalized)
             if target_user:
                 from sqlalchemy import and_
@@ -500,8 +802,7 @@ async def import_account_data(
                     skipped_count += 1
                     continue
 
-                from src.infrastructure.database.flowpilot_models import BusinessMemberModel as _BMM
-                member = _BMM(
+                member = BusinessMemberModel(
                     business_id=business_id,
                     user_id=target_user.id,
                     role=role if role in ("approver", "analyst") else "analyst",
@@ -544,6 +845,181 @@ async def import_account_data(
         if invited_count > 0:
             restored.append(f"team_members ({invited_count} re-invited, {skipped_count} skipped)")
 
+    # ── Restore business config ───────────────────────────────────────────────
+    biz_config_data = data.get("business_config") or {}
+    if biz_config_data:
+        biz_config = (
+            await session.execute(
+                select(BusinessConfigModel).where(BusinessConfigModel.business_id == business_id)
+            )
+        ).scalars().first()
+        if biz_config:
+            _config_fields = (
+                "monthly_txn_volume_range", "avg_monthly_payouts_range", "primary_bank",
+                "primary_use_cases", "risk_appetite",
+                "default_budget_cap", "daily_payout_limit", "single_payout_cap",
+                "risk_alert_threshold", "liquidity_alert_buffer",
+            )
+            for field in _config_fields:
+                val = biz_config_data.get(field)
+                if val is not None and not getattr(biz_config, field, None):
+                    setattr(biz_config, field, val)
+            _rt = biz_config_data.get("default_risk_tolerance")
+            if _rt is not None and biz_config.default_risk_tolerance == 0.35:
+                biz_config.default_risk_tolerance = _rt
+            restored.append("business_config")
+
+    # ── Restore saved recipients ──────────────────────────────────────────────
+    saved_recipients = data.get("saved_recipients") or []
+    if saved_recipients:
+        from sqlalchemy import and_ as _and
+        recipients_added = 0
+        for r in saved_recipients:
+            acct = r.get("account_number")
+            inst = r.get("institution_code")
+            name = r.get("name")
+            if not acct or not inst or not name:
+                continue
+            dup = (
+                await session.execute(
+                    select(SavedRecipientModel).where(
+                        _and(
+                            SavedRecipientModel.business_id == business_id,
+                            SavedRecipientModel.account_number == acct,
+                            SavedRecipientModel.institution_code == inst,
+                        )
+                    )
+                )
+            ).scalars().first()
+            if dup:
+                continue
+            session.add(SavedRecipientModel(
+                business_id=business_id,
+                name=name,
+                account_number=acct,
+                institution_code=inst,
+                email=r.get("email"),
+                notes=r.get("notes"),
+                tags=r.get("tags") or [],
+            ))
+            recipients_added += 1
+        if recipients_added:
+            restored.append(f"saved_recipients ({recipients_added} restored)")
+
+    # ── Restore approval rules ────────────────────────────────────────────────
+    approval_rules = data.get("approval_rules") or []
+    if approval_rules:
+        _valid_conditions = {"amount_above", "risk_score_above", "always"}
+        rules_added = 0
+        for r in approval_rules:
+            condition = r.get("condition")
+            if condition not in _valid_conditions:
+                continue
+            session.add(ApprovalRuleModel(
+                business_id=business_id,
+                name=r.get("name") or "Imported rule",
+                condition=condition,
+                threshold=r.get("threshold") or 0,
+                required_approvers=max(1, int(r.get("required_approvers") or 1)),
+                approver_roles=r.get("approver_roles") or ["approver"],
+                is_active=bool(r.get("is_active", True)),
+            ))
+            rules_added += 1
+        if rules_added:
+            restored.append(f"approval_rules ({rules_added} restored)")
+
+    # ── Restore blocklist entries ─────────────────────────────────────────────
+    blocklist_entries = data.get("blocklist_entries") or []
+    if blocklist_entries:
+        _valid_types = {"account_number", "beneficiary_name", "bank_code"}
+        from sqlalchemy import and_ as _and2
+        blocklist_added = 0
+        for e in blocklist_entries:
+            etype = e.get("type")
+            evalue = e.get("value")
+            if etype not in _valid_types or not evalue:
+                continue
+            dup = (
+                await session.execute(
+                    select(BlocklistEntryModel).where(
+                        _and2(
+                            BlocklistEntryModel.business_id == business_id,
+                            BlocklistEntryModel.type == etype,
+                            BlocklistEntryModel.value == evalue,
+                            BlocklistEntryModel.is_active.is_(True),
+                        )
+                    )
+                )
+            ).scalars().first()
+            if dup:
+                continue
+            session.add(BlocklistEntryModel(
+                business_id=business_id,
+                type=etype,
+                value=evalue,
+                reason=e.get("reason") or "",
+                is_active=True,
+            ))
+            blocklist_added += 1
+        if blocklist_added:
+            restored.append(f"blocklist_entries ({blocklist_added} restored)")
+
+    # ── Restore scheduled runs (imported as paused) ───────────────────────────
+    scheduled_runs = data.get("scheduled_runs") or []
+    if scheduled_runs:
+        runs_added = 0
+        for sr in scheduled_runs:
+            name = sr.get("name")
+            objective = sr.get("objective")
+            if not name or not objective:
+                continue
+            session.add(ScheduledRunModel(
+                business_id=business_id,
+                created_by=current_user.id,
+                name=name,
+                objective=objective,
+                run_type=sr.get("run_type") or "recurring",
+                cron_expression=sr.get("cron_expression"),
+                frequency_label=sr.get("frequency_label") or "Custom",
+                is_active=False,
+                run_config=sr.get("run_config") or {},
+            ))
+            runs_added += 1
+        if runs_added:
+            restored.append(f"scheduled_runs ({runs_added} restored, paused)")
+
+    # ── Restore webhooks (imported as inactive) ───────────────────────────────
+    webhooks_to_restore = data.get("webhooks") or []
+    if webhooks_to_restore:
+        import secrets as _secrets
+        from app.api.auth.passwords import hash_password as _hp
+        webhooks_added = 0
+        for wh in webhooks_to_restore:
+            url = wh.get("url")
+            if not url:
+                continue
+            raw_secret = f"whsec_{_secrets.token_hex(32)}"
+            session.add(WebhookModel(
+                business_id=business_id,
+                created_by=current_user.id,
+                url=url,
+                events=wh.get("events") or [],
+                is_active=False,
+                secret_hash=_hp(raw_secret),
+                signing_secret=raw_secret,
+            ))
+            webhooks_added += 1
+        if webhooks_added:
+            restored.append(f"webhooks ({webhooks_added} restored, inactive)")
+
+    # ── Restore notification preferences ─────────────────────────────────────
+    notif_prefs = (data.get("user") or {}).get("notification_preferences")
+    if notif_prefs and isinstance(notif_prefs, dict):
+        existing_prefs = dict(getattr(current_user, "notification_preferences", None) or {})
+        if not existing_prefs:
+            current_user.notification_preferences = notif_prefs
+            restored.append("notification_preferences")
+
     await session.commit()
 
     return {
@@ -551,3 +1027,62 @@ async def import_account_data(
         "restored": restored,
         "exported_at": data.get("exported_at"),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification preferences
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_PREFS = {
+    "login_alerts": True,
+    "security_alerts": True,
+    "payout_updates": True,
+    "kyc_updates": True,
+    "api_key_warnings": True,
+    "wallet_alerts": True,
+    "scheduled_run_reminders": True,
+}
+
+_ALLOWED_PREF_KEYS = set(_DEFAULT_PREFS.keys())
+
+
+class NotificationPreferencesUpdate(BaseModel):
+    login_alerts: Optional[bool] = None
+    security_alerts: Optional[bool] = None
+    payout_updates: Optional[bool] = None
+    kyc_updates: Optional[bool] = None
+    api_key_warnings: Optional[bool] = None
+    wallet_alerts: Optional[bool] = None
+    scheduled_run_reminders: Optional[bool] = None
+
+
+@router.get("/notification-preferences")
+async def get_notification_preferences(
+    current_user=Depends(get_current_user),
+):
+    """Return the current user's notification preferences (merged with defaults)."""
+    stored = getattr(current_user, "notification_preferences", None) or {}
+    return {**_DEFAULT_PREFS, **stored}
+
+
+@router.patch("/notification-preferences")
+async def update_notification_preferences(
+    body: NotificationPreferencesUpdate,
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Update one or more notification preference toggles."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one preference must be provided",
+        )
+
+    existing = dict(getattr(current_user, "notification_preferences", None) or {})
+    existing.update(updates)
+    current_user.notification_preferences = existing
+    current_user.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    return {**_DEFAULT_PREFS, **existing}

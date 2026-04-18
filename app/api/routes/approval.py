@@ -599,12 +599,14 @@ async def approve_candidates(
                         resource_type="wallet",
                     )
                     await session.commit()
-                    _asyncio2.create_task(_send_lb(
-                        to=_owner_user.email,
-                        display_name=_owner_user.display_name or _owner_user.email,
-                        balance=_wallet_balance_after,
-                        threshold=float(_LOW_THRESHOLD_VAL),
-                    ))
+                    from src.services.email_service import check_notification_pref as _cnp_lb
+                    if _cnp_lb(_owner_user, "wallet_alerts"):
+                        _asyncio2.create_task(_send_lb(
+                            to=_owner_user.email,
+                            display_name=_owner_user.display_name or _owner_user.email,
+                            balance=_wallet_balance_after,
+                            threshold=float(_LOW_THRESHOLD_VAL),
+                        ))
             except Exception as _lb_exc:
                 logger.warning("[Wallet] Low-balance alert failed after approval debit: %s", _lb_exc)
 
@@ -712,14 +714,16 @@ async def approve_candidates(
                 )
                 creator = creator_row.scalar_one_or_none()
                 if creator:
-                    await send_run_completed_email(
-                        to=creator.email,
-                        run_id=run_id,
-                        objective=run.objective,
-                        status=final_status,
-                        approved_count=approved_count,
-                        frontend_url=Settings.FRONTEND_URL,
-                    )
+                    from src.services.email_service import check_notification_pref as _cnp
+                    if _cnp(creator, "payout_updates"):
+                        await send_run_completed_email(
+                            to=creator.email,
+                            run_id=run_id,
+                            objective=run.objective,
+                            status=final_status,
+                            approved_count=approved_count,
+                            frontend_url=Settings.FRONTEND_URL,
+                        )
                     notif_repo = NotificationRepository(session)
                     if final_status == "completed":
                         await notif_repo.create(
@@ -978,17 +982,18 @@ async def assign_approver(
     # Email the newly assigned approver (best-effort, non-blocking)
     try:
         import asyncio as _asyncio_aa
-        from src.services.email_service import send_run_awaiting_approval_email as _send_aa
-        _asyncio_aa.create_task(
-            _send_aa(
-                to=assignee_user.email,
-                run_id=run_id,
-                objective=run.objective,
-                candidate_count=len(run.payout_candidates) if run.payout_candidates else 0,
-                approver_name=assignee_user.display_name or assignee_user.email,
-                frontend_url=Settings.FRONTEND_URL,
+        from src.services.email_service import send_run_awaiting_approval_email as _send_aa, check_notification_pref as _cnp_aa
+        if _cnp_aa(assignee_user, "payout_updates"):
+            _asyncio_aa.create_task(
+                _send_aa(
+                    to=assignee_user.email,
+                    run_id=run_id,
+                    objective=run.objective,
+                    candidate_count=len(run.payout_candidates) if run.payout_candidates else 0,
+                    approver_name=assignee_user.display_name or assignee_user.email,
+                    frontend_url=Settings.FRONTEND_URL,
+                )
             )
-        )
     except Exception as _email_exc:
         logger.warning(f"Run {run_id}: failed to email new approver: {_email_exc}")
 

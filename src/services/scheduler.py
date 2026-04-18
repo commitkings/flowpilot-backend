@@ -307,14 +307,15 @@ async def _check_api_key_expiry() -> None:
                     await session.commit()
 
                     # Email
-                    from src.services.email_service import send_api_key_expiry_warning
-                    await send_api_key_expiry_warning(
-                        to=owner.email,
-                        display_name=display_name,
-                        key_name=key.name,
-                        key_prefix=key.key_prefix,
-                        days_remaining=days_left,
-                    )
+                    from src.services.email_service import send_api_key_expiry_warning, check_notification_pref as _cnp_s
+                    if _cnp_s(owner, "api_key_warnings"):
+                        await send_api_key_expiry_warning(
+                            to=owner.email,
+                            display_name=display_name,
+                            key_name=key.name,
+                            key_prefix=key.key_prefix,
+                            days_remaining=days_left,
+                        )
                     logger.info(
                         "[Scheduler] Sent expiry warning for key %s (%d days left) to %s",
                         key.id,
@@ -410,18 +411,19 @@ async def _check_scheduled_reminders() -> None:
                         )
 
                         # Email
-                        from src.services.email_service import send_scheduled_run_reminder_email
-                        asyncio.create_task(
-                            send_scheduled_run_reminder_email(
-                                to=owner_user.email,
-                                display_name=owner_user.display_name or owner_user.email,
-                                schedule_name=scheduled.name,
-                                objective=scheduled.objective,
-                                fires_at=fires_at_str,
-                                frequency_label=scheduled.frequency_label,
-                                scheduled_run_id=str(scheduled.id),
+                        from src.services.email_service import send_scheduled_run_reminder_email, check_notification_pref as _cnp_sr
+                        if _cnp_sr(owner_user, "scheduled_run_reminders"):
+                            asyncio.create_task(
+                                send_scheduled_run_reminder_email(
+                                    to=owner_user.email,
+                                    display_name=owner_user.display_name or owner_user.email,
+                                    schedule_name=scheduled.name,
+                                    objective=scheduled.objective,
+                                    fires_at=fires_at_str,
+                                    frequency_label=scheduled.frequency_label,
+                                    scheduled_run_id=str(scheduled.id),
+                                )
                             )
-                        )
 
                         # Mark as reminded for this occurrence
                         await session.execute(

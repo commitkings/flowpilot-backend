@@ -70,6 +70,8 @@ class UserModel(Base):
     totp_grace_until: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))  # org-enforced grace deadline
     # Approval step-up PIN (bcrypt hash of 4-6 digit PIN)
     approval_pin_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Per-user email notification preferences (keys default to True when absent)
+    notification_preferences: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("now()")
     )

@@ -36,6 +36,8 @@ from src.services.email_service import (
     send_password_reset_email,
     send_verification_email,
     send_account_locked_email,
+    send_login_notification_email,
+    check_notification_pref,
 )
 from src.infrastructure.cache import otp_store
 from src.infrastructure.cache import password_reset_store
@@ -147,6 +149,7 @@ def _user_response(user, memberships) -> dict:
             if getattr(user, "totp_grace_until", None)
             else None
         ),
+        "notification_preferences": getattr(user, "notification_preferences", None) or {},
     }
 
 
@@ -554,6 +557,24 @@ async def login_with_password(
     requires_2fa_setup = config_q.scalars().first() is not None
 
     token = create_access_token(user.id, user.email)
+
+    if check_notification_pref(user, "login_alerts"):
+        import asyncio as _aio
+        _forwarded = request.headers.get("x-forwarded-for")
+        _ip = (_forwarded.split(",")[0].strip() if _forwarded else (request.client.host if request.client else None))
+        _ua = request.headers.get("user-agent")
+        _aio.create_task(
+            send_login_notification_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                email=user.email,
+                login_time=datetime.now(tz.utc).strftime("%d %b %Y, %I:%M %p UTC"),
+                ip_address=_ip,
+                user_agent=_ua,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+        )
+
     return {
         "token": token,
         "user": {
@@ -589,6 +610,7 @@ async def google_login(raw_tokens: bool = False):
 
 @router.get("/google/callback")
 async def google_callback(
+    request: Request,
     code: str,
     state: Optional[str] = None,
     raw_tokens: bool = False,
@@ -701,6 +723,25 @@ async def google_callback(
 
     # Issue JWT and redirect to frontend
     jwt_token = create_access_token(user.id, user.email)
+
+    if check_notification_pref(user, "login_alerts"):
+        from datetime import datetime as _dt, timezone as _tz2
+        import asyncio as _aio2
+        _fwd = request.headers.get("x-forwarded-for")
+        _gip = (_fwd.split(",")[0].strip() if _fwd else (request.client.host if request.client else None))
+        _gua = request.headers.get("user-agent")
+        _aio2.create_task(
+            send_login_notification_email(
+                to=user.email,
+                display_name=user.display_name or user.email,
+                email=user.email,
+                login_time=_dt.now(_tz2.utc).strftime("%d %b %Y, %I:%M %p UTC"),
+                ip_address=_gip,
+                user_agent=_gua,
+                frontend_url=Settings.FRONTEND_URL,
+            )
+        )
+
     redirect_url = f"{Settings.FRONTEND_URL}/auth/callback?token={jwt_token}"
     if requires_2fa_setup:
         redirect_url += "&requires_2fa_setup=true"
