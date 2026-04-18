@@ -409,6 +409,30 @@ def _build_risk_tools(state: AgentState, db_session=None) -> list[Tool]:
                     max_dup_score = sim
                     dup_match = other.get("candidate_id", f"candidate_{j}")
 
+            # Duplicate detection against historical transactions (double payment check)
+            historical_dup_score = 0.0
+            if account and amount > 0 and transactions:
+                # We check if there's a past transaction to the same account with the exact same amount
+                for t in transactions:
+                    t_account = t.get("accountNumber") or t.get("recipientAccount") or ""
+                    # Ensure it's a successful/completed transaction to strictly avoid counting pending duplicates
+                    t_status = str(t.get("status", "")).lower()
+                    if t_account == account and t_status in ("success", "successful", "completed"):
+                        t_amount_raw = t.get("amount") or t.get("transactionAmount") or 0.0
+                        try:
+                            t_amount = float(t_amount_raw)
+                        except (ValueError, TypeError):
+                            t_amount = 0.0
+                            
+                        # If the amount matches exactly or very closely (within 1 cent/kobo)
+                        if abs(t_amount - float(amount)) < 0.01:
+                            historical_dup_score = 0.98  # Highly likely a double payment!
+                            dup_match = t.get("transactionReference", "historical_txn")
+                            break
+            
+            # Combine the highest duplicate signal from either batch or history
+            max_dup_score = max(max_dup_score, historical_dup_score)
+
             # Velocity from current transactions (basic)
             same_account_in_txns = (
                 sum(

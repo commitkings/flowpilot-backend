@@ -36,7 +36,7 @@ def _serialize_candidate_with_run(candidate, run=None) -> dict:
         "currency": candidate.currency,
         "purpose": candidate.purpose,
         "risk_score": float(candidate.risk_score) if candidate.risk_score is not None else None,
-        "risk_reasons": candidate.risk_reasons,
+        "risk_reasons": [r for r in (candidate.risk_reasons or []) if not (isinstance(r, str) and r.startswith("NARRATIVE::"))],
         "risk_decision": candidate.risk_decision,
         "approval_status": candidate.approval_status,
         "execution_status": candidate.execution_status,
