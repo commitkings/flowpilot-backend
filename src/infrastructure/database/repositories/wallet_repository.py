@@ -303,43 +303,46 @@ class WalletRepository:
 
         total_debit = (suc + fee_charged).quantize(Decimal("0.01"))
         balance_before = wallet.balance
-        wallet.balance -= total_debit
         wallet.reserved_balance -= reservation.reserved_amount
         if wallet.reserved_balance < 0:
             wallet.reserved_balance = Decimal("0.00")
         wallet.updated_at = datetime.now(timezone.utc)
 
-        tx = WalletTransactionModel(
-            wallet_id=wallet.id,
-            business_id=business_id,
-            type="debit",
-            amount=total_debit,
-            reference=f"run_settle_{run_id}",
-            description="Payout run settlement (successful amounts + proportional fee)",
-            run_id=run_id,
-            balance_before=balance_before,
-            balance_after=wallet.balance,
-        )
-        self._session.add(tx)
-        await self._session.flush()
+        settle_led = None
+        if total_debit > 0:
+            wallet.balance -= total_debit
+            tx = WalletTransactionModel(
+                wallet_id=wallet.id,
+                business_id=business_id,
+                type="debit",
+                amount=total_debit,
+                reference=f"run_settle_{run_id}",
+                description="Payout run settlement (successful amounts + proportional fee)",
+                run_id=run_id,
+                balance_before=balance_before,
+                balance_after=wallet.balance,
+            )
+            self._session.add(tx)
+            await self._session.flush()
 
-        settle_led = await insert_ledger_entry(
-            self._session,
-            entry_type="wallet_settle",
-            gross_amount=suc,
-            net_amount=total_debit,
-            fee_amount=fee_charged,
-            direction="debit",
-            status="completed",
-            originator_type="business",
-            beneficiary_type="system",
-            business_id=business_id,
-            run_id=run_id,
-            narration=f"Settlement for run {run_id}",
-            prefix="WST",
-            source_table="wallet_transaction",
-            source_id=str(tx.id),
-        )
+        if total_debit > 0:
+            settle_led = await insert_ledger_entry(
+                self._session,
+                entry_type="wallet_settle",
+                gross_amount=suc,
+                net_amount=total_debit,
+                fee_amount=fee_charged,
+                direction="debit",
+                status="completed",
+                originator_type="business",
+                beneficiary_type="system",
+                business_id=business_id,
+                run_id=run_id,
+                narration=f"Settlement for run {run_id}",
+                prefix="WST",
+                source_table="wallet_transaction",
+                source_id=str(tx.id),
+            )
 
         if failed_payout_total > 0:
             await insert_ledger_entry(

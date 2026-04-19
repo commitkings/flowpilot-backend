@@ -372,9 +372,12 @@ async def _execute_approved_run(
             # Notify / email creator
             try:
                 from sqlalchemy import select as _select
+                from sqlalchemy.orm import selectinload as _selectinload
                 if created_by:
                     creator_row = await session.execute(
-                        _select(UserModel).where(UserModel.id == created_by)
+                        _select(UserModel)
+                        .options(_selectinload(UserModel.profile), _selectinload(UserModel.notification_pref_rows))
+                        .where(UserModel.id == created_by)
                     )
                     creator = creator_row.scalar_one_or_none()
                     if creator:
@@ -412,7 +415,7 @@ async def _execute_approved_run(
             logger.error(f"Run {run_id}: background execution failed: {e}", exc_info=True)
             try:
                 await session.rollback()
-                recovery_status = "awaiting_approval" if Settings.is_payout_simulated() else "failed"
+                recovery_status = "failed"
                 await run_repo.update_status(run_uuid, recovery_status, str(e))
                 await session.commit()
                 await _sync_conversation_after_run(session, run_uuid, "failed", str(e))
