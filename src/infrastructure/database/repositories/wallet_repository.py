@@ -294,8 +294,8 @@ class WalletRepository:
             return False
 
         wallet = await self._get_locked(business_id)
-        suc = successful_payout_total.quantize(Decimal("0.01"))
-        orig = original_payout_total.quantize(Decimal("0.01"))
+        suc = Decimal(str(successful_payout_total)).quantize(Decimal("0.01"))
+        orig = Decimal(str(original_payout_total)).quantize(Decimal("0.01"))
         if orig > 0:
             fee_charged = (platform_fee_amount * (suc / orig)).quantize(Decimal("0.01"))
         else:

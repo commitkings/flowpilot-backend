@@ -295,16 +295,14 @@ class RunOrchestrator:
         if not approved:
             return
 
-        orig = sum(Decimal(str(c.amount)) for c in approved)
+        orig = sum((Decimal(str(c.amount)) for c in approved), Decimal("0"))
         succ = sum(
-            Decimal(str(c.amount))
-            for c in approved
-            if str(c.execution_status).lower() == "success"
+            (Decimal(str(c.amount)) for c in approved if str(c.execution_status).lower() == "success"),
+            Decimal("0"),
         )
         failed = sum(
-            Decimal(str(c.amount))
-            for c in approved
-            if str(c.execution_status).lower() == "failed"
+            (Decimal(str(c.amount)) for c in approved if str(c.execution_status).lower() == "failed"),
+            Decimal("0"),
         )
 
         wr = WalletRepository(self._session)

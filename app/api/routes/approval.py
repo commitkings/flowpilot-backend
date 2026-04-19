@@ -290,6 +290,7 @@ async def _execute_approved_run(
     objective: str,
     created_by,
     approved_count: int,
+    payout_total: "Decimal",
     state: dict,
 ) -> None:
     """Run execute→audit pipeline in the background after approval is committed."""
@@ -340,6 +341,31 @@ async def _execute_approved_run(
                 _asyncio.create_task(_dispatch(business_id, run_event, webhook_payload))
             except Exception as _wh_exc:
                 logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
+
+            # Update monthly KYC limit tracker only on success
+            if final_status == "completed":
+                try:
+                    from decimal import Decimal as _D2
+                    from datetime import date as _date2, datetime as _dt3, timezone as _tz3
+                    from sqlalchemy import select as _sa_lim
+                    from src.infrastructure.database.flowpilot_models import KycLimitTrackerModel as _KycTracker
+                    _t2 = await session.execute(
+                        _sa_lim(_KycTracker).where(_KycTracker.business_id == business_id)
+                    )
+                    _tracker2 = _t2.scalar_one_or_none()
+                    _amount = _D2(str(payout_total))
+                    if _tracker2 is None:
+                        session.add(_KycTracker(
+                            business_id=business_id,
+                            monthly_payout_used=_amount,
+                            month_start=_date2.today().replace(day=1),
+                        ))
+                    else:
+                        _tracker2.monthly_payout_used += _amount
+                        _tracker2.updated_at = _dt3.now(_tz3.utc)
+                    await session.commit()
+                except Exception as _lim_exc:
+                    logger.warning("Could not update KYC limit tracker: %s", _lim_exc)
 
             await _sync_conversation_after_run(session, run_uuid, final_status, state.get("error"))
 
@@ -670,28 +696,7 @@ async def approve_candidates(
             run.platform_fee_rate = _PLATFORM_FEE_RATE
             run.platform_fee_amount = _fee_amount
 
-            # Update monthly KYC limit tracker
-            try:
-                from sqlalchemy import select as _sa_lim
-                from src.infrastructure.database.flowpilot_models import KycLimitTrackerModel as _KycTracker
-                from datetime import datetime as _dt2, timezone as _tz2, date as _d2
-                _t2 = await session.execute(
-                    _sa_lim(_KycTracker).where(_KycTracker.business_id == run.business_id)
-                )
-                _tracker2 = _t2.scalar_one_or_none()
-                if _tracker2 is None:
-                    # Shouldn't happen (created during pre-check), but create defensively
-                    _tracker2 = _KycTracker(
-                        business_id=run.business_id,
-                        monthly_payout_used=_total_decimal,
-                        month_start=_date.today().replace(day=1),
-                    )
-                    session.add(_tracker2)
-                else:
-                    _tracker2.monthly_payout_used += _total_decimal
-                    _tracker2.updated_at = _dt2.now(_tz2.utc)
-            except Exception as _lim_exc:
-                logger.warning("Could not update KYC limit tracker: %s", _lim_exc)
+            # Monthly KYC limit is updated only after successful execution (in background task)
 
         except _InsufficientBalance as exc:
             # Revert status so the approver can try again after topping up
@@ -800,6 +805,7 @@ async def approve_candidates(
         objective=run.objective,
         created_by=run.created_by,
         approved_count=approved_count,
+        payout_total=_total_decimal,
         state=state,
     ))
 
