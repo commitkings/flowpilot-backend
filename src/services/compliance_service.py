@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.infrastructure.database.flowpilot_models import (
@@ -30,7 +31,11 @@ class ComplianceService:
         self, *, business_id: UUID, candidate_id: UUID
     ) -> TravelRulePayload:
         biz = (
-            await self.session.execute(select(BusinessModel).where(BusinessModel.id == business_id))
+            await self.session.execute(
+                select(BusinessModel)
+                .options(selectinload(BusinessModel.address_row))
+                .where(BusinessModel.id == business_id)
+            )
         ).scalar_one()
         candidate = (
             await self.session.execute(
@@ -79,9 +84,11 @@ class ComplianceService:
 
     @staticmethod
     def validate_payload(payload: TravelRulePayload) -> list[str]:
+        # originator_bvn is optional: businesses that verified via NIN won't have one
+        OPTIONAL_FIELDS = {"beneficiary_bank_name", "beneficiary_address", "originator_bvn"}
         missing: list[str] = []
         for field, value in asdict(payload).items():
-            if field in {"beneficiary_bank_name", "beneficiary_address"}:
+            if field in OPTIONAL_FIELDS:
                 continue
             if not value:
                 missing.append(field)

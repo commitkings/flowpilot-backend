@@ -33,6 +33,7 @@ from src.infrastructure.database.flowpilot_models import (
     BlocklistEntryModel,
     BusinessMemberModel,
 )
+from src.services.user_audit_service import log_user_audit_event
 
 router = APIRouter(tags=["org-config"])
 
@@ -146,6 +147,14 @@ async def create_approval_rule(
         is_active=body.is_active,
     )
     session.add(rule)
+    await log_user_audit_event(
+        session,
+        event_type="org.approval_rule_created",
+        user_id=current_user.id,
+        business_id=business_id,
+        resource_type="approval_rule",
+        metadata={"name": body.name, "condition": body.condition, "required_approvers": body.required_approvers},
+    )
     await session.commit()
     await session.refresh(rule)
     return _serialize_rule(rule)
@@ -210,6 +219,15 @@ async def update_approval_rule(
     await session.execute(
         update(ApprovalRuleModel).where(ApprovalRuleModel.id == rule_id).values(**values)
     )
+    await log_user_audit_event(
+        session,
+        event_type="org.approval_rule_updated",
+        user_id=current_user.id,
+        business_id=business_id,
+        resource_type="approval_rule",
+        resource_id=rule_id,
+        metadata={k: v for k, v in values.items() if k != "updated_at"},
+    )
     await session.commit()
     await session.refresh(rule)
     return _serialize_rule(rule)
@@ -234,6 +252,14 @@ async def delete_approval_rule(
 
     await session.execute(
         delete(ApprovalRuleModel).where(ApprovalRuleModel.id == rule_id)
+    )
+    await log_user_audit_event(
+        session,
+        event_type="org.approval_rule_deleted",
+        user_id=current_user.id,
+        business_id=business_id,
+        resource_type="approval_rule",
+        resource_id=rule_id,
     )
     await session.commit()
     return {"status": "deleted"}
@@ -328,6 +354,14 @@ async def create_blocklist_entry(
         is_active=True,
     )
     session.add(entry)
+    await log_user_audit_event(
+        session,
+        event_type="org.blocklist_entry_created",
+        user_id=current_user.id,
+        business_id=business_id,
+        resource_type="blocklist_entry",
+        metadata={"type": body.type, "value": body.value},
+    )
     await session.commit()
     await session.refresh(entry)
     return _serialize_blocklist(entry, added_by_email=current_user.email)
@@ -361,6 +395,15 @@ async def update_blocklist_entry(
         await session.execute(
             update(BlocklistEntryModel).where(BlocklistEntryModel.id == entry_id).values(**values)
         )
+        await log_user_audit_event(
+            session,
+            event_type="org.blocklist_entry_updated",
+            user_id=current_user.id,
+            business_id=business_id,
+            resource_type="blocklist_entry",
+            resource_id=entry_id,
+            metadata=values,
+        )
         await session.commit()
         await session.refresh(entry)
 
@@ -386,6 +429,14 @@ async def delete_blocklist_entry(
 
     await session.execute(
         delete(BlocklistEntryModel).where(BlocklistEntryModel.id == entry_id)
+    )
+    await log_user_audit_event(
+        session,
+        event_type="org.blocklist_entry_deleted",
+        user_id=current_user.id,
+        business_id=business_id,
+        resource_type="blocklist_entry",
+        resource_id=entry_id,
     )
     await session.commit()
     return {"status": "deleted"}

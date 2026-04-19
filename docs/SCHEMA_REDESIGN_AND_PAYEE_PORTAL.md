@@ -5,6 +5,8 @@
 **Date:** April 2026  
 **Regulatory Frameworks:** CBN AML/CFT Guidelines 2023, NDPC Act 2023, FATF Recommendation 16 (Travel Rule), ISO 20022
 
+**Product scope:** FlowPilot serves **registered businesses and individual payers** (sole traders, freelancers, and other natural persons operating as payers), as well as **payees** (recipients paid through the platform). The data model uses a single `business` row per payer account with `account_type IN ('business', 'individual')`; wording below may say “business” when it means that payer account row.
+
 ---
 
 ## Table of Contents
@@ -14,6 +16,7 @@
 3. [Normalization Principles Applied](#3-normalization-principles-applied)
 4. [Nigerian Regulatory Requirements](#4-nigerian-regulatory-requirements)
 5. [Normalized Schema — Full Design](#5-normalized-schema--full-design)
+   - [5.0 Cross-domain prerequisites (DDL order)](#50-cross-domain-prerequisites-ddl-order)
 6. [Payee Self-Service Portal — Full Design](#6-payee-self-service-portal--full-design)
 7. [Implementation Phases](#7-implementation-phases)
 8. [Migration Strategy](#8-migration-strategy)
@@ -24,7 +27,7 @@
 
 ## 1. Executive Summary
 
-The current FlowPilot schema has several structural problems that create audit risk, compliance exposure, and technical debt. Specifically:
+The current FlowPilot schema has several structural problems that create audit risk, compliance exposure, and technical debt. The platform already supports **both** company accounts and **individual payer** accounts (see `business.account_type` and individual KYC flows); the redesign below makes that split explicit in the schema and documentation. Specifically:
 
 - **Tables with 25–30+ columns** that mix concerns (auth + profile, config + policy, identity + document)
 - **Repeated data groups** in single rows (KYC levels 1/2/3 as column groups violates 1NF)
@@ -33,7 +36,7 @@ The current FlowPilot schema has several structural problems that create audit r
 - **No complete general-purpose audit event table** — the existing `audit_log` only covers agent actions, not user actions (login, config changes, team changes), which is a CBN AML requirement
 - **Virtual account fields embedded on `business`** rather than a dedicated table — limits future multi-account support
 - **No `platform_fee_transaction` ledger** — fees are stored only on `agent_run`, not in an immutable ledger as required by financial accounting standards
-- **No central transaction ledger** — money movements are split across 6 tables with no unified view; a CBN auditor asking "show me every naira this business moved" requires a UNION across `wallet_transaction`, `payout_candidate`, `payout_execution`, `reconciled_transaction`, `platform_fee_transaction`, and `ai_credit_transaction` — which is unacceptable for a regulated financial platform
+- **No central transaction ledger** — money movements are split across 6 tables with no unified view; a CBN auditor asking "show me every naira this **payer account** moved" (whether that account is a registered company or an individual) requires a UNION across `wallet_transaction`, `payout_candidate`, `payout_execution`, `reconciled_transaction`, `platform_fee_transaction`, and `ai_credit_transaction` — which is unacceptable for a regulated financial platform
 
 This document redesigns every affected table to 3NF (Third Normal Form), adds the missing compliance infrastructure, and introduces the Payee Self-Service Portal as a set of new, properly normalized tables.
 
@@ -84,7 +87,7 @@ This table contains fields for 5 different business types in the same row, with 
 
 The three KYC levels are stored as repeating column groups: `level_1_type`, `level_1_value`, `level_1_status`, `level_1_submitted_at`, `level_1_verified_at` — then repeated for level 2 and 3. This is a textbook First Normal Form violation.
 
-**Fix:** Replace with `kyc_verification_level` table — one row per level per business.
+**Fix:** Replace with `kyc_verification_level` table — one row per level **per payer** (the `business` row, including `account_type = 'individual'`).
 
 ### 2.6 `payout_candidate` table (28 columns — mixed concerns)
 
@@ -178,6 +181,20 @@ For interoperability with NIP/NIBSS and future international transfers, transact
 
 ## 5. Normalized Schema — Full Design
 
+### 5.0 Cross-domain prerequisites (DDL order)
+
+Sections below are grouped by **domain**, not by PostgreSQL `CREATE TABLE` order. The following objects are **referenced before they appear** in this document:
+
+| Referenced object | Referenced from | Defined in |
+|-------------------|-----------------|------------|
+| `payee_profile` | `payee_bank_account.payee_profile_id`, `ledger_entry.beneficiary_payee_profile_id`, `consent_record.payee_profile_id` | [§6.2 — `payee_profile`](#62-new-tables) |
+
+**Greenfield database:** Create `payee_profile` (and enable the `user` rows that payees need) **before** running the DDL for `payee_bank_account`, `ledger_entry`, and `consent_record`, or add those foreign keys in a follow-up migration after `payee_profile` exists.
+
+**Phased rollout:** [Phase 5 — Payee Self-Service Portal](#phase-5--payee-self-service-portal) creates `payee_profile` early; beneficiary and ledger migrations attach nullable FKs or use a second migration step so production never violates dependency order.
+
+---
+
 ### 5.1 Auth & Identity Domain
 
 #### `user` (reformed — 10 columns)
@@ -197,7 +214,7 @@ CREATE TABLE "user" (
 );
 ```
 
-> **Note:** `account_type` distinguishes payer users (business owners/members) from payee users (recipients). This is the key field for the Payee Portal.
+> **Note:** `account_type` distinguishes **payer** users (anyone acting for a payer account—company team members or a natural person using an individual payer account) from **payee** users (recipients). This is the key field for the Payee Portal. The same human may use FlowPilot as a payer in one context and as a payee in another, with separate auth rows if both apply.
 
 ---
 
@@ -457,6 +474,9 @@ CREATE TABLE business_use_case (
 ### 5.3 KYC Domain (Fully Normalized)
 
 #### `kyc_submission` (reformed — header only)
+
+`business_id` names the **payer account** row in `business`, including when `business.account_type = 'individual'` (sole trader / natural person payer). It is not limited to incorporated companies.
+
 ```sql
 CREATE TABLE kyc_submission (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -808,13 +828,15 @@ FROM wallet
 WHERE business_id = $1;
 ```
 
-This is what the wallet UI should always display — three distinct numbers so the business always understands exactly where their money is.
+This is what the wallet UI should always display — three distinct numbers so the **payer** (business or individual account) always understands exactly where their money is.
 
 ---
 
 #### `payee_bank_account` (new — single source of truth for beneficiary identity)
 
 This is the most critical normalization fix. All five tables that currently store raw `account_number + bank_code + name` will FK to this instead.
+
+> **Dependency:** `payee_profile` must exist before this table if you include `REFERENCES payee_profile(id)` — see [§5.0](#50-cross-domain-prerequisites-ddl-order).
 
 ```sql
 CREATE TABLE payee_bank_account (
@@ -899,6 +921,8 @@ CREATE INDEX platform_fee_tx_created_at_idx ON platform_fee_transaction USING BR
 Every single naira movement that passes through FlowPilot writes exactly one row here. Specialized tables (`wallet_transaction`, `payout_candidate`, `platform_fee_transaction`) remain for domain-specific detail but all carry a `ledger_entry_id` FK back to this table.
 
 This is the single table a CBN examiner, auditor, or reconciliation engineer queries first.
+
+> **Dependency:** `beneficiary_payee_profile_id` references `payee_profile` — create `payee_profile` first or add this FK later; see [§5.0](#50-cross-domain-prerequisites-ddl-order).
 
 ```sql
 CREATE TABLE ledger_entry (
@@ -1067,8 +1091,7 @@ CREATE TABLE ledger_entry (
     -- Always equals initiated_at. Separate field for consistency with other tables.
 );
 
--- Indexes
-CREATE UNIQUE INDEX ledger_entry_internal_ref_idx   ON ledger_entry(internal_reference);
+-- Indexes (internal_reference is already UNIQUE on the column; no separate unique index needed)
 CREATE INDEX ledger_entry_client_ref_idx            ON ledger_entry(client_reference)
     WHERE client_reference IS NOT NULL;
 CREATE INDEX ledger_entry_provider_ref_idx          ON ledger_entry(provider_reference)
@@ -1197,6 +1220,9 @@ CREATE TABLE suspicious_activity_report (
 ---
 
 #### `consent_record` (new — NDPC Act 2023)
+
+> **Dependency:** `payee_profile_id` references `payee_profile` — see [§5.0](#50-cross-domain-prerequisites-ddl-order).
+
 ```sql
 CREATE TABLE consent_record (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1223,7 +1249,9 @@ CREATE INDEX consent_record_payee_profile_id_idx ON consent_record(payee_profile
 
 ### 6.1 Overview
 
-The Payee Portal introduces a new account type (`account_type = 'payee'` on the `user` table) with a completely separate experience from payer accounts. The same `user` table is used for auth, but a separate `payee_profile` table holds all payee-specific data.
+The Payee Portal introduces a new account type (`account_type = 'payee'` on the `user` table) with a completely separate experience from payer accounts. The same `user` table is used for auth, but a separate `payee_profile` table holds all payee-specific data. Payees are typically **individuals** (employees, contractors, freelancers); the model still supports a **business name** on the profile for sole traders and small vendors.
+
+**Relationship to individual payers:** A person can be an **individual payer** (their money out via `business.account_type = 'individual'`) on one journey and a **payee** on another; those are separate `user`/`business` vs `payee_profile` records, linked operationally by bank account and KYC where required.
 
 **Entry point:** Payment notification email contains a CTA button. Payee clicks it, enters email, verifies, and their payment history (matched by bank account) is immediately visible.
 
@@ -1539,13 +1567,14 @@ When a payout run executes and a payment is successful:
 # In execution agent — post-execution hook
 async def _link_payee_after_payment(candidate: PayoutCandidateModel, session):
     # Find payee_bank_account by account_number + institution_code
-    bank_account = await session.execute(
+    result = await session.execute(
         select(PayeeBankAccountModel).where(
             PayeeBankAccountModel.account_number == candidate.bank_account.account_number,
             PayeeBankAccountModel.institution_code == candidate.bank_account.institution_code
         )
     )
-    if bank_account and bank_account.payee_profile_id:
+    bank_account = result.scalar_one_or_none()
+    if bank_account is not None and bank_account.payee_profile_id:
         # Create receipt
         receipt = PayeePaymentReceiptModel(
             payee_profile_id=bank_account.payee_profile_id,
@@ -1569,13 +1598,14 @@ When a payer creates a new run and enters a recipient:
 
 ```python
 # In run creation — before BAV
-bank_account = await session.execute(
+result = await session.execute(
     select(PayeeBankAccountModel).where(
         PayeeBankAccountModel.account_number == input_account_number,
         PayeeBankAccountModel.institution_code == input_institution_code
     )
 )
-if bank_account and bank_account.is_bav_verified:
+bank_account = result.scalar_one_or_none()
+if bank_account is not None and bank_account.is_bav_verified:
     # Skip BAV — already verified
     # Pre-populate candidate with verified name
     # Show payer: "✓ Verified FlowPilot payee — Chidera Ozigbo"

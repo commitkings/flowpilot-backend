@@ -11,10 +11,11 @@ import jwt
 from src.config.settings import Settings
 
 
-def create_access_token(user_id: uuid.UUID, email: str) -> str:
+def create_access_token(user_id: uuid.UUID, email: str, security_version: int = 0) -> str:
     payload = {
         "sub": str(user_id),
         "email": email,
+        "sv": security_version,
         "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc)
         + timedelta(hours=Settings.JWT_EXPIRY_HOURS),

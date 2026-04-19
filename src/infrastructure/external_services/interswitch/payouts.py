@@ -9,6 +9,7 @@ Uses the Payouts Service hosted at api.interswitchng.com:
 """
 
 import logging
+from decimal import Decimal
 from typing import Optional
 
 from src.config.settings import Settings
@@ -44,7 +45,7 @@ class PayoutClient:
     async def execute_single_payout(
         self,
         transaction_reference: str,
-        amount_ngn: float,
+        amount_ngn: Decimal,
         narration: str,
         account_number: str,
         institution_code: str,
@@ -138,7 +139,7 @@ class PayoutClient:
 
         Each item dict must contain:
             transaction_reference (str): From prior customer-lookup
-            amount (float): In NGN (major denomination)
+            amount (Decimal): In NGN (major denomination)
             account_number (str): Recipient account
             institution_code (str): Bank code
             client_reference (str, optional): Internal tracking ref

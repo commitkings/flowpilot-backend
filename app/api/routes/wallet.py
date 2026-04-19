@@ -7,8 +7,8 @@ GET  /wallet/transactions    — paginated ledger (owner, approver)
 
 import logging
 import uuid
-from decimal import Decimal, InvalidOperation
-from typing import Optional
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -39,16 +39,21 @@ router = APIRouter()
 class WalletResponse(BaseModel):
     id: str
     business_id: str
-    balance: float
+    balance: Decimal
+    reserved_balance: Decimal = Decimal("0.00")
+    available_balance: Decimal = Decimal("0.00")
     currency: str
-    total_credit: float = 0.0
-    total_debit: float = 0.0
+    total_credit: Decimal = Decimal("0.00")
+    total_debit: Decimal = Decimal("0.00")
     created_at: str
     updated_at: str
+    # instant = POST /wallet/topup can credit (simulated / lookup_only with Monnify, or non-Monnify).
+    # webhook = live Monnify: fund reserved account; Monnify webhook credits wallet.
+    topup_behavior: Literal["instant", "webhook"]
 
 
 class TopUpRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to add (must be > 0)")
+    amount: Decimal = Field(..., gt=0, description="Amount to add (must be > 0)")
     reference: str = Field(
         ..., min_length=1, max_length=255, description="Unique payment reference"
     )
@@ -56,21 +61,23 @@ class TopUpRequest(BaseModel):
 
 
 class TopUpResponse(BaseModel):
-    balance: float
-    amount_credited: float
+    balance: Decimal
+    amount_credited: Decimal
     reference: str
     already_processed: bool
+    wallet_cap: Optional[Decimal] = None
+    balance_warning: Optional[str] = None
 
 
 class WalletTransactionResponse(BaseModel):
     id: str
     type: str
-    amount: float
+    amount: Decimal
     reference: str
     description: Optional[str]
     run_id: Optional[str]
-    balance_before: float
-    balance_after: float
+    balance_before: Decimal
+    balance_after: Decimal
     created_at: str
 
 
@@ -168,24 +175,32 @@ async def get_wallet(
             WalletTransactionModel.type == "credit",
         )
     )
-    total_credit = float(_credit_result.scalar_one())
+    total_credit = Decimal(str(_credit_result.scalar_one() or 0))
     _debit_result = await session.execute(
         select(_func.coalesce(_func.sum(WalletTransactionModel.amount), 0)).where(
             WalletTransactionModel.business_id == business_uuid,
             WalletTransactionModel.type == "debit",
         )
     )
-    total_debit = float(_debit_result.scalar_one())
+    total_debit = Decimal(str(_debit_result.scalar_one() or 0))
 
+    bal = wallet.balance
+    rb = getattr(wallet, "reserved_balance", Decimal("0.00")) or Decimal("0.00")
+    _topup_instant = not (
+        Settings.PAYOUT_PROVIDER == "monnify" and not Settings.is_payout_simulated()
+    )
     return WalletResponse(
         id=str(wallet.id),
         business_id=str(wallet.business_id),
-        balance=float(wallet.balance),
+        balance=bal,
+        reserved_balance=rb,
+        available_balance=bal - rb,
         currency=wallet.currency,
         total_credit=total_credit,
         total_debit=total_debit,
         created_at=wallet.created_at.isoformat(),
         updated_at=wallet.updated_at.isoformat(),
+        topup_behavior="instant" if _topup_instant else "webhook",
     )
 
 
@@ -198,12 +213,15 @@ async def topup_wallet(
     _=Depends(require_role("owner")),
     _kyc=Depends(require_verified_kyc),
 ):
-    if Settings.PAYOUT_PROVIDER == "monnify":
+    # Live Monnify collections: wallet is credited from the Monnify webhook on bank transfer
+    # to the business reserved account — not from this endpoint.
+    # Simulated / lookup_only modes still allow manual top-up for local dev and QA.
+    if Settings.PAYOUT_PROVIDER == "monnify" and not Settings.is_payout_simulated():
         raise HTTPException(
             status_code=410,
             detail=(
-                "Direct wallet top-up endpoint is disabled. "
-                "Fund your reserved Monnify account; wallet credits are applied via webhook."
+                "Direct wallet top-up is disabled when payouts are live with Monnify. "
+                "Fund your reserved account by bank transfer; credits are applied automatically."
             ),
         )
     try:
@@ -220,10 +238,14 @@ async def topup_wallet(
     except InvalidOperation:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
-    # Enforce wallet balance cap based on KYC level
+    # Enforce wallet balance cap based on KYC level.
+    # In production the manual topup endpoint is disabled (Monnify webhook handles credits),
+    # so this guard only applies in dev/simulated mode. Rather than blocking, we allow the
+    # credit and trigger the overlimit flow so the full warning path can be tested locally.
     from src.config.kyc_limits import get_limits as _get_limits
     biz_for_cap = await session.execute(select(BusinessModel).where(BusinessModel.id == business_uuid))
     biz_cap = biz_for_cap.scalar_one_or_none()
+    _topup_would_exceed_cap = False
     if biz_cap:
         from src.infrastructure.database.repositories.wallet_repository import WalletRepository as _WR
         _cap_repo = _WR(session)
@@ -235,13 +257,16 @@ async def topup_wallet(
             from decimal import Decimal as _D
             _cap = _limits["wallet"]
             if _current_wallet.balance + _D(str(request.amount)) > _cap:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Wallet balance cap exceeded. Your current KYC level allows a maximum wallet "
-                        f"balance of ₦{float(_cap):,.2f}. Complete a higher KYC level to increase this limit."
-                    ),
-                )
+                if Settings.is_production():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Wallet balance cap exceeded. Your current KYC level allows a maximum wallet "
+                            f"balance of ₦{float(_cap):,.2f}. Complete a higher KYC level to increase this limit."
+                        ),
+                    )
+                # Non-production: allow the credit but flag for overlimit flow below
+                _topup_would_exceed_cap = True
 
     repo = WalletRepository(session)
     tx, created = await repo.credit(
@@ -253,7 +278,7 @@ async def topup_wallet(
     await session.commit()
     await session.refresh(tx)
 
-    new_balance = float(tx.balance_after)
+    new_balance = tx.balance_after
 
     # Fire top-up confirmation email + in-app notification (best-effort, non-blocking)
     if created:
@@ -270,7 +295,7 @@ async def topup_wallet(
                     business_id=business_uuid,
                     title="Wallet top-up successful",
                     message=(
-                        f"₦{float(amount):,.2f} has been credited to your wallet. "
+                        f"₦{amount:,.2f} has been credited to your wallet. "
                         f"New balance: ₦{new_balance:,.2f}."
                     ),
                     type="success",
@@ -286,7 +311,7 @@ async def topup_wallet(
                         send_wallet_topup_email(
                             to=owner_user.email,
                             display_name=owner_user.display_name or owner_user.email,
-                            amount=float(amount),
+                            amount=amount,
                             new_balance=new_balance,
                             reference=request.reference,
                         )
@@ -294,23 +319,62 @@ async def topup_wallet(
         except Exception as exc:
             logger.warning("[Wallet] Could not send top-up notification: %s", exc)
 
+    # Non-production overlimit simulation: credit went through above the cap,
+    # now trigger the same flag + email flow as the Monnify webhook does in prod.
+    if created and _topup_would_exceed_cap and biz_cap:
+        try:
+            from src.services.wallet_limit_service import check_and_flag_overlimit
+            await check_and_flag_overlimit(session, biz_cap, new_balance)
+            await session.commit()
+        except Exception as exc:
+            logger.warning("[Wallet] Could not run overlimit check: %s", exc)
+
+    # Compute wallet cap info for response
+    _resp_cap: Optional[Decimal] = None
+    _resp_warning: Optional[str] = None
+    try:
+        from src.config.kyc_limits import get_limits as _get_limits_resp
+        if biz_cap:
+            _at = getattr(biz_cap, "account_type", "business") or "business"
+            _kl = getattr(biz_cap, "kyc_level", 0) or 0
+            _lim = _get_limits_resp(_at, _kl)
+            if _lim:
+                _resp_cap = _lim["wallet"]
+                _pct = new_balance / _resp_cap
+                if new_balance > _resp_cap:
+                    _resp_warning = (
+                        f"Your balance of ₦{float(new_balance):,.2f} exceeds your KYC tier limit of "
+                        f"₦{float(_resp_cap):,.2f}. Upgrade your KYC level to avoid restrictions."
+                    )
+                elif _pct >= Decimal("0.9"):
+                    _remaining = _resp_cap - new_balance
+                    _resp_warning = (
+                        f"You are approaching your wallet limit. "
+                        f"Only ₦{float(_remaining):,.2f} remaining before you reach the "
+                        f"₦{float(_resp_cap):,.2f} cap for your KYC level."
+                    )
+    except Exception:
+        pass
+
     return TopUpResponse(
         balance=new_balance,
-        amount_credited=float(amount),
+        amount_credited=amount,
         reference=tx.reference,
         already_processed=not created,
+        wallet_cap=_resp_cap,
+        balance_warning=_resp_warning,
     )
 
 
 class WithdrawRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to withdraw (must be > 0)")
+    amount: Decimal = Field(..., gt=0, description="Amount to withdraw (must be > 0)")
     reference: str = Field(..., min_length=1, max_length=255, description="Unique withdrawal reference")
     description: Optional[str] = Field(None, max_length=500)
 
 
 class WithdrawResponse(BaseModel):
-    balance: float
-    amount_debited: float
+    balance: Decimal
+    amount_debited: Decimal
     reference: str
 
 
@@ -376,8 +440,8 @@ async def withdraw_wallet(
         logger.warning("[Wallet] Could not send withdrawal notification: %s", exc)
 
     return WithdrawResponse(
-        balance=float(tx.balance_after),
-        amount_debited=float(amount),
+        balance=tx.balance_after,
+        amount_debited=amount,
         reference=tx.reference,
     )
 
@@ -402,7 +466,7 @@ class CreditPurchaseRequest(BaseModel):
 class CreditPurchaseResponse(BaseModel):
     balance: int
     credits_added: int
-    amount_charged: float
+    amount_charged: Decimal
     reference: str
     already_processed: bool
 
@@ -421,7 +485,7 @@ class CreditTransactionListResponse(BaseModel):
     total: int
 
 
-@router.get("/credits", response_model=CreditBalanceResponse)
+@router.get("/wallet/credits", response_model=CreditBalanceResponse)
 async def get_credits(
     business_id: str = Query(..., description="Business UUID"),
     session: AsyncSession = Depends(get_db_session),
@@ -453,7 +517,7 @@ async def get_credits(
     )
 
 
-@router.post("/credits/purchase", response_model=CreditPurchaseResponse)
+@router.post("/wallet/credits/purchase", response_model=CreditPurchaseResponse)
 async def purchase_credits(
     request: CreditPurchaseRequest,
     business_id: str = Query(..., description="Business UUID"),
@@ -549,7 +613,7 @@ async def purchase_credits(
     )
 
 
-@router.get("/credits/transactions", response_model=CreditTransactionListResponse)
+@router.get("/wallet/credits/transactions", response_model=CreditTransactionListResponse)
 async def list_credit_transactions(
     business_id: str = Query(..., description="Business UUID"),
     limit: int = Query(50, ge=1, le=100),
@@ -649,12 +713,12 @@ async def list_wallet_transactions(
             WalletTransactionResponse(
                 id=str(t.id),
                 type=t.type,
-                amount=float(t.amount),
+                amount=t.amount,
                 reference=t.reference,
                 description=t.description,
                 run_id=str(t.run_id) if t.run_id else None,
-                balance_before=float(t.balance_before),
-                balance_after=float(t.balance_after),
+                balance_before=t.balance_before,
+                balance_after=t.balance_after,
                 created_at=t.created_at.isoformat(),
             )
             for t in transactions

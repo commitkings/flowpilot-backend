@@ -21,6 +21,7 @@ from app.api.routes.org_config import router as org_config_router
 from app.api.routes.public_api import router as public_api_router
 from app.api.routes.files import router as files_router
 from app.api.routes.recipients import router as recipients_router
+from app.api.routes.payee import router as payee_router
 from app.api.routes.monnify_webhooks import router as monnify_webhooks_router
 from app.api.auth import auth_router, two_factor_router
 from app.api.auth.approval_pin import router as approval_pin_router
@@ -135,6 +136,7 @@ app.include_router(org_config_router, prefix="/api/v1", tags=["org-config"])
 app.include_router(public_api_router, prefix="/api/v1", tags=["public-api"])
 app.include_router(files_router, prefix="/api/v1", tags=["files"])
 app.include_router(recipients_router, prefix="/api/v1", tags=["recipients"])
+app.include_router(payee_router, prefix="/api/v1", tags=["payee"])
 app.include_router(monnify_webhooks_router, prefix="/api/v1", tags=["monnify-webhooks"])
 
 # Serve uploaded files (avatars, etc.)

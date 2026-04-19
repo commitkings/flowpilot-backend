@@ -3,12 +3,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 
 from src.config.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class MonnifyClient:
@@ -60,22 +63,63 @@ class MonnifyClient:
                     headers=headers,
                     **kwargs,
                 )
+            if resp.status_code >= 400:
+                try:
+                    err_detail = resp.json()
+                except Exception:
+                    err_detail = (resp.text or "")[:800]
+                logger.warning(
+                    "Monnify API error %s %s %s: %s",
+                    resp.status_code,
+                    method,
+                    path,
+                    err_detail,
+                )
             resp.raise_for_status()
             return resp.json()
 
     async def create_reserved_account(
-        self, *, account_reference: str, account_name: str, customer_email: str, customer_name: str
+        self,
+        *,
+        account_reference: str,
+        account_name: str,
+        customer_email: str,
+        customer_name: str,
+        bvn: str | None = None,
+        nin: str | None = None,
+        get_all_available_banks: bool = True,
     ) -> dict:
-        payload = {
+        """Create a customer reserved account per Monnify v2 docs (BVN or NIN required)."""
+        bvn_s = (bvn or "").strip()
+        nin_s = (nin or "").strip()
+        if not bvn_s and not nin_s:
+            raise ValueError(
+                "Monnify reserved account requires customer bvn or nin (see Customer Reserved Account API)."
+            )
+
+        preferred = [
+            p.strip()
+            for p in (Settings.MONNIFY_PREFERRED_BANKS or "50515").split(",")
+            if p.strip()
+        ]
+        if not preferred:
+            preferred = ["50515"]
+
+        payload: dict[str, Any] = {
             "accountReference": account_reference,
             "accountName": account_name,
             "currencyCode": "NGN",
             "contractCode": self.contract_code,
             "customerEmail": customer_email,
             "customerName": customer_name,
-            "getAllAvailableBanks": False,
-            "preferredBanks": ["035"],
+            "getAllAvailableBanks": bool(get_all_available_banks),
+            "preferredBanks": preferred,
         }
+        if bvn_s:
+            payload["bvn"] = bvn_s
+        if nin_s:
+            payload["nin"] = nin_s
+
         return await self._request("POST", "/api/v2/bank-transfer/reserved-accounts", json=payload)
 
     async def attach_bvn(self, *, account_reference: str, bvn: str) -> dict:

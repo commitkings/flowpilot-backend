@@ -34,6 +34,7 @@ from src.infrastructure.database.repositories import (
     RunRepository,
     TransactionRepository,
 )
+from src.services.ledger_writer import insert_ledger_entry
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -277,6 +278,124 @@ async def _sync_conversation_after_run(
 
 
 # ------------------------------------------------------------------
+# Background execution after approval
+# ------------------------------------------------------------------
+
+
+async def _execute_approved_run(
+    *,
+    run_id: str,
+    run_uuid: uuid.UUID,
+    business_id: uuid.UUID,
+    objective: str,
+    created_by,
+    approved_count: int,
+    state: dict,
+) -> None:
+    """Run execute→audit pipeline in the background after approval is committed."""
+    import asyncio as _asyncio
+    from src.infrastructure.database.connection import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        run_repo = RunRepository(session)
+        transaction_repo = TransactionRepository(session)
+        try:
+            transactions = state.get("transactions", [])
+            if transactions:
+                await transaction_repo.create_batch(
+                    run_uuid, business_id, _map_transactions(transactions)
+                )
+
+            publisher = EventPublisher(run_uuid, session)
+            orchestrator = RunOrchestrator(session, publisher=publisher)
+            state = await orchestrator.resume_after_approval(run_uuid, state)
+
+            _running_states.pop(run_id, None)
+            final_status = "failed" if state.get("error") else "completed"
+
+            # Webhooks
+            try:
+                from src.services.webhook_dispatcher import dispatch_event as _dispatch
+                _exec_results = state.get("candidate_execution_results", [])
+                _succeeded = [e for e in _exec_results if e.get("execution_status") == "success"]
+                _failed_exec = [e for e in _exec_results if e.get("execution_status") == "failed"]
+                _total_paid = sum(float(e.get("amount", 0)) for e in _succeeded)
+                webhook_payload = {
+                    "run_id": run_id,
+                    "objective": objective,
+                    "action": "approved",
+                    "status": final_status,
+                    "approved_count": approved_count,
+                    "rejected_count": len(state.get("rejected_candidate_ids", [])),
+                    "succeeded_count": len(_succeeded),
+                    "failed_count": len(_failed_exec),
+                    "total_payout_amount": _total_paid,
+                    "currency": "NGN",
+                    "error": state.get("error"),
+                    "run_url": f"{Settings.FRONTEND_URL}/runs/{run_id}",
+                }
+                _asyncio.create_task(_dispatch(business_id, "approval.completed", webhook_payload))
+                run_event = "run.completed" if final_status == "completed" else "run.failed"
+                _asyncio.create_task(_dispatch(business_id, run_event, webhook_payload))
+            except Exception as _wh_exc:
+                logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
+
+            await _sync_conversation_after_run(session, run_uuid, final_status, state.get("error"))
+
+            # Notify / email creator
+            try:
+                from sqlalchemy import select as _select
+                if created_by:
+                    creator_row = await session.execute(
+                        _select(UserModel).where(UserModel.id == created_by)
+                    )
+                    creator = creator_row.scalar_one_or_none()
+                    if creator:
+                        from src.services.email_service import check_notification_pref as _cnp
+                        if _cnp(creator, "payout_updates"):
+                            await send_run_completed_email(
+                                to=creator.email,
+                                run_id=run_id,
+                                objective=objective,
+                                status=final_status,
+                                approved_count=approved_count,
+                                frontend_url=Settings.FRONTEND_URL,
+                            )
+                        notif_repo = NotificationRepository(session)
+                        title = "Run completed" if final_status == "completed" else "Run failed"
+                        msg = (
+                            f'{approved_count} transaction{"s" if approved_count != 1 else ""} processed on run "{objective[:50]}".'
+                            if final_status == "completed"
+                            else f'Run "{objective[:50]}" could not complete. Please review and retry.'
+                        )
+                        await notif_repo.create(
+                            user_id=created_by,
+                            business_id=business_id,
+                            title=title,
+                            message=msg,
+                            type="success" if final_status == "completed" else "error",
+                            resource_type="run",
+                            resource_id=run_id,
+                        )
+                        await session.commit()
+            except Exception as _email_exc:
+                logger.warning(f"Run {run_id}: failed to notify creator: {_email_exc}")
+
+        except Exception as e:
+            logger.error(f"Run {run_id}: background execution failed: {e}", exc_info=True)
+            try:
+                await session.rollback()
+                recovery_status = "awaiting_approval" if Settings.is_payout_simulated() else "failed"
+                await run_repo.update_status(run_uuid, recovery_status, str(e))
+                await session.commit()
+                await _sync_conversation_after_run(session, run_uuid, "failed", str(e))
+            except Exception:
+                logger.error(f"Run {run_id}: failed to persist error state after background failure")
+            _running_states.pop(run_id, None)
+
+
+# ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
 
@@ -415,7 +534,8 @@ async def approve_candidates(
     # ── 3b. KYC payout limits — single transaction cap + monthly cap ────────
     from decimal import Decimal as _D
     from datetime import date as _date
-    from src.config.kyc_limits import get_limits as _get_limits, SUPPORT_EMAIL as _SUPPORT_EMAIL
+    from src.services.kyc_limit_service import get_limits as _get_limits
+    from src.config.kyc_limits import SUPPORT_EMAIL as _SUPPORT_EMAIL
     from sqlalchemy import select as _sa_sel
 
     _biz_result = await session.execute(
@@ -431,20 +551,19 @@ async def approve_candidates(
         if _kyc_level == 0 and _kyc_status == "verified":
             _kyc_level = 1
 
-        _limits = _get_limits(_account_type, _kyc_level)
+        _limits = await _get_limits(session, _account_type, _kyc_level)
 
         if _limits:
-            # Single transaction cap
-            for c in selected_candidates:
-                if _D(str(c.amount)) > _limits["single"]:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Payout to {c.beneficiary_name} (₦{float(c.amount):,.2f}) exceeds your "
-                            f"single-transaction limit of ₦{float(_limits['single']):,.2f}. "
-                            f"Upgrade your KYC level or contact {_SUPPORT_EMAIL} for a higher limit."
-                        ),
-                    )
+            # Single run cap — total approved amount for this batch
+            if _D(str(total_approved)) > _limits["single"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Total payout amount (₦{total_approved:,.2f}) exceeds your single-run limit of "
+                        f"₦{float(_limits['single']):,.2f}. Split the batch or upgrade your KYC level. "
+                        f"Contact {_SUPPORT_EMAIL} for a higher limit."
+                    ),
+                )
 
             # Monthly cap: get or create tracker, reset if new month
             _today = _date.today()
@@ -519,28 +638,35 @@ async def approve_candidates(
         _total_decimal = Decimal(str(total_approved))
         _fee_amount = max(_PLATFORM_FEE_MIN, (_total_decimal * _PLATFORM_FEE_RATE).quantize(Decimal("0.01")))
         try:
-            # Debit payout amount
-            _debit_tx, _ = await _wallet_repo.debit(
+            # Reserve payout + fee (balance debited at settlement after execution)
+            await _wallet_repo.reserve_for_payout_run(
                 business_id=run.business_id,
-                amount=_total_decimal,
-                reference=f"run_exec_{run_id}",
-                description=f"Payout execution: {run.objective[:80]}",
                 run_id=run_uuid,
+                payout_total=_total_decimal,
+                platform_fee=_fee_amount,
             )
-            _wallet_balance_after = float(_debit_tx.balance_after)
+            _wf = await _wallet_repo.get(run.business_id)
+            _wallet_balance_after = float(_wf.balance) if _wf else 0.0
 
-            # Debit platform fee (separate ledger line)
-            if _fee_amount > 0:
-                _fee_tx, _ = await _wallet_repo.debit(
-                    business_id=run.business_id,
-                    amount=_fee_amount,
-                    reference=f"platform_fee_{run_id}",
-                    description=f"Platform fee (0.6%, min ₦50): {run.objective[:60]}",
-                    run_id=run_uuid,
-                )
-                _wallet_balance_after = float(_fee_tx.balance_after)
+            # Ledger: payout debit (pending until execution settles)
+            await insert_ledger_entry(
+                session,
+                entry_type="payout_run",
+                gross_amount=_total_decimal + _fee_amount,
+                fee_amount=_fee_amount,
+                net_amount=_total_decimal,
+                direction="debit",
+                status="pending",
+                originator_type="business",
+                beneficiary_type="payee",
+                business_id=run.business_id,
+                run_id=run_uuid,
+                narration=f"Payout run: {run.objective[:80] if run.objective else 'Payout'}",
+                internal_narration=f"Platform fee: ₦{float(_fee_amount):,.2f} ({float(_PLATFORM_FEE_RATE)*100:.1f}%)",
+                prefix="PAY",
+            )
 
-            # Persist fee on the run
+            # Persist fee on the run (actual charge is proportional at settlement)
             run.platform_fee_rate = _PLATFORM_FEE_RATE
             run.platform_fee_amount = _fee_amount
 
@@ -664,132 +790,24 @@ async def approve_candidates(
     state["approved_candidate_ids"] = list(existing_approved)
     state["current_step"] = "approved"
 
-    logger.info(f"Run {run_id}: approved {approved_count} candidates, resuming execution")
+    logger.info(f"Run {run_id}: approved {approved_count} candidates, dispatching execution")
 
-    try:
-        # Re-persist transactions (safe: ON CONFLICT DO NOTHING)
-        transactions = state.get("transactions", [])
-        if transactions:
-            business_id = uuid.UUID(state["business_id"]) if state.get("business_id") else run.business_id
-            await transaction_repo.create_batch(
-                run_uuid, business_id, _map_transactions(transactions)
-            )
+    import asyncio as _asyncio
+    _asyncio.create_task(_execute_approved_run(
+        run_id=run_id,
+        run_uuid=run_uuid,
+        business_id=run.business_id,
+        objective=run.objective,
+        created_by=run.created_by,
+        approved_count=approved_count,
+        state=state,
+    ))
 
-        # Resume from execute→audit ONLY (no re-run of plan/reconcile/risk)
-        publisher = EventPublisher(run_uuid, session)
-        orchestrator = RunOrchestrator(session, publisher=publisher)
-        state = await orchestrator.resume_after_approval(run_uuid, state)
-
-        _running_states.pop(run_id, None)
-
-        final_status = "failed" if state.get("error") else "completed"
-
-        # Fire webhooks for approval.completed and run outcome
-        try:
-            import asyncio as _asyncio
-            from src.services.webhook_dispatcher import dispatch_event as _dispatch
-            _exec_results = state.get("candidate_execution_results", [])
-            _succeeded = [e for e in _exec_results if e.get("execution_status") == "success"]
-            _failed_exec = [e for e in _exec_results if e.get("execution_status") == "failed"]
-            _total_paid = sum(float(e.get("amount", 0)) for e in _succeeded)
-            webhook_payload = {
-                "run_id": run_id,
-                "objective": run.objective,
-                "action": "approved",
-                "status": final_status,
-                "approved_count": approved_count,
-                "rejected_count": len(state.get("rejected_candidate_ids", [])),
-                "succeeded_count": len(_succeeded),
-                "failed_count": len(_failed_exec),
-                "total_payout_amount": _total_paid,
-                "currency": "NGN",
-                "date_range": {
-                    "from": state.get("date_from"),
-                    "to": state.get("date_to"),
-                },
-                "error": state.get("error"),
-                "run_url": f"{Settings.FRONTEND_URL}/runs/{run_id}",
-            }
-            _asyncio.create_task(_dispatch(run.business_id, "approval.completed", webhook_payload))
-            run_event = "run.completed" if final_status == "completed" else "run.failed"
-            _asyncio.create_task(_dispatch(run.business_id, run_event, webhook_payload))
-        except Exception as _wh_exc:
-            logger.warning(f"Run {run_id}: webhook dispatch failed: {_wh_exc}")
-
-        # Sync linked conversation so chat UI reflects run completion
-        await _sync_conversation_after_run(
-            session, run_uuid, final_status, state.get("error")
-        )
-
-        # Notify and email run creator about the outcome
-        try:
-            from sqlalchemy import select as _select
-            if run.created_by:
-                creator_row = await session.execute(
-                    _select(UserModel).where(UserModel.id == run.created_by)
-                )
-                creator = creator_row.scalar_one_or_none()
-                if creator:
-                    from src.services.email_service import check_notification_pref as _cnp
-                    if _cnp(creator, "payout_updates"):
-                        await send_run_completed_email(
-                            to=creator.email,
-                            run_id=run_id,
-                            objective=run.objective,
-                            status=final_status,
-                            approved_count=approved_count,
-                            frontend_url=Settings.FRONTEND_URL,
-                        )
-                    notif_repo = NotificationRepository(session)
-                    if final_status == "completed":
-                        await notif_repo.create(
-                            user_id=run.created_by,
-                            business_id=run.business_id,
-                            title="Run completed",
-                            message=f'{approved_count} transaction{"s" if approved_count != 1 else ""} processed on run "{run.objective[:50]}".',
-                            type="success",
-                            resource_type="run",
-                            resource_id=run_id,
-                        )
-                    else:
-                        await notif_repo.create(
-                            user_id=run.created_by,
-                            business_id=run.business_id,
-                            title="Run failed",
-                            message=f'Run "{run.objective[:50]}" could not complete. Please review and retry.',
-                            type="error",
-                            resource_type="run",
-                            resource_id=run_id,
-                        )
-                    await session.flush()
-                    await session.commit()
-        except Exception as _email_exc:
-            logger.warning(f"Run {run_id}: failed to notify creator: {_email_exc}")
-
-        return {
-            "run_id": run_id,
-            "status": final_status,
-            "approved_count": approved_count,
-            "current_step": state.get("current_step"),
-        }
-    except Exception as e:
-        logger.error(f"Run {run_id} execution failed after approval: {e}")
-        try:
-            await session.rollback()
-            recovery_status = (
-                "awaiting_approval" if Settings.is_payout_simulated() else "failed"
-            )
-            await run_repo.update_status(run_uuid, recovery_status, str(e))
-            await session.commit()
-
-            # Mark conversation as completed even on failure so it's not stuck
-            await _sync_conversation_after_run(
-                session, run_uuid, "failed", str(e)
-            )
-        except Exception:
-            logger.error(f"Run {run_id}: failed to persist error state")
-        _running_states.pop(run_id, None)
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "run_id": run_id,
+        "status": "executing",
+        "approved_count": approved_count,
+    }
 
 
 @router.post("/runs/{run_id}/reject")

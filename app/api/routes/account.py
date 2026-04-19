@@ -37,6 +37,7 @@ from src.infrastructure.database.flowpilot_models import (
     WebhookModel,
 )
 from src.infrastructure.database.repositories import AuditRepository
+from src.infrastructure.database.repositories.business_repository import BusinessRepository
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_account_deletion_code_email
 
@@ -52,7 +53,14 @@ async def _require_owner(session: AsyncSession, user_id) -> BusinessMemberModel:
     """Fetch the caller's membership and raise 403 if they are not an owner."""
     result = await session.execute(
         select(BusinessMemberModel)
-        .options(selectinload(BusinessMemberModel.business))
+        .options(
+            selectinload(BusinessMemberModel.business).selectinload(
+                BusinessModel.profile_row
+            ),
+            selectinload(BusinessMemberModel.business).selectinload(
+                BusinessModel.address_row
+            ),
+        )
         .where(BusinessMemberModel.user_id == user_id)
     )
     membership = result.scalars().first()
@@ -193,28 +201,52 @@ async def export_account_data(
         for a in audit_rows
     ]
 
-    # ── Business config ───────────────────────────────────────────────────────
+    # ── Business config (onboarding + prefs + payment/security policy) ───────
     biz_config = (
         await session.execute(
             select(BusinessConfigModel).where(BusinessConfigModel.business_id == business_id)
         )
     ).scalars().first()
 
+    biz_policies = (
+        await session.execute(
+            select(BusinessModel)
+            .options(
+                selectinload(BusinessModel.payment_policy),
+                selectinload(BusinessModel.security_policy),
+                selectinload(BusinessModel.use_case_rows),
+            )
+            .where(BusinessModel.id == business_id)
+        )
+    ).scalars().first()
+
     business_config_data = None
-    if biz_config:
+    if biz_config and biz_policies:
         business_config_data = {
-            "monthly_txn_volume_range": biz_config.monthly_txn_volume_range,
-            "avg_monthly_payouts_range": biz_config.avg_monthly_payouts_range,
-            "primary_bank": biz_config.primary_bank,
-            "primary_use_cases": biz_config.primary_use_cases,
-            "risk_appetite": biz_config.risk_appetite,
-            "default_risk_tolerance": str(biz_config.default_risk_tolerance) if biz_config.default_risk_tolerance is not None else None,
-            "default_budget_cap": str(biz_config.default_budget_cap) if biz_config.default_budget_cap is not None else None,
-            "daily_payout_limit": str(biz_config.daily_payout_limit) if biz_config.daily_payout_limit is not None else None,
-            "single_payout_cap": str(biz_config.single_payout_cap) if biz_config.single_payout_cap is not None else None,
-            "risk_alert_threshold": str(biz_config.risk_alert_threshold) if biz_config.risk_alert_threshold is not None else None,
-            "liquidity_alert_buffer": str(biz_config.liquidity_alert_buffer) if biz_config.liquidity_alert_buffer is not None else None,
-            "require_2fa": biz_config.require_2fa,
+            "monthly_txn_volume_range": biz_policies.monthly_txn_volume_range,
+            "avg_monthly_payouts_range": biz_policies.avg_monthly_payouts_range,
+            "primary_bank": biz_policies.primary_bank,
+            "primary_use_cases": biz_policies.primary_use_cases,
+            "risk_appetite": biz_policies.risk_appetite,
+            "default_risk_tolerance": str(biz_policies.default_risk_tolerance)
+            if biz_policies.default_risk_tolerance is not None
+            else None,
+            "default_budget_cap": str(biz_policies.default_budget_cap)
+            if biz_policies.default_budget_cap is not None
+            else None,
+            "daily_payout_limit": str(biz_policies.daily_payout_limit)
+            if biz_policies.daily_payout_limit is not None
+            else None,
+            "single_payout_cap": str(biz_policies.single_payout_cap)
+            if biz_policies.single_payout_cap is not None
+            else None,
+            "risk_alert_threshold": str(biz_policies.risk_alert_threshold)
+            if biz_policies.risk_alert_threshold is not None
+            else None,
+            "liquidity_alert_buffer": str(biz_policies.liquidity_alert_buffer)
+            if biz_policies.liquidity_alert_buffer is not None
+            else None,
+            "require_2fa": biz_policies.require_2fa,
             "preferences": biz_config.preferences or {},
         }
 
@@ -540,6 +572,12 @@ async def delete_account(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid authentication code",
             )
+        from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+        if not await _totp_mark(str(current_user.id), body.totp_code):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Authenticator code has already been used. Wait for the next code.",
+            )
     else:
         if not body.delete_code:
             raise HTTPException(
@@ -663,6 +701,12 @@ async def delete_self(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid authentication code",
+            )
+        from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+        if not await _totp_mark(str(current_user.id), body.totp_code):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Authenticator code has already been used. Wait for the next code.",
             )
     else:
         if not body.delete_code:
@@ -848,25 +892,27 @@ async def import_account_data(
     # ── Restore business config ───────────────────────────────────────────────
     biz_config_data = data.get("business_config") or {}
     if biz_config_data:
-        biz_config = (
-            await session.execute(
-                select(BusinessConfigModel).where(BusinessConfigModel.business_id == business_id)
-            )
-        ).scalars().first()
-        if biz_config:
-            _config_fields = (
-                "monthly_txn_volume_range", "avg_monthly_payouts_range", "primary_bank",
-                "primary_use_cases", "risk_appetite",
-                "default_budget_cap", "daily_payout_limit", "single_payout_cap",
-                "risk_alert_threshold", "liquidity_alert_buffer",
-            )
-            for field in _config_fields:
-                val = biz_config_data.get(field)
-                if val is not None and not getattr(biz_config, field, None):
-                    setattr(biz_config, field, val)
-            _rt = biz_config_data.get("default_risk_tolerance")
-            if _rt is not None and biz_config.default_risk_tolerance == 0.35:
-                biz_config.default_risk_tolerance = _rt
+        brepo = BusinessRepository(session)
+        _config_fields = (
+            "monthly_txn_volume_range",
+            "avg_monthly_payouts_range",
+            "primary_bank",
+            "primary_use_cases",
+            "risk_appetite",
+            "default_budget_cap",
+            "daily_payout_limit",
+            "single_payout_cap",
+            "risk_alert_threshold",
+            "liquidity_alert_buffer",
+            "default_risk_tolerance",
+        )
+        payload = {
+            k: v
+            for k, v in biz_config_data.items()
+            if k in _config_fields and v is not None
+        }
+        if payload:
+            await brepo.update_config(business_id, **payload)
             restored.append("business_config")
 
     # ── Restore saved recipients ──────────────────────────────────────────────
@@ -1017,7 +1063,8 @@ async def import_account_data(
     if notif_prefs and isinstance(notif_prefs, dict):
         existing_prefs = dict(getattr(current_user, "notification_preferences", None) or {})
         if not existing_prefs:
-            current_user.notification_preferences = notif_prefs
+            urepo = UserRepository(session)
+            await urepo.sync_notification_preferences(current_user.id, notif_prefs)
             restored.append("notification_preferences")
 
     await session.commit()
@@ -1081,7 +1128,8 @@ async def update_notification_preferences(
 
     existing = dict(getattr(current_user, "notification_preferences", None) or {})
     existing.update(updates)
-    current_user.notification_preferences = existing
+    repo = UserRepository(session)
+    await repo.sync_notification_preferences(current_user.id, existing)
     current_user.updated_at = datetime.now(timezone.utc)
     await session.commit()
 

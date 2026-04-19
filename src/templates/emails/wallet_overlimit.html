@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <title>Scheduled run tomorrow</title>
+  <title>Wallet balance exceeds your KYC limit</title>
   <style>
     @media (prefers-color-scheme: dark) {
       .light-logo { display: none !important; }
@@ -23,7 +23,7 @@
 
   <!-- Preheader -->
   <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;color:#f0ede8;font-size:1px;">
-    {% if is_approval_request %}Action required — approve or skip "{{ schedule_name }}" before it runs tomorrow.{% else %}Heads up — "{{ schedule_name }}" is scheduled to fire tomorrow at {{ fires_at }}.{% endif %} &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
+    Your wallet balance of &#8358;{{ new_balance }} exceeds your KYC tier limit. Upgrade to keep transacting. &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
   </div>
 
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0ede8;">
@@ -31,9 +31,9 @@
       <td align="center" class="outer-pad" style="padding:48px 16px 40px;">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
 
-          <!-- Top accent bar -->
+          <!-- Top accent bar — amber/warning -->
           <tr>
-            <td style="height:4px;background-color:#e86727;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
+            <td style="height:4px;background-color:#f59e0b;border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
           </tr>
 
           <!-- Logo -->
@@ -53,73 +53,73 @@
             <td class="body-pad" style="background-color:#ffffff;padding:0 40px 36px;">
               <div style="height:1px;background-color:#f0ede8;margin-bottom:28px;font-size:0;line-height:0;">&nbsp;</div>
 
-              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">
-                {% if is_approval_request %}Approval required: scheduled run tomorrow{% else %}Scheduled run tomorrow{% endif %}
-              </h1>
+              <!-- Warning badge -->
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:16px;">
+                <tr>
+                  <td style="background-color:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:7px 14px;">
+                    <span style="font-size:13px;font-weight:600;color:#92400e;">&#9888;&#65039; Action needed</span>
+                  </td>
+                </tr>
+              </table>
+
+              <h1 class="h1" style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;letter-spacing:-0.3px;margin:0 0 10px;">Your wallet balance exceeds your KYC limit</h1>
               <p style="font-size:15px;color:#64748b;line-height:1.65;margin:0 0 24px;">
-                {% if is_approval_request %}
-                Hi {{ first_name }}, please approve or skip the run below before it fires. If you do nothing, the run will be skipped automatically.
-                {% else %}
-                Hi {{ first_name }}, a heads-up about an upcoming automated run.
-                {% endif %}
+                Hi {{ first_name }}, a recent deposit has pushed your wallet balance above the limit allowed for your current KYC level. Your funds are safe, but you may be restricted from creating new payout runs until this is resolved.
               </p>
 
-              <!-- Schedule details card -->
+              <!-- Balance card -->
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
-                  <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
+                  <td style="background-color:#fffbeb;border-radius:8px;border:1px solid #fde68a;padding:16px 18px;">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                       <tr>
-                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Schedule</td>
-                        <td style="font-size:13px;font-weight:600;color:#0f172a;text-align:right;padding-bottom:8px;">{{ schedule_name }}</td>
+                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Current balance</td>
+                        <td style="font-size:13px;font-weight:700;color:#0f172a;text-align:right;padding-bottom:8px;">&#8358;{{ new_balance }}</td>
                       </tr>
                       <tr>
-                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Frequency</td>
-                        <td style="font-size:13px;font-weight:600;color:#0f172a;text-align:right;padding-bottom:8px;">{{ frequency_label }}</td>
+                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Your KYC tier limit</td>
+                        <td style="font-size:13px;font-weight:700;color:#f59e0b;text-align:right;padding-bottom:8px;">&#8358;{{ wallet_cap }}</td>
                       </tr>
                       <tr>
-                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Objective</td>
-                        <td style="font-size:13px;color:#64748b;text-align:right;padding-bottom:8px;">{{ objective }}</td>
-                      </tr>
-                      <tr>
-                        <td style="font-size:13px;color:#64748b;">Fires at</td>
-                        <td style="font-size:13px;font-weight:600;color:#0f172a;text-align:right;">{{ fires_at }}</td>
+                        <td style="font-size:13px;color:#64748b;">Amount over limit</td>
+                        <td style="font-size:13px;font-weight:700;color:#dc2626;text-align:right;">&#8358;{{ over_by }}</td>
                       </tr>
                     </table>
                   </td>
                 </tr>
               </table>
 
-              <!-- CTA buttons -->
-              {% if is_approval_request %}
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:12px;">
+              <!-- What to do -->
+              <p style="font-size:14px;font-weight:600;color:#0f172a;margin:0 0 10px;">What you can do</p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
-                  <td style="border-radius:8px;background-color:#16a34a;">
-                    <a href="{{ approve_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      ✓ Approve this run
-                    </a>
-                  </td>
-                  <td style="width:12px;">&nbsp;</td>
-                  <td style="border-radius:8px;background-color:#f1f5f9;border:1px solid #e2e8f0;">
-                    <a href="{{ skip_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:600;color:#475569;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      Skip this run
-                    </a>
+                  <td style="background-color:#faf9f7;border-radius:8px;border:1px solid #ede9e3;padding:16px 18px;">
+                    <p style="margin:0 0 8px;font-size:13px;color:#334155;line-height:1.6;">
+                      <strong style="color:#0f172a;">Option 1 &mdash; Upgrade your KYC level.</strong>
+                      Complete the next KYC tier to increase your wallet cap and keep transacting without interruption.
+                    </p>
+                    <p style="margin:0;font-size:13px;color:#334155;line-height:1.6;">
+                      <strong style="color:#0f172a;">Option 2 &mdash; Reduce your balance.</strong>
+                      Use your existing balance for payout runs to bring it back within the limit.
+                    </p>
                   </td>
                 </tr>
               </table>
-              <p style="font-size:12px;color:#94a3b8;margin:0 0 24px;">Both links expire once used. If you do nothing, the run will be skipped.</p>
-              {% else %}
+
+              <!-- CTA button -->
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                 <tr>
                   <td style="border-radius:8px;background-color:#e86727;">
-                    <a href="{{ schedules_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
-                      Manage schedules &rarr;
+                    <a href="{{ kyc_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      Upgrade KYC &rarr;
                     </a>
                   </td>
                 </tr>
               </table>
-              {% endif %}
 
+              <p style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;">
+                Questions? Reply to this email or contact <a href="mailto:support@flowpilot.club" style="color:#e86727;text-decoration:none;">support@flowpilot.club</a>.
+              </p>
             </td>
           </tr>
 

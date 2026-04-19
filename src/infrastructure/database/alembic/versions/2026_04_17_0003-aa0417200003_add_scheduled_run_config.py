@@ -1,7 +1,7 @@
 """Add run_config to scheduled_run table.
 
-Revision ID: aa0417200003
-Revises: aa0417200002
+Revision ID: aa0417200004
+Revises: aa0417200003
 Create Date: 2026-04-17 00:03:00
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision = "aa0417200003"
-down_revision = "aa0417200002"
+revision = "aa0417200004"
+down_revision = "aa0417200003"
 branch_labels = None
 depends_on = None
 

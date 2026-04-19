@@ -23,15 +23,20 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.auth.dependencies import get_current_user
 from src.infrastructure.database.connection import get_db_session, get_session_factory
 from src.infrastructure.database.flowpilot_models import (
     BusinessMemberModel,
     BusinessModel,
+    BusinessProfileModel,
+    BusinessVirtualAccountModel,
     IndividualKycSubmissionModel,
+    KycDocumentModel,
     KycLimitTrackerModel,
     KycSubmissionModel,
+    KycUpgradeRequestModel,
     UserModel,
 )
 from src.config.kyc_limits import KYC_LIMITS, SUPPORT_EMAIL, get_limits
@@ -43,6 +48,7 @@ from src.infrastructure.storage.s3_client import validate_document, get_presigne
 from src.services import email_service
 from src.config.settings import Settings
 from src.services.payment_service import PaymentService
+from src.services.user_audit_service import log_user_audit_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/kyc", tags=["kyc"])
@@ -88,26 +94,256 @@ def _presigned(key: Optional[str]) -> Optional[str]:
     return get_presigned_url(key)
 
 
+async def _upsert_kyc_document(
+    session: AsyncSession,
+    *,
+    submission_id: uuid.UUID,
+    business_id: uuid.UUID,
+    doc_type: str,
+    storage_key: Optional[str],
+) -> None:
+    if not storage_key:
+        return
+    r = await session.execute(
+        select(KycDocumentModel).where(
+            KycDocumentModel.submission_id == submission_id,
+            KycDocumentModel.document_type == doc_type,
+        ).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row:
+        row.storage_key = storage_key
+        row.uploaded_at = now
+    else:
+        session.add(
+            KycDocumentModel(
+                submission_id=submission_id,
+                business_id=business_id,
+                document_type=doc_type,
+                storage_key=storage_key,
+                is_current=True,
+            )
+        )
+
+
+def _kyc_doc_key(kyc: KycSubmissionModel, doc_type: str) -> Optional[str]:
+    for d in kyc.documents or []:
+        if d.document_type == doc_type and d.is_current:
+            return d.storage_key
+    return None
+
+
+def _digits_id(raw: str | None, length: int = 11) -> str | None:
+    if not raw:
+        return None
+    d = "".join(c for c in raw if c.isdigit())
+    if len(d) < 10:
+        return None
+    return d[:length]
+
+
+def _pick_business_kyc_bvn(kyc: KycSubmissionModel) -> str | None:
+    """BVN Monnify can bind for a verified business submission (by business type)."""
+    bt = (kyc.business_type or "").lower()
+    if bt == "ngo":
+        order = (kyc.trustee_bvn, kyc.director_bvn)
+    elif bt == "mda":
+        order = (kyc.authorized_officer_bvn, kyc.director_bvn)
+    else:
+        order = (kyc.director_bvn, kyc.trustee_bvn, kyc.authorized_officer_bvn)
+    for raw in order:
+        b = _digits_id(raw, 11)
+        if b:
+            return b
+    return None
+
+
+async def _resolve_monnify_identity(
+    session: AsyncSession, business_id: uuid.UUID
+) -> tuple[str | None, str | None]:
+    """Return (bvn, nin) for Monnify reserved-account creation — at least one is required."""
+    ind_r = await session.execute(
+        select(IndividualKycSubmissionModel).where(
+            IndividualKycSubmissionModel.business_id == business_id
+        )
+    )
+    ind = ind_r.scalar_one_or_none()
+    if ind and ind.level_1_status == "verified" and ind.level_1_type in ("bvn", "nin") and ind.level_1_value:
+        digits = _digits_id(ind.level_1_value, 11)
+        if not digits:
+            return None, None
+        if ind.level_1_type == "bvn":
+            return digits, None
+        return None, digits
+
+    kyc_r = await session.execute(
+        select(KycSubmissionModel).where(KycSubmissionModel.business_id == business_id)
+    )
+    kyc = kyc_r.scalar_one_or_none()
+    if kyc and kyc.status == "verified":
+        bvn = _pick_business_kyc_bvn(kyc)
+        if bvn:
+            return bvn, None
+    return None, None
+
+
+async def _ensure_reserved_virtual_account(
+    session: AsyncSession,
+    *,
+    business_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    owner_display_name: Optional[str],
+    owner_email: str,
+    notify: bool = True,
+) -> None:
+    """Provision Monnify reserved account once KYC is verified (idempotent)."""
+    await session.flush()
+
+    existing = await session.execute(
+        select(BusinessVirtualAccountModel).where(
+            BusinessVirtualAccountModel.business_id == business_id,
+            BusinessVirtualAccountModel.is_active.is_(True),
+        ).limit(1)
+    )
+    if existing.scalar_one_or_none():
+        return
+
+    biz_result = await session.execute(select(BusinessModel).where(BusinessModel.id == business_id))
+    biz = biz_result.scalar_one_or_none()
+    if biz is None:
+        return
+
+    acct_type = getattr(biz, "account_type", "business") or "business"
+    account_name = (
+        biz.business_name
+        if acct_type == "business"
+        else (owner_display_name or biz.business_name)
+    )
+    customer_name = owner_display_name or owner_email or account_name
+
+    account_reference = f"fp-{biz.id}"
+
+    if not Settings.is_production():
+        # Non-production: create a simulated virtual account locally — no Monnify call needed.
+        fake_acct_num = "000" + str(biz.id).replace("-", "")[:10]
+        session.add(
+            BusinessVirtualAccountModel(
+                business_id=business_id,
+                account_number=fake_acct_num,
+                account_name=account_name,
+                bank_name="FlowPilot Dev Bank",
+                bank_code="000",
+                account_reference=account_reference,
+                provider="internal",
+                is_primary=True,
+                is_active=True,
+            )
+        )
+        await session.flush()
+        logger.info(
+            "Non-production: simulated virtual account created for business %s (acct: %s)",
+            business_id,
+            fake_acct_num,
+        )
+        return
+
+    bvn, nin = await _resolve_monnify_identity(session, business_id)
+    if not bvn and not nin:
+        logger.warning(
+            "Skipping Monnify reserved account for business %s: no verified BVN or NIN on file "
+            "(Monnify requires one of them to create a reserved account).",
+            business_id,
+        )
+        return
+
+    try:
+        payment_service = PaymentService()
+        va_response = await payment_service.create_reserved_account(
+            account_reference=account_reference,
+            account_name=account_name or "Customer",
+            customer_email=owner_email,
+            customer_name=customer_name,
+            bvn=bvn,
+            nin=nin,
+        )
+        va_body = va_response.get("responseBody", {})
+        accounts = va_body.get("accounts", [])
+        account = accounts[0] if accounts else {}
+        acct_num = account.get("accountNumber") or ""
+        if not acct_num:
+            logger.warning(
+                "Monnify reserved account returned no account number for business %s",
+                business_id,
+            )
+            return
+        session.add(
+            BusinessVirtualAccountModel(
+                business_id=business_id,
+                account_number=acct_num,
+                account_name=account_name,
+                bank_name=account.get("bankName"),
+                bank_code=account.get("bankCode"),
+                account_reference=va_body.get("reservedAccountCode") or account_reference,
+                provider="monnify",
+                is_primary=True,
+                is_active=True,
+            )
+        )
+        await session.flush()
+    except Exception as exc:
+        logger.warning("Monnify reserved account creation failed for %s: %s", business_id, exc)
+        return
+
+    if notify:
+        va_row = (
+            await session.execute(
+                select(BusinessVirtualAccountModel).where(
+                    BusinessVirtualAccountModel.business_id == business_id,
+                    BusinessVirtualAccountModel.is_active.is_(True),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        acct_display = va_row.account_number if va_row else ""
+        bank_display = (va_row.bank_name if va_row else None) or "your assigned bank"
+        notif_repo = NotificationRepository(session)
+        await notif_repo.create(
+            user_id=owner_user_id,
+            business_id=business_id,
+            title="Your wallet account details are ready",
+            message=(
+                f"Fund your FlowPilot wallet by transferring to account {acct_display} "
+                f"at {bank_display}. Find these details on your Wallet page."
+            ),
+            type="success",
+            resource_type="business",
+            resource_id=str(business_id),
+        )
+
+
 async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, business_name: str) -> None:
     """Background task: wait 30 seconds then mark KYC as verified."""
     await asyncio.sleep(30)
     try:
         session_factory = get_session_factory()
+        wants_kyc_email = True
         async with session_factory() as session:
             async with session.begin():
                 bid = uuid.UUID(business_id)
                 now = datetime.now(timezone.utc)
 
-                await session.execute(
-                    update(KycSubmissionModel)
-                    .where(KycSubmissionModel.business_id == bid)
-                    .values(status="verified", verified_at=now, updated_at=now)
-                )
+                # Only verify the latest pending submission — older rows are historical
+                latest_sub = (await session.execute(
+                    select(KycSubmissionModel)
+                    .where(KycSubmissionModel.business_id == bid, KycSubmissionModel.status == "pending")
+                    .order_by(KycSubmissionModel.submitted_at.desc())
+                    .limit(1)
+                )).scalar_one_or_none()
+                if latest_sub:
+                    latest_sub.status = "verified"
+                    latest_sub.verified_at = now
+                    latest_sub.updated_at = now
 
-                biz_result = await session.execute(
-                    select(BusinessModel).where(BusinessModel.id == bid)
-                )
-                biz = biz_result.scalar_one_or_none()
                 va_updates: dict = {
                     "kyc_status": "verified",
                     "kyc_level": 1,  # Business full submission = Level 1
@@ -120,10 +356,24 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                 )
 
                 owner_result = await session.execute(
-                    select(UserModel).where(UserModel.email == owner_email)
+                    select(UserModel)
+                    .where(UserModel.email == owner_email)
+                    .options(selectinload(UserModel.notification_pref_rows))
                 )
                 owner = owner_result.scalar_one_or_none()
+                # Resolve prefs while session is active — avoid lazy IO after commit (xd2s).
+                from src.services.email_service import check_notification_pref as _cnp_k_in
+
+                wants_kyc_email = bool(owner and _cnp_k_in(owner, "kyc_updates"))
                 if owner:
+                    await _ensure_reserved_virtual_account(
+                        session,
+                        business_id=bid,
+                        owner_user_id=owner.id,
+                        owner_display_name=owner_name,
+                        owner_email=owner_email,
+                        notify=True,
+                    )
                     notif_repo = NotificationRepository(session)
                     await notif_repo.create(
                         user_id=owner.id,
@@ -139,8 +389,17 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
         _biz_max = get_limits("business", max(KYC_LIMITS.get("business", {}).keys(), default=1))
         def _fmtb(n) -> str:
             return f"\u20a6{float(n):,.0f}"
-        from src.services.email_service import check_notification_pref as _cnp_k
-        if _cnp_k(owner, "kyc_updates"):
+
+        # Fetch virtual account created during verification
+        _va_result = await session.execute(
+            select(BusinessVirtualAccountModel).where(
+                BusinessVirtualAccountModel.business_id == bid,
+                BusinessVirtualAccountModel.is_active.is_(True),
+            ).limit(1)
+        )
+        _va = _va_result.scalar_one_or_none()
+
+        if wants_kyc_email:
             await email_service.send_kyc_verified_email(
                 to=owner_email,
                 display_name=owner_name,
@@ -149,6 +408,8 @@ async def _auto_verify_kyc(business_id: str, owner_email: str, owner_name: str, 
                 single_limit=_fmtb(_biz_l1["single"]) if _biz_l1 else "₦300,000",
                 wallet_limit=_fmtb(_biz_l1["wallet"]) if _biz_l1 else "₦3,000,000",
                 max_monthly_limit=_fmtb(_biz_max["monthly"]) if _biz_max else "₦50,000,000",
+                account_number=_va.account_number if _va else None,
+                bank_name=_va.bank_name if _va else None,
             )
         logger.info("KYC auto-verified for business %s", business_id)
 
@@ -212,6 +473,26 @@ async def submit_kyc(
             detail="Individual accounts must use the /kyc/individual/level1-3 endpoints.",
         )
 
+    # Block re-submission unless the latest submission was rejected
+    latest_kyc = (
+        await session.execute(
+            select(KycSubmissionModel)
+            .where(KycSubmissionModel.business_id == biz.id)
+            .order_by(KycSubmissionModel.submitted_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest_kyc and latest_kyc.status in ("pending", "verified"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your KYC submission is currently under review. "
+                "You may only resubmit after a rejection."
+                if latest_kyc.status == "pending"
+                else "Your business is already verified. Use the upgrade endpoints to reach Level 2 or 3."
+            ),
+        )
+
     # Validate business type
     valid_types = {"limited_company", "ngo", "sole_proprietorship", "partnership", "mda"}
     if business_type and business_type not in valid_types:
@@ -262,95 +543,76 @@ async def submit_kyc(
 
     now = datetime.now(timezone.utc)
 
-    # ── Upsert KycSubmission ──────────────────────────────────
-
-    kyc_result = await session.execute(
-        select(KycSubmissionModel).where(KycSubmissionModel.business_id == biz.id)
+    # ── Always insert a new submission row — preserves full history ──────────
+    kyc = KycSubmissionModel(
+        business_id=biz.id,
+        status="pending",
+        business_type=business_type,
+        registration_number=registration_number,
+        tin_number=tin_number,
+        director_name=director_name,
+        director_bvn=director_bvn,
+        trustee_name=trustee_name,
+        trustee_bvn=trustee_bvn,
+        scuml_number=scuml_number,
+        partner_names=partner_names,
+        authorized_officer_name=authorized_officer_name,
+        authorized_officer_bvn=authorized_officer_bvn,
+        submitted_at=now,
     )
-    kyc = kyc_result.scalar_one_or_none()
+    session.add(kyc)
+    await session.flush()  # populate kyc.id for document FKs
 
-    if kyc is None:
-        kyc = KycSubmissionModel(
-            business_id=biz.id,
-            status="pending",
-            business_type=business_type,
-            registration_number=registration_number,
-            tin_number=tin_number,
-            # Shared docs
-            cac_certificate_key=cac_key,
-            tin_document_key=tin_key,
-            proof_of_address_key=poa_key,
-            # LLC / Sole Prop
-            director_name=director_name,
-            director_bvn=director_bvn,
-            director_id_key=dir_id_key,
-            # NGO
-            trustee_name=trustee_name,
-            trustee_bvn=trustee_bvn,
-            trustee_id_key=trustee_id_key,
-            scuml_number=scuml_number,
-            scuml_letter_key=scuml_letter_key,
-            # Partnership
-            partner_names=partner_names,
-            partner_id_key=partner_id_key,
-            # MDA
-            mda_letter_key=mda_letter_key,
-            authorized_officer_name=authorized_officer_name,
-            authorized_officer_bvn=authorized_officer_bvn,
-            authorized_officer_id_key=auth_officer_id_key,
-            submitted_at=now,
-        )
-        session.add(kyc)
-    else:
-        kyc.status = "pending"
-        kyc.submitted_at = now
-        kyc.updated_at = now
-        if business_type:
-            kyc.business_type = business_type
-        if registration_number:
-            kyc.registration_number = registration_number
-        if tin_number:
-            kyc.tin_number = tin_number
-        # Docs — only overwrite if a new file was uploaded
-        if cac_key:
-            kyc.cac_certificate_key = cac_key
-        if tin_key:
-            kyc.tin_document_key = tin_key
-        if poa_key:
-            kyc.proof_of_address_key = poa_key
-        if dir_id_key:
-            kyc.director_id_key = dir_id_key
-        if director_name:
-            kyc.director_name = director_name
-        if director_bvn:
-            kyc.director_bvn = director_bvn
-        if trustee_name:
-            kyc.trustee_name = trustee_name
-        if trustee_bvn:
-            kyc.trustee_bvn = trustee_bvn
-        if trustee_id_key:
-            kyc.trustee_id_key = trustee_id_key
-        if scuml_number:
-            kyc.scuml_number = scuml_number
-        if scuml_letter_key:
-            kyc.scuml_letter_key = scuml_letter_key
-        if partner_names:
-            kyc.partner_names = partner_names
-        if partner_id_key:
-            kyc.partner_id_key = partner_id_key
-        if mda_letter_key:
-            kyc.mda_letter_key = mda_letter_key
-        if authorized_officer_name:
-            kyc.authorized_officer_name = authorized_officer_name
-        if authorized_officer_bvn:
-            kyc.authorized_officer_bvn = authorized_officer_bvn
-        if auth_officer_id_key:
-            kyc.authorized_officer_id_key = auth_officer_id_key
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="cac_certificate", storage_key=cac_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="tin_document", storage_key=tin_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="proof_of_address", storage_key=poa_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="director_id", storage_key=dir_id_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="trustee_id", storage_key=trustee_id_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="scuml_letter", storage_key=scuml_letter_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="partner_id", storage_key=partner_id_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="mda_letter", storage_key=mda_letter_key,
+    )
+    await _upsert_kyc_document(
+        session, submission_id=kyc.id, business_id=biz.id,
+        doc_type="authorized_officer_id", storage_key=auth_officer_id_key,
+    )
 
-    # Update business kyc_status + business_type
+    # Update business kyc_status + profile business_type
     biz.kyc_status = "pending"
     if business_type:
-        biz.business_type = business_type
+        bp_result = await session.execute(
+            select(BusinessProfileModel).where(
+                BusinessProfileModel.business_id == biz.id
+            )
+        )
+        bp = bp_result.scalar_one_or_none()
+        if bp is None:
+            session.add(BusinessProfileModel(business_id=biz.id, business_type=business_type))
+        else:
+            bp.business_type = business_type
     biz.updated_at = now
 
     # In-app notification
@@ -365,6 +627,14 @@ async def submit_kyc(
         resource_id=str(biz.id),
     )
 
+    await log_user_audit_event(
+        session,
+        event_type="kyc.business_submitted",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"business_type": business_type, "doc_count": len([k for k in [cac_key, tin_key, poa_key, dir_id_key, trustee_id_key, partner_id_key, scuml_letter_key, mda_letter_key, auth_officer_id_key] if k])},
+    )
     await session.commit()
 
     # Build list of submitted items for confirmation email
@@ -410,6 +680,13 @@ async def submit_kyc(
                 wallet_limit=_fmts(_sub_l1["wallet"]) if _sub_l1 else "₦3,000,000",
             )
         )
+
+    if Settings.VERIFICATION_ENV != "production":
+        asyncio.create_task(_auto_verify_kyc(
+            str(biz.id), user.email,
+            user.display_name or user.email,
+            biz.business_name,
+        ))
 
     return {
         "status": "pending",
@@ -504,9 +781,16 @@ async def get_kyc_status(
             "submission": None,
         }
 
-    # Business account — return existing business KYC submission
+    # Business account — return the latest submission (most recent by submitted_at)
     kyc_result = await session.execute(
-        select(KycSubmissionModel).where(KycSubmissionModel.business_id == biz.id)
+        select(KycSubmissionModel)
+        .options(
+            selectinload(KycSubmissionModel.documents),
+            selectinload(KycSubmissionModel.upgrade_requests),
+        )
+        .where(KycSubmissionModel.business_id == biz.id)
+        .order_by(KycSubmissionModel.submitted_at.desc())
+        .limit(1)
     )
     kyc = kyc_result.scalar_one_or_none()
 
@@ -516,6 +800,33 @@ async def get_kyc_status(
             "limit_info": limit_info,
             "submission": None,
         }
+
+    cac_k = _kyc_doc_key(kyc, "cac_certificate")
+    tin_k = _kyc_doc_key(kyc, "tin_document")
+    poa_k = _kyc_doc_key(kyc, "proof_of_address")
+    dir_k = _kyc_doc_key(kyc, "director_id")
+    tru_k = _kyc_doc_key(kyc, "trustee_id")
+    prt_k = _kyc_doc_key(kyc, "partner_id")
+    scm_k = _kyc_doc_key(kyc, "scuml_letter")
+    mda_k = _kyc_doc_key(kyc, "mda_letter")
+    aoi_k = _kyc_doc_key(kyc, "authorized_officer_id")
+
+    # Never return presigned document URLs once verified — security policy.
+    is_verified = kyc.status == "verified"
+
+    # Build a level→most-recent-request map: pending takes priority, otherwise latest by date.
+    upgrade_by_level: dict[int, KycUpgradeRequestModel] = {}
+    for r in sorted(kyc.upgrade_requests or [], key=lambda x: x.requested_at):
+        if r.level not in upgrade_by_level or r.status == "pending":
+            upgrade_by_level[r.level] = r
+
+    def _upgrade_field(level: int, field: str):
+        r = upgrade_by_level.get(level)
+        if r is None:
+            return None
+        if field == "status":
+            return r.status
+        return r.requested_at.isoformat() if r.requested_at else None
 
     return {
         "kyc_status": biz.kyc_status,
@@ -532,19 +843,24 @@ async def get_kyc_status(
             "authorized_officer_name": kyc.authorized_officer_name,
             "submitted_at": kyc.submitted_at.isoformat() if kyc.submitted_at else None,
             "verified_at": kyc.verified_at.isoformat() if kyc.verified_at else None,
-            "has_cac_certificate": bool(kyc.cac_certificate_key),
-            "has_tin_document": bool(kyc.tin_document_key),
-            "has_director_id": bool(kyc.director_id_key),
-            "has_proof_of_address": bool(kyc.proof_of_address_key),
-            "cac_certificate_url": _presigned(kyc.cac_certificate_key),
-            "tin_document_url": _presigned(kyc.tin_document_key),
-            "proof_of_address_url": _presigned(kyc.proof_of_address_key),
-            "director_id_url": _presigned(kyc.director_id_key),
-            "trustee_id_url": _presigned(kyc.trustee_id_key),
-            "partner_id_url": _presigned(kyc.partner_id_key),
-            "scuml_letter_url": _presigned(kyc.scuml_letter_key),
-            "mda_letter_url": _presigned(kyc.mda_letter_key),
-            "authorized_officer_id_url": _presigned(kyc.authorized_officer_id_key),
+            "has_cac_certificate": bool(cac_k),
+            "has_tin_document": bool(tin_k),
+            "has_director_id": bool(dir_k),
+            "has_proof_of_address": bool(poa_k),
+            # URLs only while pending/rejected; locked after verification (security policy).
+            "cac_certificate_url": None if is_verified else _presigned(cac_k),
+            "tin_document_url": None if is_verified else _presigned(tin_k),
+            "proof_of_address_url": None if is_verified else _presigned(poa_k),
+            "director_id_url": None if is_verified else _presigned(dir_k),
+            "trustee_id_url": None if is_verified else _presigned(tru_k),
+            "partner_id_url": None if is_verified else _presigned(prt_k),
+            "scuml_letter_url": None if is_verified else _presigned(scm_k),
+            "mda_letter_url": None if is_verified else _presigned(mda_k),
+            "authorized_officer_id_url": None if is_verified else _presigned(aoi_k),
+            "level_2_status": _upgrade_field(2, "status"),
+            "level_2_requested_at": _upgrade_field(2, "requested_at"),
+            "level_3_status": _upgrade_field(3, "status"),
+            "level_3_requested_at": _upgrade_field(3, "requested_at"),
         },
     }
 
@@ -558,6 +874,7 @@ async def _auto_verify_individual_kyc(
     await asyncio.sleep(30)
     try:
         session_factory = get_session_factory()
+        wants_kyc_email = True
         async with session_factory() as session:
             async with session.begin():
                 bid = uuid.UUID(business_id)
@@ -590,10 +907,23 @@ async def _auto_verify_individual_kyc(
 
                 # In-app notification
                 owner_result = await session.execute(
-                    select(UserModel).where(UserModel.email == owner_email)
+                    select(UserModel)
+                    .where(UserModel.email == owner_email)
+                    .options(selectinload(UserModel.notification_pref_rows))
                 )
                 owner = owner_result.scalar_one_or_none()
+                from src.services.email_service import check_notification_pref as _cnp_kiv_in
+
+                wants_kyc_email = bool(owner and _cnp_kiv_in(owner, "kyc_updates"))
                 if owner and biz:
+                    await _ensure_reserved_virtual_account(
+                        session,
+                        business_id=bid,
+                        owner_user_id=owner.id,
+                        owner_display_name=owner_name,
+                        owner_email=owner_email,
+                        notify=True,
+                    )
                     notif_repo = NotificationRepository(session)
                     await notif_repo.create(
                         user_id=owner.id,
@@ -611,8 +941,7 @@ async def _auto_verify_individual_kyc(
         _max_level = max(KYC_LIMITS.get("individual", {}).keys(), default=0)
         def _fmt(n) -> str:
             return f"\u20a6{float(n):,.0f}"
-        from src.services.email_service import check_notification_pref as _cnp_kiv
-        if _cnp_kiv(owner, "kyc_updates"):
+        if wants_kyc_email:
             await email_service.send_individual_kyc_verified_email(
                 to=owner_email,
                 display_name=owner_name,
@@ -653,6 +982,16 @@ async def submit_individual_kyc_level1(
         )
     )
     ind = ind_result.scalar_one_or_none()
+
+    if ind and ind.level_1_status in ("pending", "verified"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Identity verification is already under review."
+                if ind.level_1_status == "pending"
+                else "Identity is already verified."
+            ),
+        )
 
     if ind is None:
         ind = IndividualKycSubmissionModel(
@@ -695,8 +1034,23 @@ async def submit_individual_kyc_level1(
                 level_name=f"Identity ({id_type.upper()})",
             )
         )
-    )
-    # Real verification with Monnify
+    if Settings.VERIFICATION_ENV != "production":
+        # Test mode: skip Monnify (live-only API) and auto-verify after 30 s
+        await log_user_audit_event(
+            session,
+            event_type="kyc.individual_level1_submitted",
+            user_id=user.id,
+            business_id=biz.id,
+            resource_type="kyc_submission",
+            metadata={"id_type": id_type, "result": "pending_auto"},
+        )
+        await session.commit()
+        asyncio.create_task(_auto_verify_individual_kyc(
+            str(biz.id), 1, user.email, user.display_name or user.email,
+        ))
+        return {"status": "pending", "message": f"{id_type.upper()} submitted. Auto-verification in progress."}
+
+    # Production: real verification with Monnify
     payment_service = PaymentService()
     passed = False
     try:
@@ -723,10 +1077,27 @@ async def submit_individual_kyc_level1(
     if passed:
         biz.kyc_level = max(getattr(biz, "kyc_level", 0) or 0, 1)
         biz.kyc_status = "verified"
-        if id_type == "bvn" and biz.virtual_account_reference:
+        await _ensure_reserved_virtual_account(
+            session,
+            business_id=biz.id,
+            owner_user_id=user.id,
+            owner_display_name=(user.email or "customer").split("@", 1)[0],
+            owner_email=user.email,
+            notify=True,
+        )
+        va_row = (
+            await session.execute(
+                select(BusinessVirtualAccountModel).where(
+                    BusinessVirtualAccountModel.business_id == biz.id,
+                    BusinessVirtualAccountModel.is_active.is_(True),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        va_ref = (va_row.account_reference if va_row else None) or f"fp-{biz.id}"
+        if id_type == "bvn":
             try:
                 await payment_service.attach_bvn(
-                    account_reference=biz.virtual_account_reference or f"fp-{biz.id}",
+                    account_reference=va_ref,
                     bvn=id_value,
                 )
             except Exception as exc:
@@ -734,6 +1105,14 @@ async def submit_individual_kyc_level1(
     else:
         biz.kyc_status = "rejected"
     biz.updated_at = now2
+    await log_user_audit_event(
+        session,
+        event_type="kyc.individual_level1_submitted",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"id_type": id_type, "result": ind.level_1_status},
+    )
     await session.commit()
 
     return {
@@ -785,6 +1164,16 @@ async def submit_individual_kyc_level2(
     if ind is None:
         raise HTTPException(status_code=400, detail="Level 1 submission not found.")
 
+    if ind.level_2_status in ("pending", "verified"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Address verification is already under review."
+                if ind.level_2_status == "pending"
+                else "Address is already verified."
+            ),
+        )
+
     ind.level_2_address = address
     if poa_key:
         ind.level_2_document_key = poa_key
@@ -805,6 +1194,14 @@ async def submit_individual_kyc_level2(
         resource_type="kyc",
         resource_id=str(biz.id),
     )
+    await log_user_audit_event(
+        session,
+        event_type="kyc.individual_level2_submitted",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"has_document": bool(poa_key)},
+    )
     await session.commit()
 
     from src.services.email_service import check_notification_pref as _cnp_kis2
@@ -817,7 +1214,11 @@ async def submit_individual_kyc_level2(
                 level_name="Address",
             )
         )
-    )
+    if Settings.VERIFICATION_ENV != "production":
+        asyncio.create_task(_auto_verify_individual_kyc(
+            str(biz.id), 2, user.email, user.display_name or user.email,
+        ))
+
     return {"status": "pending", "message": "Address verification submitted and queued for review."}
 
 
@@ -873,6 +1274,16 @@ async def submit_individual_kyc_level3(
     if ind is None:
         raise HTTPException(status_code=400, detail="Level 1 submission not found.")
 
+    if ind.level_3_status in ("pending", "verified"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Government ID verification is already under review."
+                if ind.level_3_status == "pending"
+                else "Level 3 is already verified."
+            ),
+        )
+
     ind.level_3_document_key = gov_id_key
     ind.level_3_selfie_key = selfie_key
     ind.level_3_status = "pending"
@@ -892,6 +1303,14 @@ async def submit_individual_kyc_level3(
         resource_type="kyc",
         resource_id=str(biz.id),
     )
+    await log_user_audit_event(
+        session,
+        event_type="kyc.individual_level3_submitted",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"has_gov_id": bool(gov_id_key), "has_selfie": bool(selfie_key)},
+    )
     await session.commit()
 
     from src.services.email_service import check_notification_pref as _cnp_kis3
@@ -904,4 +1323,238 @@ async def submit_individual_kyc_level3(
                 level_name="Government ID",
             )
         )
+    if Settings.VERIFICATION_ENV != "production":
+        asyncio.create_task(_auto_verify_individual_kyc(
+            str(biz.id), 3, user.email, user.display_name or user.email,
+        ))
+
     return {"status": "pending", "message": "Government ID submitted for Level 3 review."}
+
+
+# ── Business KYC upgrade requests (Level 2 and 3) ────────────────────────────
+# For businesses, Level 2 and 3 upgrades require no additional documents.
+# The owner submits a brief reason; the team reviews it (in prod) or it is
+# auto-approved after a short delay (non-prod).
+
+async def _auto_approve_business_upgrade(
+    business_id: str, level: int, owner_email: str, owner_name: str, business_name: str
+) -> None:
+    """Background task: auto-approve a business KYC level upgrade in non-production."""
+    await asyncio.sleep(30)
+    try:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            async with session.begin():
+                bid = uuid.UUID(business_id)
+                now = datetime.now(timezone.utc)
+
+                await session.execute(
+                    update(KycUpgradeRequestModel)
+                    .where(
+                        KycUpgradeRequestModel.business_id == bid,
+                        KycUpgradeRequestModel.level == level,
+                        KycUpgradeRequestModel.status == "pending",
+                    )
+                    .values(status="verified", verified_at=now)
+                )
+                await session.execute(
+                    update(BusinessModel)
+                    .where(BusinessModel.id == bid)
+                    .values(kyc_level=level, kyc_status="verified", updated_at=now)
+                )
+
+                owner_result = await session.execute(
+                    select(UserModel)
+                    .where(UserModel.email == owner_email)
+                    .options(selectinload(UserModel.notification_pref_rows))
+                )
+                owner = owner_result.scalar_one_or_none()
+                if owner:
+                    notif_repo = NotificationRepository(session)
+                    await notif_repo.create(
+                        user_id=owner.id,
+                        business_id=bid,
+                        title=f"Business KYC Level {level} Approved",
+                        message=f"{business_name} has been upgraded to Level {level}. Your payout limits have been increased.",
+                        type="success",
+                        resource_type="kyc",
+                        resource_id=business_id,
+                    )
+
+        _limits = get_limits("business", level)
+        _max_level = max(KYC_LIMITS.get("business", {}).keys(), default=level)
+        def _fmtb(n) -> str:
+            return f"\u20a6{float(n):,.0f}"
+        from src.services.email_service import check_notification_pref as _cnp_bu
+        if _limits:
+            async with session_factory() as session:
+                owner_check = (await session.execute(
+                    select(UserModel)
+                    .where(UserModel.email == owner_email)
+                    .options(selectinload(UserModel.notification_pref_rows))
+                )).scalar_one_or_none()
+            if owner_check and _cnp_bu(owner_check, "kyc_updates"):
+                await email_service.send_kyc_verified_email(
+                    to=owner_email,
+                    display_name=owner_name,
+                    business_name=business_name,
+                    monthly_limit=_fmtb(_limits["monthly"]),
+                    single_limit=_fmtb(_limits["single"]),
+                    wallet_limit=_fmtb(_limits["wallet"]),
+                    max_monthly_limit=_fmtb(get_limits("business", _max_level)["monthly"]) if get_limits("business", _max_level) else "₦50,000,000",
+                )
+        logger.info("Business KYC Level %d auto-approved for business %s", level, business_id)
+    except Exception as exc:
+        logger.error("Business KYC upgrade auto-approve failed (level %d, business %s): %s", level, business_id, exc)
+
+
+@router.post("/business/level2")
+async def request_business_kyc_level2(
+    reason: str = Form(..., min_length=10, max_length=1000, description="Why you need Level 2 limits"),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Request a business KYC Level 2 upgrade. No documents needed — provide a reason."""
+    biz, user = await _get_business_and_owner(current_user, session)
+
+    if getattr(biz, "account_type", "business") == "individual":
+        raise HTTPException(status_code=400, detail="Individual accounts use /kyc/individual routes.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) < 1 or biz.kyc_status != "verified":
+        raise HTTPException(status_code=400, detail="Complete Level 1 verification before requesting Level 2.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) >= 2:
+        raise HTTPException(status_code=400, detail="Already at Level 2 or higher.")
+
+    kyc_result = await session.execute(
+        select(KycSubmissionModel)
+        .where(KycSubmissionModel.business_id == biz.id, KycSubmissionModel.status == "verified")
+        .order_by(KycSubmissionModel.submitted_at.desc())
+        .limit(1)
+    )
+    kyc = kyc_result.scalar_one_or_none()
+    if kyc is None:
+        raise HTTPException(status_code=400, detail="No verified Level 1 submission found.")
+
+    pending_check = (await session.execute(
+        select(KycUpgradeRequestModel).where(
+            KycUpgradeRequestModel.submission_id == kyc.id,
+            KycUpgradeRequestModel.level == 2,
+            KycUpgradeRequestModel.status == "pending",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if pending_check:
+        raise HTTPException(status_code=400, detail="A Level 2 upgrade request is already under review.")
+
+    now = datetime.now(timezone.utc)
+    session.add(KycUpgradeRequestModel(
+        submission_id=kyc.id,
+        business_id=biz.id,
+        level=2,
+        status="pending",
+        reason=reason.strip(),
+        requested_at=now,
+    ))
+
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=user.id,
+        business_id=biz.id,
+        title="Level 2 Upgrade Requested",
+        message="Your request to upgrade to KYC Level 2 is under review. We will notify you once it is approved.",
+        type="info",
+        resource_type="kyc",
+        resource_id=str(biz.id),
+    )
+    await log_user_audit_event(
+        session,
+        event_type="kyc.business_level2_requested",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"reason_length": len(reason)},
+    )
+    await session.commit()
+
+    if Settings.VERIFICATION_ENV != "production":
+        asyncio.create_task(_auto_approve_business_upgrade(
+            str(biz.id), 2, user.email, user.display_name or user.email, biz.business_name,
+        ))
+
+    return {"status": "pending", "message": "Level 2 upgrade request submitted and queued for review."}
+
+
+@router.post("/business/level3")
+async def request_business_kyc_level3(
+    reason: str = Form(..., min_length=10, max_length=1000, description="Why you need Level 3 limits"),
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Request a business KYC Level 3 upgrade. No documents needed — provide a reason."""
+    biz, user = await _get_business_and_owner(current_user, session)
+
+    if getattr(biz, "account_type", "business") == "individual":
+        raise HTTPException(status_code=400, detail="Individual accounts use /kyc/individual routes.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) < 2:
+        raise HTTPException(status_code=400, detail="Complete Level 2 verification before requesting Level 3.")
+
+    if (getattr(biz, "kyc_level", 0) or 0) >= 3:
+        raise HTTPException(status_code=400, detail="Already at the maximum level.")
+
+    kyc_result = await session.execute(
+        select(KycSubmissionModel)
+        .where(KycSubmissionModel.business_id == biz.id, KycSubmissionModel.status == "verified")
+        .order_by(KycSubmissionModel.submitted_at.desc())
+        .limit(1)
+    )
+    kyc = kyc_result.scalar_one_or_none()
+    if kyc is None:
+        raise HTTPException(status_code=400, detail="No verified KYC submission found.")
+
+    pending_check = (await session.execute(
+        select(KycUpgradeRequestModel).where(
+            KycUpgradeRequestModel.submission_id == kyc.id,
+            KycUpgradeRequestModel.level == 3,
+            KycUpgradeRequestModel.status == "pending",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if pending_check:
+        raise HTTPException(status_code=400, detail="A Level 3 upgrade request is already under review.")
+
+    now = datetime.now(timezone.utc)
+    session.add(KycUpgradeRequestModel(
+        submission_id=kyc.id,
+        business_id=biz.id,
+        level=3,
+        status="pending",
+        reason=reason.strip(),
+        requested_at=now,
+    ))
+
+    notif_repo = NotificationRepository(session)
+    await notif_repo.create(
+        user_id=user.id,
+        business_id=biz.id,
+        title="Level 3 Upgrade Requested",
+        message="Your request to upgrade to KYC Level 3 is under review. We will notify you once it is approved.",
+        type="info",
+        resource_type="kyc",
+        resource_id=str(biz.id),
+    )
+    await log_user_audit_event(
+        session,
+        event_type="kyc.business_level3_requested",
+        user_id=user.id,
+        business_id=biz.id,
+        resource_type="kyc_submission",
+        metadata={"reason_length": len(reason)},
+    )
+    await session.commit()
+
+    if Settings.VERIFICATION_ENV != "production":
+        asyncio.create_task(_auto_approve_business_upgrade(
+            str(biz.id), 3, user.email, user.display_name or user.email, biz.business_name,
+        ))
+
+    return {"status": "pending", "message": "Level 3 upgrade request submitted and queued for review."}

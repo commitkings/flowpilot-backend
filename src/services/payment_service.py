@@ -10,13 +10,26 @@ class PaymentService:
         self.client = MonnifyClient()
 
     async def create_reserved_account(
-        self, *, account_reference: str, account_name: str, customer_email: str
+        self,
+        *,
+        account_reference: str,
+        account_name: str,
+        customer_email: str,
+        customer_name: str | None = None,
+        bvn: str | None = None,
+        nin: str | None = None,
+        get_all_available_banks: bool = True,
     ) -> dict:
+        """Create a Monnify reserved account (BVN or NIN required by Monnify)."""
+        cn = (customer_name or "").strip() or account_name
         return await self.client.create_reserved_account(
             account_reference=account_reference,
             account_name=account_name,
             customer_email=customer_email,
-            customer_name=account_name,
+            customer_name=cn,
+            bvn=bvn,
+            nin=nin,
+            get_all_available_banks=get_all_available_banks,
         )
 
     async def attach_bvn(self, *, account_reference: str, bvn: str) -> None:
@@ -33,7 +46,7 @@ class PaymentService:
 
     async def single_transfer(self, req: TransferRequest) -> TransferResponse:
         payload = {
-            "amount": req.amount,
+            "amount": float(req.amount),
             "reference": req.reference,
             "narration": req.narration,
             "destinationBankCode": req.destination_bank_code,

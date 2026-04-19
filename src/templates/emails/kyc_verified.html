@@ -95,6 +95,33 @@
                 </tr>
               </table>
 
+              {% if account_number %}
+              <!-- Virtual account card -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:20px;">
+                <tr>
+                  <td style="background-color:#eff6ff;border-radius:8px;border:1px solid #bfdbfe;padding:16px 18px;">
+                    <p style="margin:0 0 12px;font-size:13px;font-weight:700;color:#1d4ed8;">&#127974; Your wallet account is ready</p>
+                    <p style="margin:0 0 12px;font-size:13px;color:#334155;line-height:1.6;">
+                      A dedicated bank account has been created for your wallet. Transfer funds to this account to top up your FlowPilot balance:
+                    </p>
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="font-size:13px;color:#64748b;padding-bottom:8px;">Account number</td>
+                        <td style="font-size:15px;font-weight:800;color:#0f172a;text-align:right;padding-bottom:8px;font-family:monospace;letter-spacing:0.05em;">{{ account_number }}</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size:13px;color:#64748b;">Bank</td>
+                        <td style="font-size:13px;font-weight:600;color:#0f172a;text-align:right;">{{ bank_name }}</td>
+                      </tr>
+                    </table>
+                    <p style="margin:12px 0 0;font-size:12px;color:#64748b;line-height:1.5;">
+                      This account is unique to your business. Any transfer made to it will automatically credit your FlowPilot wallet.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+              {% endif %}
+
               <!-- What's available card -->
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
                 <tr>
@@ -111,14 +138,21 @@
                 Need higher limits? Complete Level 2 and Level 3 verification from your dashboard to unlock up to {{ max_monthly_limit }}/month.
               </p>
 
-              <!-- CTA button -->
+              <!-- CTA buttons -->
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                 <tr>
-                  <td style="border-radius:8px;background-color:#e86727;">
+                  <td style="border-radius:8px;background-color:#e86727;padding-right:12px;">
                     <a href="{{ dashboard_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
                       Go to dashboard &rarr;
                     </a>
                   </td>
+                  {% if account_number %}
+                  <td style="border-radius:8px;background-color:#1d4ed8;">
+                    <a href="{{ wallet_url }}" style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:8px;letter-spacing:0.01em;">
+                      View wallet &rarr;
+                    </a>
+                  </td>
+                  {% endif %}
                 </tr>
               </table>
 

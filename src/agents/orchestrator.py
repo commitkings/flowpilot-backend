@@ -197,6 +197,9 @@ class RunOrchestrator:
             else:
                 await self._publisher.run_failed(state.get("error", "Unknown error"))
 
+        await self._settle_wallet_after_run(run_id)
+        await self._emit_payee_receipts(run_id)
+
         await self._session.commit()
         return state
 
@@ -260,9 +263,112 @@ class RunOrchestrator:
             else:
                 await self._publisher.run_failed(state.get("error", "Unknown error"))
 
+        await self._settle_wallet_after_run(run_id)
+        await self._emit_payee_receipts(run_id)
+
         await self._session.commit()
 
         return state
+
+    async def _settle_wallet_after_run(self, run_id: uuid.UUID) -> None:
+        """Settle reserved wallet funds after execution + audit (reserve → settle)."""
+        from sqlalchemy import select as _sel
+
+        from src.infrastructure.database.flowpilot_models import (
+            AgentRunModel,
+            PayoutCandidateModel,
+        )
+        from src.infrastructure.database.repositories.wallet_repository import (
+            WalletRepository,
+        )
+
+        run = await self._run_repo.get_by_id(run_id)
+        if run is None:
+            return
+
+        cand_rows = (
+            await self._session.execute(
+                _sel(PayoutCandidateModel).where(PayoutCandidateModel.run_id == run_id)
+            )
+        ).scalars().all()
+        approved = [c for c in cand_rows if c.approval_status == "approved"]
+        if not approved:
+            return
+
+        orig = sum(Decimal(str(c.amount)) for c in approved)
+        succ = sum(
+            Decimal(str(c.amount))
+            for c in approved
+            if str(c.execution_status).lower() == "success"
+        )
+        failed = sum(
+            Decimal(str(c.amount))
+            for c in approved
+            if str(c.execution_status).lower() == "failed"
+        )
+
+        wr = WalletRepository(self._session)
+        await wr.settle_payout_run(
+            run.business_id,
+            run_id,
+            successful_payout_total=succ,
+            failed_payout_total=failed,
+            original_payout_total=orig,
+            platform_fee_amount=Decimal(str(run.platform_fee_amount)),
+            platform_fee_rate=Decimal(str(run.platform_fee_rate or "0.006")),
+        )
+
+    async def _emit_payee_receipts(self, run_id: uuid.UUID) -> None:
+        """Create payee_payment_receipt rows for successful payouts to registered payees."""
+        from datetime import datetime as _dt, timezone as _tz
+
+        from sqlalchemy import select as _sel
+
+        from src.infrastructure.database.flowpilot_models import PayoutCandidateModel
+        from src.infrastructure.database.flowpilot_models import (
+            PayeeBankAccountModel,
+            PayeePaymentReceiptModel,
+        )
+
+        candidates = (
+            await self._session.execute(
+                _sel(PayoutCandidateModel).where(
+                    PayoutCandidateModel.run_id == run_id,
+                    PayoutCandidateModel.execution_status == "success",
+                )
+            )
+        ).scalars().all()
+        for c in candidates:
+            acc = (
+                await self._session.execute(
+                    _sel(PayeeBankAccountModel).where(
+                        PayeeBankAccountModel.account_number == c.account_number,
+                        PayeeBankAccountModel.institution_code == c.institution_code,
+                    )
+                )
+            ).scalar_one_or_none()
+            if acc is None or acc.payee_profile_id is None:
+                continue
+            exists = await self._session.execute(
+                _sel(PayeePaymentReceiptModel).where(
+                    PayeePaymentReceiptModel.payout_candidate_id == c.id
+                )
+            )
+            if exists.scalar_one_or_none() is not None:
+                continue
+            self._session.add(
+                PayeePaymentReceiptModel(
+                    payee_profile_id=acc.payee_profile_id,
+                    payout_candidate_id=c.id,
+                    bank_account_id=acc.id,
+                    payer_business_id=c.business_id,
+                    amount=c.amount,
+                    currency=c.currency,
+                    purpose=c.purpose,
+                    provider_reference=c.provider_reference,
+                    paid_at=c.executed_at or _dt.now(_tz.utc),
+                )
+            )
 
     def _build_dynamic_pipeline(self, state: AgentState) -> list[PipelineEntry]:
         """Build an execution pipeline from the planner's plan_steps output.
@@ -870,22 +976,30 @@ class RunOrchestrator:
                 _inst_map: dict[str, str] = {}
                 try:
                     _inst_repo_orch = _InstRepoOrch(session)
-                    _institutions = await _inst_repo_orch.get_all_active()
+                    _institutions, _ = await _inst_repo_orch.get_all_active(limit=10_000)
                     _inst_map = {i.institution_code: i.institution_name for i in _institutions}
                 except Exception:
                     pass
 
-                # Org name for emails
+                # Org name + logo for emails
                 _org_name_exec = "Your Organisation"
+                _org_logo_url: Optional[str] = None
                 try:
                     from sqlalchemy import select as _sel_orch
                     from src.infrastructure.database.flowpilot_models import BusinessModel as _BizModelOrch
+                    from src.infrastructure.storage.s3_client import S3Client as _S3Orch
                     _biz_r = await session.execute(
                         _sel_orch(_BizModelOrch).where(_BizModelOrch.id == business_uuid_wh)
                     )
                     _biz_e = _biz_r.scalar_one_or_none()
                     if _biz_e:
                         _org_name_exec = _biz_e.business_name
+                        if getattr(_biz_e, "logo_url", None):
+                            try:
+                                _s3 = _S3Orch()
+                                _org_logo_url = await _s3.make_file_url(_biz_e.logo_url)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -929,6 +1043,7 @@ class RunOrchestrator:
                                 status="success",
                                 reference=_provider_ref,
                                 purpose=_meta.get("purpose"),
+                                business_logo_url=_org_logo_url,
                             ))
                     elif exec_status == "failed":
                         _reason = er.get("response_message") or "execution_failed"
@@ -961,6 +1076,7 @@ class RunOrchestrator:
                                 status="failed",
                                 purpose=_meta.get("purpose"),
                                 reason=_reason,
+                                business_logo_url=_org_logo_url,
                             ))
             except Exception as _wh_exc:
                 logger.warning(f"Run {run_id}: payout webhook/email dispatch failed: {_wh_exc}")

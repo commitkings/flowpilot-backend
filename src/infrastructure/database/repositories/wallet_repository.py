@@ -24,6 +24,10 @@ from src.infrastructure.database.flowpilot_models import (
     WalletModel,
     WalletTransactionModel,
 )
+from src.infrastructure.database.flowpilot_models import (
+    WalletReservationModel,
+)
+from src.services.ledger_writer import insert_ledger_entry
 
 # Balance below which we fire a low-balance warning email to the owner.
 LOW_BALANCE_THRESHOLD = Decimal("50000.00")
@@ -88,7 +92,11 @@ class WalletRepository:
         )
         wallet = result.scalars().first()
         if wallet is None:
-            wallet = WalletModel(business_id=business_id, balance=Decimal("0.00"))
+            wallet = WalletModel(
+                business_id=business_id,
+                balance=Decimal("0.00"),
+                reserved_balance=Decimal("0.00"),
+            )
             self._session.add(wallet)
             await self._session.flush()
         return wallet
@@ -173,9 +181,10 @@ class WalletRepository:
 
         wallet = await self._get_locked(business_id)
 
-        if wallet.balance < amount:
+        available = wallet.balance - wallet.reserved_balance
+        if available < amount:
             raise InsufficientBalanceError(
-                balance=wallet.balance, required=amount
+                balance=available, required=amount
             )
 
         balance_before = wallet.balance
@@ -203,6 +212,178 @@ class WalletRepository:
             return existing, False  # type: ignore[return-value]
 
         return tx, True
+
+    async def reserve_for_payout_run(
+        self,
+        business_id: uuid.UUID,
+        run_id: uuid.UUID,
+        payout_total: Decimal,
+        platform_fee: Decimal,
+    ) -> WalletReservationModel:
+        """Lock payout_total + platform_fee in reserved_balance; append-only ledger reserve row."""
+        # Idempotent: return existing reservation if the run was retried after a partial failure
+        existing = (await self._session.execute(
+            select(WalletReservationModel).where(WalletReservationModel.run_id == run_id)
+        )).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
+        total_reserve = (payout_total + platform_fee).quantize(Decimal("0.01"))
+        if total_reserve <= 0:
+            raise ValueError("reserve amount must be positive")
+
+        wallet = await self._get_locked(business_id)
+        available = wallet.balance - wallet.reserved_balance
+        if available < total_reserve:
+            raise InsufficientBalanceError(balance=available, required=total_reserve)
+
+        wallet.reserved_balance += total_reserve
+        wallet.updated_at = datetime.now(timezone.utc)
+
+        led_id = await insert_ledger_entry(
+            self._session,
+            entry_type="wallet_reserve",
+            gross_amount=total_reserve,
+            net_amount=total_reserve,
+            fee_amount=Decimal("0.00"),
+            direction="debit",
+            status="completed",
+            originator_type="business",
+            beneficiary_type="system",
+            business_id=business_id,
+            run_id=run_id,
+            narration=f"Funds reserved for run {run_id}",
+            prefix="WRR",
+            source_table="wallet_reservation",
+            source_id=str(run_id),
+        )
+
+        reservation = WalletReservationModel(
+            wallet_id=wallet.id,
+            business_id=business_id,
+            run_id=run_id,
+            reserved_amount=total_reserve,
+            status="active",
+            ledger_reserve_id=led_id,
+        )
+        self._session.add(reservation)
+        await self._session.flush()
+        return reservation
+
+    async def settle_payout_run(
+        self,
+        business_id: uuid.UUID,
+        run_id: uuid.UUID,
+        *,
+        successful_payout_total: Decimal,
+        failed_payout_total: Decimal,
+        original_payout_total: Decimal,
+        platform_fee_amount: Decimal,
+        platform_fee_rate: Decimal,
+    ) -> bool:
+        """Convert reservation into balance debits; idempotent if reservation already settled."""
+        result = await self._session.execute(
+            select(WalletReservationModel)
+            .where(WalletReservationModel.run_id == run_id)
+            .with_for_update()
+        )
+        reservation = result.scalar_one_or_none()
+        if reservation is None:
+            return False
+        if reservation.status != "active":
+            return False
+
+        wallet = await self._get_locked(business_id)
+        suc = successful_payout_total.quantize(Decimal("0.01"))
+        orig = original_payout_total.quantize(Decimal("0.01"))
+        if orig > 0:
+            fee_charged = (platform_fee_amount * (suc / orig)).quantize(Decimal("0.01"))
+        else:
+            fee_charged = Decimal("0.00")
+
+        total_debit = (suc + fee_charged).quantize(Decimal("0.01"))
+        balance_before = wallet.balance
+        wallet.balance -= total_debit
+        wallet.reserved_balance -= reservation.reserved_amount
+        if wallet.reserved_balance < 0:
+            wallet.reserved_balance = Decimal("0.00")
+        wallet.updated_at = datetime.now(timezone.utc)
+
+        tx = WalletTransactionModel(
+            wallet_id=wallet.id,
+            business_id=business_id,
+            type="debit",
+            amount=total_debit,
+            reference=f"run_settle_{run_id}",
+            description="Payout run settlement (successful amounts + proportional fee)",
+            run_id=run_id,
+            balance_before=balance_before,
+            balance_after=wallet.balance,
+        )
+        self._session.add(tx)
+        await self._session.flush()
+
+        settle_led = await insert_ledger_entry(
+            self._session,
+            entry_type="wallet_settle",
+            gross_amount=suc,
+            net_amount=total_debit,
+            fee_amount=fee_charged,
+            direction="debit",
+            status="completed",
+            originator_type="business",
+            beneficiary_type="system",
+            business_id=business_id,
+            run_id=run_id,
+            narration=f"Settlement for run {run_id}",
+            prefix="WST",
+            source_table="wallet_transaction",
+            source_id=str(tx.id),
+        )
+
+        if failed_payout_total > 0:
+            await insert_ledger_entry(
+                self._session,
+                entry_type="wallet_release",
+                gross_amount=failed_payout_total.quantize(Decimal("0.01")),
+                net_amount=failed_payout_total.quantize(Decimal("0.01")),
+                fee_amount=Decimal("0.00"),
+                direction="credit",
+                status="completed",
+                originator_type="system",
+                beneficiary_type="business",
+                business_id=business_id,
+                run_id=run_id,
+                narration=f"Release reserved funds for failed payouts — run {run_id}",
+                prefix="WRL",
+            )
+
+        from src.infrastructure.database.flowpilot_models import (
+            PlatformFeeTransactionModel,
+        )
+
+        if fee_charged > 0:
+            self._session.add(
+                PlatformFeeTransactionModel(
+                    run_id=run_id,
+                    business_id=business_id,
+                    fee_type="platform_fee",
+                    rate=platform_fee_rate,
+                    payout_amount=suc,
+                    fee_amount=fee_charged,
+                    min_fee_applied=fee_charged <= platform_fee_amount
+                    and fee_charged == platform_fee_amount,
+                    wallet_tx_id=tx.id,
+                )
+            )
+
+        reservation.settled_amount = total_debit
+        reservation.released_amount = failed_payout_total.quantize(Decimal("0.01"))
+        reservation.status = "settled"
+        reservation.settled_at = datetime.now(timezone.utc)
+        reservation.ledger_settle_id = settle_led
+        await self._session.flush()
+        return True
 
     async def list_transactions(
         self,

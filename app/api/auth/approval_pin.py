@@ -11,13 +11,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.passwords import hash_pin, verify_password
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import UserModel
+from src.infrastructure.database.flowpilot_models import UserMfaModel
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,17 @@ async def _verify_reset_otp(user_id: str, code: str) -> bool:
         return False
 
 
+async def _get_or_create_mfa(session: AsyncSession, user_id) -> UserMfaModel:
+    """Return the user's MFA row, creating an empty one if missing (PIN lives on ``user_mfa``)."""
+    r = await session.execute(select(UserMfaModel).where(UserMfaModel.user_id == user_id))
+    mfa = r.scalar_one_or_none()
+    if mfa is None:
+        mfa = UserMfaModel(user_id=user_id)
+        session.add(mfa)
+        await session.flush()
+    return mfa
+
+
 # ── Request / Response models ──────────────────────────────────────────────────
 
 class SetPinRequest(BaseModel):
@@ -107,11 +118,9 @@ async def setup_pin(
 ):
     """Create or replace the approval PIN."""
     hashed = hash_pin(body.pin)
-    await session.execute(
-        update(UserModel)
-        .where(UserModel.id == current_user.id)
-        .values(approval_pin_hash=hashed)
-    )
+    mfa = await _get_or_create_mfa(session, current_user.id)
+    mfa.approval_pin_hash = hashed
+    mfa.updated_at = datetime.now(timezone.utc)
     await session.commit()
     return {"message": "Approval PIN set successfully."}
 
@@ -141,10 +150,11 @@ async def remove_pin(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Remove the approval PIN."""
+    now = datetime.now(timezone.utc)
     await session.execute(
-        update(UserModel)
-        .where(UserModel.id == current_user.id)
-        .values(approval_pin_hash=None)
+        update(UserMfaModel)
+        .where(UserMfaModel.user_id == current_user.id)
+        .values(approval_pin_hash=None, updated_at=now)
     )
     await session.commit()
     return {"message": "Approval PIN removed."}
@@ -212,16 +222,17 @@ async def confirm_pin_reset(
         totp = pyotp.TOTP(current_user.totp_secret)
         if not totp.verify(body.code, valid_window=1):
             raise HTTPException(status_code=400, detail="Invalid authenticator code.")
+        from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+        if not await _totp_mark(str(current_user.id), body.code):
+            raise HTTPException(status_code=400, detail="Authenticator code has already been used. Wait for the next code.")
     else:
         valid = await _verify_reset_otp(str(current_user.id), body.code)
         if not valid:
             raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
 
     hashed = hash_pin(body.new_pin)
-    await session.execute(
-        update(UserModel)
-        .where(UserModel.id == current_user.id)
-        .values(approval_pin_hash=hashed)
-    )
+    mfa = await _get_or_create_mfa(session, current_user.id)
+    mfa.approval_pin_hash = hashed
+    mfa.updated_at = datetime.now(timezone.utc)
     await session.commit()
     return {"message": "Approval PIN has been reset successfully."}

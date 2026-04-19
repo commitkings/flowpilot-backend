@@ -34,6 +34,7 @@ from src.infrastructure.database.repositories.invitation_repository import (
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_team_added_email, send_team_invite_email
 from src.infrastructure.database.repositories.notification_repository import NotificationRepository
+from src.services.user_audit_service import log_user_audit_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -271,6 +272,15 @@ async def invite_member(
         except Exception as _notif_exc:
             logger.warning("Failed to create team notification: %s", _notif_exc)
 
+        await log_user_audit_event(
+            session,
+            event_type="team.member_invited",
+            user_id=current_user.id,
+            business_id=caller.business_id,
+            resource_type="team_member",
+            resource_id=target_user.id,
+            metadata={"invited_email": normalized, "role": role, "method": "direct_add"},
+        )
         return {
             "status": "added",
             "member": _serialize_member(member, target_user),
@@ -305,6 +315,15 @@ async def invite_member(
         frontend_url=Settings.FRONTEND_URL,
     )
 
+    await log_user_audit_event(
+        session,
+        event_type="team.member_invited",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="invitation",
+        resource_id=invite.id,
+        metadata={"invited_email": normalized, "role": role, "method": "email_invite"},
+    )
     return {
         "status": "invited",
         "invite_id": str(invite.id),
@@ -451,9 +470,19 @@ async def update_member_role(
     if target.user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot change your own role")
 
+    old_role = target.role
     target.role = body.role
     await session.flush()
 
+    await log_user_audit_event(
+        session,
+        event_type="team.member_role_changed",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="team_member",
+        resource_id=target.user_id,
+        metadata={"old_role": old_role, "new_role": body.role},
+    )
     return {"status": "updated", "member": _serialize_member(target, target.user)}
 
 
@@ -496,6 +525,15 @@ async def toggle_member_status(
     target.is_active = body.is_active
     await session.flush()
 
+    await log_user_audit_event(
+        session,
+        event_type="team.member_status_changed",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="team_member",
+        resource_id=target.user_id,
+        metadata={"is_active": body.is_active},
+    )
     return {"status": "updated", "member": _serialize_member(target, target.user)}
 
 
@@ -524,6 +562,15 @@ async def revoke_invitation(
         raise HTTPException(status_code=400, detail="Invitation is not pending")
 
     await invite_repo.mark_revoked(invite)
+    await log_user_audit_event(
+        session,
+        event_type="team.invite_revoked",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="invitation",
+        resource_id=iid,
+        metadata={"invited_email": invite.invited_email, "role": invite.role},
+    )
     await session.commit()
     return {"status": "revoked"}
 
@@ -617,8 +664,17 @@ async def delete_member_user(
     if target.user:
         target.user.is_active = False
 
-    # Remove team membership
+    deleted_user_id = target.user_id
     await session.delete(target)
+    await log_user_audit_event(
+        session,
+        event_type="team.member_deleted",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="team_member",
+        resource_id=deleted_user_id,
+        metadata={"deleted_user_id": str(deleted_user_id)},
+    )
     await session.commit()
 
     return {"status": "deleted", "message": "User account deactivated and removed from team"}
@@ -655,9 +711,19 @@ async def remove_member(
             status_code=400, detail="Cannot remove yourself from the team"
         )
 
+    removed_user_id = target.user_id
     await session.delete(target)
     await session.flush()
 
+    await log_user_audit_event(
+        session,
+        event_type="team.member_removed",
+        user_id=current_user.id,
+        business_id=caller.business_id,
+        resource_type="team_member",
+        resource_id=removed_user_id,
+        metadata={"removed_member_id": str(mid)},
+    )
     return {"status": "removed"}
 
 

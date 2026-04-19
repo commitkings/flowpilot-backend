@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -24,6 +25,7 @@ ROUTE_TABLE = [
     ("/api/v1/onboarding", "kyc"),
     ("/api/v1/runs", "orchestration"),
     ("/api/v1/approval", "orchestration"),
+    ("/api/v1/approvals", "orchestration"),
     ("/api/v1/approvals-queue", "orchestration"),
     ("/api/v1/audit", "orchestration"),
     ("/api/v1/scheduled-runs", "orchestration"),
@@ -41,11 +43,18 @@ def _target_service(path: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    app.state.http = httpx.AsyncClient(timeout=60.0)
+    # Default 30s for most routes; file upload routes (kyc/submit) need more headroom.
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    )
+    app.state.http_upload = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    )
     try:
         yield
     finally:
         await app.state.http.aclose()
+        await app.state.http_upload.aclose()
 
 
 app = FastAPI(title="FlowPilot Gateway", version="0.1.0", lifespan=lifespan)
@@ -66,6 +75,12 @@ app.add_middleware(
 )
 
 
+_UPLOAD_PATHS = {"/api/v1/kyc/submit", "/api/v1/kyc/individual/level1", "/api/v1/kyc/individual/level2", "/api/v1/kyc/individual/level3"}
+
+
+_RETRY_DELAYS = [0.5, 1.0, 2.0, 4.0]  # seconds between attempts
+
+
 async def _forward(request: Request, path: str) -> Response:
     service = _target_service(path)
     base_url = SERVICE_URLS[service]
@@ -77,23 +92,42 @@ async def _forward(request: Request, path: str) -> Response:
         if key.lower() not in EXCLUDED_HEADERS
     }
     body = await request.body()
-    resp = await request.app.state.http.request(
-        method=request.method,
-        url=target_url,
-        params=request.query_params,
-        headers=headers,
-        content=body,
-    )
-    passthrough_headers = {
-        key: value
-        for key, value in resp.headers.items()
-        if key.lower() not in EXCLUDED_HEADERS
-    }
+    http = request.app.state.http_upload if path in _UPLOAD_PATHS else request.app.state.http
+
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate([0.0] + _RETRY_DELAYS):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            resp = await http.request(
+                method=request.method,
+                url=target_url,
+                params=request.query_params,
+                headers=headers,
+                content=body,
+            )
+            passthrough_headers = {
+                key: value
+                for key, value in resp.headers.items()
+                if key.lower() not in EXCLUDED_HEADERS
+            }
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=passthrough_headers,
+                media_type=resp.headers.get("content-type"),
+            )
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+        except httpx.ConnectError as exc:
+            last_exc = exc
+
+    is_timeout = isinstance(last_exc, httpx.TimeoutException)
     return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=passthrough_headers,
-        media_type=resp.headers.get("content-type"),
+        content=b'{"detail":"upstream service timed out, please retry"}' if is_timeout
+                else b'{"detail":"upstream service unavailable, please retry"}',
+        status_code=504 if is_timeout else 503,
+        media_type="application/json",
     )
 
 

@@ -20,7 +20,6 @@ from src.infrastructure.database.repositories.notification_repository import (
 )
 from src.infrastructure.database.repositories.user_repository import UserRepository
 from src.services.email_service import send_welcome_email
-from src.services.payment_service import PaymentService
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +98,10 @@ async def complete_onboarding(
                 detail="You must be at least 18 years old to register.",
             )
 
-        # Persist DOB on the user
-        from sqlalchemy import update as sa_update
-        from src.infrastructure.database.flowpilot_models import UserModel as _UserModel
-        await session.execute(
-            sa_update(_UserModel)
-            .where(_UserModel.id == current_user.id)
-            .values(date_of_birth=body.date_of_birth)
+        # Persist DOB on user_profile
+        await user_repo.update_profile(
+            current_user.id,
+            date_of_birth=body.date_of_birth,
         )
 
     biz_repo = BusinessRepository(session)
@@ -129,29 +125,9 @@ async def complete_onboarding(
 
     logger.info("Onboarding complete for user=%s business=%s", current_user.id, business.id)
 
-    # Create reserved account via Monnify for wallet funding
-    try:
-        payment_service = PaymentService()
-        account_reference = f"fp-{business.id}"
-        account_name = (
-            body.business_name if body.account_type == "business" else current_user.display_name
-        )
-        va_response = await payment_service.create_reserved_account(
-            account_reference=account_reference,
-            account_name=account_name,
-            customer_email=current_user.email,
-        )
-        va_body = va_response.get("responseBody", {})
-        accounts = va_body.get("accounts", [])
-        account = accounts[0] if accounts else {}
-        business.virtual_account_number = account.get("accountNumber")
-        business.virtual_account_bank = account.get("bankName")
-        business.virtual_account_bank_code = account.get("bankCode")
-        business.virtual_account_reference = va_body.get("reservedAccountCode") or account_reference
-        business.virtual_account_name = account_name
-        await session.commit()
-    except Exception as exc:
-        logger.warning("Monnify reserved account creation failed for %s: %s", business.id, exc)
+    await session.commit()
+
+    biz_out = await biz_repo.get_by_id(business.id) or business
 
     # Create welcome notification
     notif_repo = NotificationRepository(session)
@@ -171,22 +147,6 @@ async def complete_onboarding(
         resource_id=str(business.id),
     )
 
-    # Notify about virtual account assignment
-    if business.virtual_account_number:
-        await notif_repo.create(
-            user_id=current_user.id,
-            business_id=business.id,
-            title="Your wallet account details are ready",
-            message=(
-                f"Fund your FlowPilot wallet by transferring to account "
-                f"{business.virtual_account_number} at {business.virtual_account_bank}. "
-                "Find these details on your Wallet page."
-            ),
-            type="success",
-            resource_type="business",
-            resource_id=str(business.id),
-        )
-
     # Send welcome email — best-effort, never blocks the response
     await send_welcome_email(
         to=current_user.email,
@@ -197,27 +157,27 @@ async def complete_onboarding(
 
     return {
         "business": {
-            "id": str(business.id),
-            "business_name": business.business_name,
-            "account_type": business.account_type,
-            "business_type": business.business_type,
-            "virtual_account_number": business.virtual_account_number,
-            "virtual_account_bank": business.virtual_account_bank,
-            "virtual_account_name": business.virtual_account_name,
+            "id": str(biz_out.id),
+            "business_name": biz_out.business_name,
+            "account_type": biz_out.account_type,
+            "business_type": biz_out.business_type,
+            "virtual_account_number": biz_out.virtual_account_number,
+            "virtual_account_bank": biz_out.virtual_account_bank,
+            "virtual_account_name": biz_out.virtual_account_name,
         },
         "config": {
             "onboarding_step": config.onboarding_step,
             "onboarding_completed_at": config.onboarding_completed_at.isoformat(),
-            "monthly_txn_volume_range": config.monthly_txn_volume_range,
-            "avg_monthly_payouts_range": config.avg_monthly_payouts_range,
-            "primary_bank": config.primary_bank,
-            "primary_use_cases": config.primary_use_cases,
-            "risk_appetite": config.risk_appetite,
-            "merchant_state": config.merchant_state,
-            "daily_payout_limit": float(config.daily_payout_limit) if config.daily_payout_limit else None,
-            "single_payout_cap": float(config.single_payout_cap) if config.single_payout_cap else None,
-            "risk_alert_threshold": float(config.risk_alert_threshold) if config.risk_alert_threshold else None,
-            "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config.liquidity_alert_buffer else None,
+            "monthly_txn_volume_range": biz_out.monthly_txn_volume_range,
+            "avg_monthly_payouts_range": biz_out.avg_monthly_payouts_range,
+            "primary_bank": biz_out.primary_bank,
+            "primary_use_cases": biz_out.primary_use_cases,
+            "risk_appetite": biz_out.risk_appetite,
+            "merchant_state": biz_out.merchant_state,
+            "daily_payout_limit": float(biz_out.daily_payout_limit) if biz_out.daily_payout_limit else None,
+            "single_payout_cap": float(biz_out.single_payout_cap) if biz_out.single_payout_cap else None,
+            "risk_alert_threshold": float(biz_out.risk_alert_threshold) if biz_out.risk_alert_threshold else None,
+            "liquidity_alert_buffer": float(biz_out.liquidity_alert_buffer) if biz_out.liquidity_alert_buffer else None,
         },
         "membership": {
             "business_id": str(member.business_id),

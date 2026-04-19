@@ -103,21 +103,21 @@ async def get_org_profile(
         "virtual_account_bank": biz.virtual_account_bank,
         "virtual_account_name": biz.virtual_account_name,
         "config": {
-            "monthly_txn_volume_range": config.monthly_txn_volume_range if config else None,
-            "avg_monthly_payouts_range": config.avg_monthly_payouts_range if config else None,
-            "primary_bank": config.primary_bank if config else None,
-            "primary_use_cases": config.primary_use_cases if config else None,
-            "risk_appetite": config.risk_appetite if config else None,
-            "default_risk_tolerance": config.default_risk_tolerance if config else None,
-            "default_budget_cap": float(config.default_budget_cap) if config and config.default_budget_cap else None,
-            "merchant_state": config.merchant_state if config else None,
-            "daily_payout_limit": float(config.daily_payout_limit) if config and config.daily_payout_limit else None,
-            "single_payout_cap": float(config.single_payout_cap) if config and config.single_payout_cap else None,
-            "risk_alert_threshold": float(config.risk_alert_threshold) if config and config.risk_alert_threshold else None,
-            "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config and config.liquidity_alert_buffer else None,
+            "monthly_txn_volume_range": biz.monthly_txn_volume_range,
+            "avg_monthly_payouts_range": biz.avg_monthly_payouts_range,
+            "primary_bank": biz.primary_bank,
+            "primary_use_cases": biz.primary_use_cases,
+            "risk_appetite": biz.risk_appetite,
+            "default_risk_tolerance": biz.default_risk_tolerance,
+            "default_budget_cap": float(biz.default_budget_cap) if biz.default_budget_cap else None,
+            "merchant_state": biz.merchant_state,
+            "daily_payout_limit": float(biz.daily_payout_limit) if biz.daily_payout_limit else None,
+            "single_payout_cap": float(biz.single_payout_cap) if biz.single_payout_cap else None,
+            "risk_alert_threshold": float(biz.risk_alert_threshold) if biz.risk_alert_threshold else None,
+            "liquidity_alert_buffer": float(biz.liquidity_alert_buffer) if biz.liquidity_alert_buffer else None,
             "preferences": config.preferences if config else None,
-            "require_2fa": config.require_2fa if config else False,
-        } if config else None,
+            "require_2fa": biz.require_2fa,
+        },
     }
 
 
@@ -217,19 +217,23 @@ async def update_org_config(
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation config not found")
 
+    biz = await repo.get_by_id(business_id)
+    if biz is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
+
     return {
-        "monthly_txn_volume_range": config.monthly_txn_volume_range,
-        "avg_monthly_payouts_range": config.avg_monthly_payouts_range,
-        "primary_bank": config.primary_bank,
-        "primary_use_cases": config.primary_use_cases,
-        "risk_appetite": config.risk_appetite,
-        "default_risk_tolerance": config.default_risk_tolerance,
-        "default_budget_cap": float(config.default_budget_cap) if config.default_budget_cap else None,
-        "merchant_state": config.merchant_state,
-        "daily_payout_limit": float(config.daily_payout_limit) if config.daily_payout_limit else None,
-        "single_payout_cap": float(config.single_payout_cap) if config.single_payout_cap else None,
-        "risk_alert_threshold": float(config.risk_alert_threshold) if config.risk_alert_threshold else None,
-        "liquidity_alert_buffer": float(config.liquidity_alert_buffer) if config.liquidity_alert_buffer else None,
+        "monthly_txn_volume_range": biz.monthly_txn_volume_range,
+        "avg_monthly_payouts_range": biz.avg_monthly_payouts_range,
+        "primary_bank": biz.primary_bank,
+        "primary_use_cases": biz.primary_use_cases,
+        "risk_appetite": biz.risk_appetite,
+        "default_risk_tolerance": biz.default_risk_tolerance,
+        "default_budget_cap": float(biz.default_budget_cap) if biz.default_budget_cap else None,
+        "merchant_state": biz.merchant_state,
+        "daily_payout_limit": float(biz.daily_payout_limit) if biz.daily_payout_limit else None,
+        "single_payout_cap": float(biz.single_payout_cap) if biz.single_payout_cap else None,
+        "risk_alert_threshold": float(biz.risk_alert_threshold) if biz.risk_alert_threshold else None,
+        "liquidity_alert_buffer": float(biz.liquidity_alert_buffer) if biz.liquidity_alert_buffer else None,
     }
 
 

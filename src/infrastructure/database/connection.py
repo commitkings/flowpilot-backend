@@ -24,7 +24,6 @@ def get_engine():
             max_overflow=Settings.DATABASE_MAX_OVERFLOW,
             pool_timeout=Settings.DATABASE_POOL_TIMEOUT,
             echo=Settings.DATABASE_ECHO,
-            pool_pre_ping=True,
         )
     return _engine
 

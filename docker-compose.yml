@@ -1,6 +1,23 @@
-version: "3.8"
-
 services:
+  # ── Migrator ───────────────────────────────────────────────────────────────
+  # One-shot service: runs Alembic migrations then exits.
+  # All services that use the DB depend on this completing successfully.
+  migrator:
+    build: .
+    env_file: .env
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        python scripts/seed_institutions.py &&
+        python scripts/seed_kyc_limits.py
+      "
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
+    restart: "no"
+
   # ── API Service ────────────────────────────────────────────────────────────
   # Handles all HTTP requests. Lightweight — no background loops or agent work.
   gateway:
@@ -14,16 +31,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
       core-api:
-        condition: service_started
+        condition: service_healthy
       payment-service:
-        condition: service_started
+        condition: service_healthy
       wallet-service:
-        condition: service_started
+        condition: service_healthy
       kyc-service:
-        condition: service_started
+        condition: service_healthy
       orchestration-service:
-        condition: service_started
+        condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
@@ -44,10 +63,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
       - SERVICE_ROLE=core_api
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8500/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   # ── Worker Service ─────────────────────────────────────────────────────────
@@ -63,6 +92,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
@@ -82,6 +113,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
@@ -100,6 +133,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
@@ -108,6 +143,12 @@ services:
       - MONNIFY_SECRET_KEY=${MONNIFY_SECRET_KEY}
       - MONNIFY_CONTRACT_CODE=${MONNIFY_CONTRACT_CODE}
       - MONNIFY_BASE_URL=${MONNIFY_BASE_URL:-https://api.monnify.com}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8100/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   wallet-service:
@@ -119,10 +160,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
       - SERVICE_ROLE=wallet_service
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8200/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   kyc-service:
@@ -134,10 +183,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
       - SERVICE_ROLE=kyc_service
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8300/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   orchestration-service:
@@ -149,10 +208,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql://postgres:oracle@db:5432/flowpilot
       - REDIS_URL=redis://redis:6379/0
       - SERVICE_ROLE=orchestration_service
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8400/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
   
   # ── Database ───────────────────────────────────────────────────────────────
@@ -189,3 +256,10 @@ services:
 volumes:
   db_data:
   redis_data:
+  uploads_data:
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "1450"

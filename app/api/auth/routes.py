@@ -173,9 +173,18 @@ async def register_with_password(
         BusinessMemberModel,
         UserModel,
     )
+    from src.infrastructure.database.flowpilot_models import UserProfileModel
+
+    from src.config.blocked_email_domains import is_blocked_domain
 
     repo = UserRepository(session)
     normalized = normalize_email(body.email)
+
+    if is_blocked_domain(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Temporary email addresses are not allowed.",
+        )
 
     existing = await repo.get_by_email(normalized)
     if existing is not None:
@@ -187,13 +196,19 @@ async def register_with_password(
     parts = body.name.strip().split(None, 1)
     new_user = UserModel(
         email=normalized,
-        display_name=body.name.strip(),
-        first_name=parts[0] if parts else None,
-        last_name=parts[1] if len(parts) > 1 else None,
         password_hash=hash_password(body.password),
         is_active=True,
     )
     session.add(new_user)
+    await session.flush()
+    session.add(
+        UserProfileModel(
+            user_id=new_user.id,
+            display_name=body.name.strip(),
+            first_name=parts[0] if parts else None,
+            last_name=parts[1] if len(parts) > 1 else None,
+        )
+    )
     await session.flush()
     await session.refresh(new_user)
 
@@ -209,7 +224,7 @@ async def register_with_password(
         ))
         await invite_repo.mark_accepted(invite)
 
-    token = create_access_token(new_user.id, new_user.email)
+    token = create_access_token(new_user.id, new_user.email, security_version=0)
     await session.commit()
 
     # Generate OTP → Redis (best-effort; code still generated even if Redis is down)
@@ -228,7 +243,7 @@ async def register_with_password(
         "user": {
             "id": str(new_user.id),
             "email": new_user.email,
-            "display_name": new_user.display_name,
+            "display_name": body.name.strip(),
         },
     }
 
@@ -311,6 +326,7 @@ async def register_via_invite(
         BusinessMemberModel,
         UserModel,
     )
+    from src.infrastructure.database.flowpilot_models import UserProfileModel
 
     invite_repo = InvitationRepository(session)
     invite = await invite_repo.get_by_token(body.token)
@@ -361,16 +377,22 @@ async def register_via_invite(
 
     new_user = UserModel(
         email=invite.invited_email,
-        display_name=display_name,
-        first_name=body.first_name.strip(),
-        last_name=body.last_name.strip(),
         password_hash=password_hashed,
         is_active=True,
-        date_of_birth=parsed_dob,
         # Invitation proves email ownership — mark as verified immediately
         email_verified_at=datetime.now(tz.utc),
     )
     session.add(new_user)
+    await session.flush()
+    session.add(
+        UserProfileModel(
+            user_id=new_user.id,
+            display_name=display_name,
+            first_name=body.first_name.strip(),
+            last_name=body.last_name.strip(),
+            date_of_birth=parsed_dob,
+        )
+    )
     await session.flush()
     await session.refresh(new_user)
 
@@ -429,16 +451,19 @@ async def register_via_invite(
     # Check if org requires 2FA for all members.
     # New members joining after enforcement must set up 2FA immediately — no grace period.
     # (Grace periods are only for existing members who were already in the org when enforcement was toggled on.)
-    from src.infrastructure.database.flowpilot_models import BusinessConfigModel
-    config_result = await session.execute(
-        _select(BusinessConfigModel).where(
-            BusinessConfigModel.business_id == invite.business_id
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessSecurityPolicyModel,
+    )
+
+    sec_result = await session.execute(
+        _select(BusinessSecurityPolicyModel).where(
+            BusinessSecurityPolicyModel.business_id == invite.business_id
         )
     )
-    biz_config = config_result.scalars().first()
-    requires_2fa_setup = bool(biz_config and biz_config.require_2fa)
+    sec_pol = sec_result.scalars().first()
+    requires_2fa_setup = bool(sec_pol and sec_pol.require_2fa)
 
-    token = create_access_token(new_user.id, new_user.email)
+    token = create_access_token(new_user.id, new_user.email, security_version=0)
     await session.commit()
 
     return {
@@ -446,7 +471,7 @@ async def register_via_invite(
         "user": {
             "id": str(new_user.id),
             "email": new_user.email,
-            "display_name": new_user.display_name,
+            "display_name": display_name,
         },
         "requires_2fa_setup": requires_2fa_setup,
     }
@@ -513,6 +538,19 @@ async def login_with_password(
     user.last_login_at = datetime.now(tz.utc)
     await session.flush()
 
+    try:
+        from src.services.user_audit_service import log_user_audit_event
+
+        await log_user_audit_event(
+            session,
+            event_type="login",
+            user_id=user.id,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except Exception:
+        logger.debug("user_audit_event insert skipped", exc_info=True)
+
     # If the user hasn't verified their email yet, issue a fresh OTP and
     # resend the verification email so they don't have to wait out the
     # resend cooldown on the frontend.
@@ -543,20 +581,27 @@ async def login_with_password(
     # Check if any org this user belongs to requires 2FA but the user hasn't set it up.
     requires_2fa_setup = False
     from sqlalchemy import select as _select
-    from src.infrastructure.database.flowpilot_models import BusinessMemberModel, BusinessConfigModel
+    from src.infrastructure.database.flowpilot_models import BusinessMemberModel
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessSecurityPolicyModel,
+    )
+
     config_q = await session.execute(
-        _select(BusinessConfigModel)
-        .join(BusinessMemberModel, BusinessMemberModel.business_id == BusinessConfigModel.business_id)
+        _select(BusinessSecurityPolicyModel)
+        .join(
+            BusinessMemberModel,
+            BusinessMemberModel.business_id == BusinessSecurityPolicyModel.business_id,
+        )
         .where(
             BusinessMemberModel.user_id == user.id,
             BusinessMemberModel.is_active == True,  # noqa: E712
-            BusinessConfigModel.require_2fa == True,  # noqa: E712
+            BusinessSecurityPolicyModel.require_2fa == True,  # noqa: E712
         )
         .limit(1)
     )
     requires_2fa_setup = config_q.scalars().first() is not None
 
-    token = create_access_token(user.id, user.email)
+    token = create_access_token(user.id, user.email, security_version=user.mfa.security_version if user.mfa else 0)
 
     if check_notification_pref(user, "login_alerts"):
         import asyncio as _aio
@@ -708,21 +753,25 @@ async def google_callback(
 
     # Check if any org requires 2FA and user hasn't set it up
     from sqlalchemy import select as _select_g
-    from src.infrastructure.database.flowpilot_models import BusinessMemberModel as _BMM, BusinessConfigModel as _BCM
+    from src.infrastructure.database.flowpilot_models import BusinessMemberModel as _BMM
+    from src.infrastructure.database.flowpilot_models import (
+        BusinessSecurityPolicyModel as _BSP,
+    )
+
     _cfg_q = await session.execute(
-        _select_g(_BCM)
-        .join(_BMM, _BMM.business_id == _BCM.business_id)
+        _select_g(_BSP)
+        .join(_BMM, _BMM.business_id == _BSP.business_id)
         .where(
             _BMM.user_id == user.id,
             _BMM.is_active == True,  # noqa: E712
-            _BCM.require_2fa == True,  # noqa: E712
+            _BSP.require_2fa == True,  # noqa: E712
         )
         .limit(1)
     )
     requires_2fa_setup = _cfg_q.scalars().first() is not None
 
     # Issue JWT and redirect to frontend
-    jwt_token = create_access_token(user.id, user.email)
+    jwt_token = create_access_token(user.id, user.email, security_version=user.mfa.security_version if user.mfa else 0)
 
     if check_notification_pref(user, "login_alerts"):
         from datetime import datetime as _dt, timezone as _tz2
@@ -823,10 +872,20 @@ async def change_password(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid two-factor authentication code",
             )
+        from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+        if not await _totp_mark(str(current_user.id), body.totp_code):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Authenticator code has already been used. Wait for the next code.",
+            )
 
     repo = UserRepository(session)
     pw_hash = hash_password(body.new_password)
     await repo.set_password(current_user.id, pw_hash)
+    # Increment security_version so all existing tokens are invalidated
+    from app.api.auth.two_factor import _ensure_user_mfa as _emfa
+    _sv_mfa = await _emfa(session, current_user)
+    _sv_mfa.security_version = (_sv_mfa.security_version or 0) + 1
     await session.commit()
     return {"message": "Password updated successfully"}
 

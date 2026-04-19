@@ -629,6 +629,8 @@ async def send_kyc_verified_email(
     single_limit: str = "₦300,000",
     wallet_limit: str = "₦3,000,000",
     max_monthly_limit: str = "₦50,000,000",
+    account_number: Optional[str] = None,
+    bank_name: Optional[str] = None,
     frontend_url: Optional[str] = None,
 ) -> bool:
     """Notify the business owner that their KYC has been approved, with Level 1 limits.
@@ -647,7 +649,10 @@ async def send_kyc_verified_email(
         single_limit=single_limit,
         wallet_limit=wallet_limit,
         max_monthly_limit=max_monthly_limit,
+        account_number=account_number,
+        bank_name=bank_name or "your assigned bank",
         dashboard_url=f"{base}/dashboard",
+        wallet_url=f"{base}/dashboard/wallet",
         notifications_url=f"{base}/dashboard/settings?tab=notifications",
     )
     return await _send(
@@ -798,6 +803,48 @@ async def send_scheduled_run_reminder_email(
     )
 
 
+async def send_scheduled_run_approval_request_email(
+    to: str,
+    display_name: str,
+    schedule_name: str,
+    objective: str,
+    fires_at: str,
+    frequency_label: str,
+    scheduled_run_id: str,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Send a day-before approval request for a scheduled run.
+
+    Links go to the frontend dashboard — user must log in and enter their approval PIN.
+    Template: src/templates/emails/scheduled_run_reminder.html (reused with approval context)
+    """
+    from src.config.settings import Settings as _Settings
+    base = frontend_url or _Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    approve_url = f"{base}/dashboard/runs/scheduled/{scheduled_run_id}"
+    skip_url = f"{base}/dashboard/runs/scheduled/{scheduled_run_id}"
+    html = _render(
+        "scheduled_run_reminder.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        schedule_name=schedule_name,
+        objective=objective,
+        fires_at=fires_at,
+        frequency_label=frequency_label,
+        schedules_url=f"{base}/dashboard/runs?tab=scheduled",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
+        approve_url=approve_url,
+        skip_url=skip_url,
+        is_approval_request=True,
+    )
+    return await _send(
+        to=to,
+        subject=f"Action required: approve \"{schedule_name}\" before it runs",
+        html=html,
+    )
+
+
 async def send_wallet_topup_email(
     to: str,
     display_name: str,
@@ -826,6 +873,36 @@ async def send_wallet_topup_email(
     return await _send(
         to=to,
         subject=f"₦{amount:,.2f} added to your FlowPilot wallet",
+        html=html,
+    )
+
+
+async def send_wallet_overlimit_email(
+    to: str,
+    display_name: str,
+    new_balance: float,
+    wallet_cap: float,
+    frontend_url: Optional[str] = None,
+) -> bool:
+    """Alert the business owner that a deposit has pushed their balance above their KYC wallet cap."""
+    base = frontend_url or Settings.FRONTEND_URL
+    first_name = display_name.split()[0] if display_name else "there"
+    over_by = max(0.0, new_balance - wallet_cap)
+    html = _render(
+        "wallet_overlimit.html",
+        logo_url=f"{base}/brand/flowpilot_logo_darkblue.png",
+        logo_dark_url=f"{base}/brand/flowpilot_logo.png",
+        first_name=first_name,
+        new_balance=f"{new_balance:,.2f}",
+        wallet_cap=f"{wallet_cap:,.2f}",
+        over_by=f"{over_by:,.2f}",
+        kyc_url=f"{base}/dashboard/settings?tab=kyc",
+        wallet_url=f"{base}/dashboard/wallet",
+        notifications_url=f"{base}/dashboard/settings?tab=notifications",
+    )
+    return await _send(
+        to=to,
+        subject="Action needed: your wallet balance exceeds your KYC limit",
         html=html,
     )
 
@@ -905,6 +982,7 @@ async def send_beneficiary_payment_email(
     reference: Optional[str] = None,
     purpose: Optional[str] = None,
     reason: Optional[str] = None,
+    business_logo_url: Optional[str] = None,
 ) -> bool:
     """Notify a beneficiary that a payment was sent (or failed) to their account.
 
@@ -923,6 +1001,7 @@ async def send_beneficiary_payment_email(
         reference=reference,
         purpose=purpose,
         reason=reason,
+        business_logo_url=business_logo_url,
     )
     if status == "success":
         subject = f"You've received ₦{amount:,.2f} from {org_name}"

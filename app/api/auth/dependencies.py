@@ -59,6 +59,15 @@ async def get_current_user(
             detail="User not found",
         )
 
+    # Session invalidation: token sv must match DB security_version
+    token_sv = payload.get("sv", 0)
+    db_sv = user.mfa.security_version if user.mfa else 0
+    if token_sv != db_sv:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session invalidated due to a security change. Please log in again.",
+        )
+
     # Fire-and-forget session heartbeat (never fails the request)
     try:
         from src.infrastructure.cache.session_store import touch

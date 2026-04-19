@@ -20,6 +20,7 @@ async def _run() -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(_run())
 
 

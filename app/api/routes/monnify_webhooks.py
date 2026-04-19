@@ -10,9 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import BusinessModel
+from src.infrastructure.database.flowpilot_models import (
+    BusinessModel,
+    BusinessVirtualAccountModel,
+)
 from src.infrastructure.database.repositories.wallet_repository import WalletRepository
 from src.infrastructure.external_services.monnify.client import MonnifyClient
+from src.services.ledger_writer import insert_ledger_entry
+from src.services.wallet_limit_service import check_and_flag_overlimit
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks/monnify", tags=["monnify-webhooks"])
@@ -54,9 +59,12 @@ async def monnify_webhook(
 
     business = (
         await session.execute(
-            select(BusinessModel).where(
-                BusinessModel.virtual_account_reference == account_reference
+            select(BusinessModel)
+            .join(
+                BusinessVirtualAccountModel,
+                BusinessVirtualAccountModel.business_id == BusinessModel.id,
             )
+            .where(BusinessVirtualAccountModel.account_reference == account_reference)
         )
     ).scalar_one_or_none()
     if business is None:
@@ -66,16 +74,61 @@ async def monnify_webhook(
     if event_type == "SUCCESSFUL_TRANSACTION":
         amount = Decimal(str(event_data.get("amountPaid", 0)))
         payment_reference = event_data.get("paymentReference") or f"monnify:{account_reference}:{amount}"
+
+        # Redis guard: prevents duplicate concurrent deliveries hitting the DB
+        # simultaneously. If the guard fires but DB commit later fails, we clear
+        # the key so Monnify's retry can proceed (see except block below).
+        redis_key: str | None = None
         is_fresh = await _replay_guard(raw_body, payment_reference)
         if not is_fresh:
+            # Already processed — idempotent ACK
             return {"ok": True}
+
+        redis_url = Settings.REDIS_URL
+        digest = sha256(raw_body).hexdigest()
+        redis_key = f"monnify:webhook:seen:{payment_reference}:{digest}"
+
         repo = WalletRepository(session)
-        _, created = await repo.credit(
-            business_id=business.id,
-            amount=amount,
-            reference=f"monnify_topup_{payment_reference}",
-            description="Monnify reserved account top-up",
-        )
-        if created:
-            await session.commit()
+        try:
+            tx, created = await repo.credit(
+                business_id=business.id,
+                amount=amount,
+                reference=f"monnify_topup_{payment_reference}",
+                description="Monnify reserved account top-up",
+            )
+            if created:
+                await insert_ledger_entry(
+                    session,
+                    entry_type="wallet_topup",
+                    gross_amount=amount,
+                    net_amount=amount,
+                    direction="credit",
+                    status="completed",
+                    originator_type="monnify",
+                    beneficiary_type="business_wallet",
+                    business_id=business.id,
+                    narration="Monnify reserved account top-up",
+                    provider_reference=payment_reference,
+                    prefix="TOP",
+                )
+                await check_and_flag_overlimit(session, business, tx.balance_after)
+                await session.commit()
+        except Exception as exc:
+            logger.error(
+                "Monnify webhook DB commit failed for %s — clearing Redis guard so Monnify can retry. Error: %s",
+                payment_reference,
+                exc,
+            )
+            # Clear the Redis guard so Monnify's next delivery attempt is not
+            # blocked. Without this, the guard would suppress the retry and the
+            # payment would be silently lost.
+            if redis_key and redis_url:
+                try:
+                    _r = Redis.from_url(redis_url, decode_responses=True)
+                    await _r.delete(redis_key)
+                    await _r.aclose()
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail="Internal error processing payment — please retry")
+
     return {"ok": True}

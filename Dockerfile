@@ -1,5 +1,5 @@
 # Stage 1: Builder
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -18,9 +18,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (e.g., poppler-utils for pdf2image)
+# Install runtime dependencies (e.g., poppler-utils for pdf2image, curl for healthchecks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed python packages from builder

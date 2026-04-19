@@ -1,5 +1,7 @@
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.config.settings import Settings
 from src.services.contracts import TransferRequest
@@ -22,7 +24,7 @@ class ValidateAccountRequest(BaseModel):
 
 
 class SingleTransferRequest(BaseModel):
-    amount: float
+    amount: Decimal = Field(..., gt=0)
     reference: str
     narration: str
     destination_bank_code: str
@@ -50,5 +52,15 @@ async def transfer_single(
     _=Depends(_require_internal_token),
 ):
     service = PaymentService()
-    result = await service.single_transfer(TransferRequest(**body.model_dump()))
+    result = await service.single_transfer(
+        TransferRequest(
+            amount=body.amount,
+            reference=body.reference,
+            narration=body.narration,
+            destination_bank_code=body.destination_bank_code,
+            destination_account_number=body.destination_account_number,
+            source_account_number=body.source_account_number,
+            currency=body.currency,
+        )
+    )
     return result.__dict__

@@ -36,9 +36,12 @@ from src.config.settings import Settings
 from src.infrastructure.cache import totp_challenge_store
 from src.infrastructure.database.connection import get_db_session
 from src.infrastructure.database.flowpilot_models import (
-    BusinessConfigModel,
     BusinessMemberModel,
     UserModel,
+)
+from src.infrastructure.database.flowpilot_models import (
+    BusinessSecurityPolicyModel,
+    UserMfaModel,
 )
 from src.infrastructure.database.repositories.notification_repository import (
     NotificationRepository,
@@ -51,9 +54,18 @@ from src.services.email_service import (
     send_login_notification_email,
     check_notification_pref,
 )
+from src.services.user_audit_service import log_user_audit_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/2fa", tags=["2fa"])
+
+
+async def _ensure_user_mfa(session: AsyncSession, user: UserModel) -> UserMfaModel:
+    if user.mfa is None:
+        user.mfa = UserMfaModel(user_id=user.id)
+        session.add(user.mfa)
+        await session.flush()
+    return user.mfa
 
 _BACKUP_CODE_COUNT = 8
 _GRACE_HOURS = 24
@@ -156,7 +168,8 @@ async def setup_2fa(
     secret = pyotp.random_base32()
 
     # Persist the (not-yet-active) secret so /enable can verify it
-    current_user.totp_secret = secret
+    mfa = await _ensure_user_mfa(session, current_user)
+    mfa.totp_secret = secret
     await session.commit()
 
     uri = _totp_uri(secret, current_user.email)
@@ -194,13 +207,19 @@ async def enable_2fa(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid authenticator code.",
         )
+    from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+    if not await _totp_mark(str(current_user.id), body.code):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authenticator code has already been used. Wait for the next code.",
+        )
 
     plain_codes, hashed_codes = _generate_backup_codes()
-    current_user.totp_enabled_at = datetime.now(_tz.utc)
-    current_user.backup_codes_hash = json.dumps(hashed_codes)
-
-    # Clear the grace period if org enforcement was pending for this user
-    current_user.totp_grace_until = None
+    mfa = await _ensure_user_mfa(session, current_user)
+    mfa.totp_enabled_at = datetime.now(_tz.utc)
+    mfa.backup_codes_hash = json.dumps(hashed_codes)
+    mfa.totp_grace_until = None
+    mfa.security_version = (mfa.security_version or 0) + 1
 
     await session.commit()
 
@@ -212,6 +231,14 @@ async def enable_2fa(
         message="Your account is now protected with 2FA. Keep your backup codes somewhere safe.",
         type="success",
         resource_type="security",
+    )
+    await session.commit()
+
+    await log_user_audit_event(
+        session,
+        event_type="auth.2fa_enabled",
+        user_id=current_user.id,
+        metadata={"method": "totp"},
     )
     await session.commit()
 
@@ -247,9 +274,11 @@ async def disable_2fa(
             detail="Incorrect password.",
         )
 
-    current_user.totp_secret = None
-    current_user.totp_enabled_at = None
-    current_user.backup_codes_hash = None
+    mfa = await _ensure_user_mfa(session, current_user)
+    mfa.totp_secret = None
+    mfa.totp_enabled_at = None
+    mfa.backup_codes_hash = None
+    mfa.security_version = (mfa.security_version or 0) + 1
     await session.commit()
 
     # In-app notification
@@ -260,6 +289,13 @@ async def disable_2fa(
         message="2FA has been turned off. Re-enable it in Settings → Security to keep your account protected.",
         type="warning",
         resource_type="security",
+    )
+    await session.commit()
+
+    await log_user_audit_event(
+        session,
+        event_type="auth.2fa_disabled",
+        user_id=current_user.id,
     )
     await session.commit()
 
@@ -311,8 +347,14 @@ async def verify_mfa(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid authenticator code.",
         )
+    from src.infrastructure.cache.totp_replay_store import mark_used as _totp_mark
+    if not await _totp_mark(str(user.id), body.code):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authenticator code has already been used. Wait for the next code.",
+        )
 
-    token = create_access_token(user.id, user.email)
+    token = create_access_token(user.id, user.email, security_version=user.mfa.security_version if user.mfa else 0)
     memberships = await repo.get_memberships(user.id)
 
     if check_notification_pref(user, "login_alerts"):
@@ -368,13 +410,19 @@ async def backup_code_login(
 
     repo = UserRepository(session)
     user = await repo.get_by_id(user_id)
-    if not user or not user.is_active or not user.backup_codes_hash:
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid MFA session.",
+        )
+    mfa = await _ensure_user_mfa(session, user)
+    if not mfa.backup_codes_hash:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid MFA session.",
         )
 
-    hashed_list: list[str] = json.loads(user.backup_codes_hash)
+    hashed_list: list[str] = json.loads(mfa.backup_codes_hash)
     match_index = _verify_backup_code(body.backup_code, hashed_list)
     if match_index is None:
         raise HTTPException(
@@ -384,10 +432,10 @@ async def backup_code_login(
 
     # Remove the consumed code
     hashed_list.pop(match_index)
-    user.backup_codes_hash = json.dumps(hashed_list)
+    mfa.backup_codes_hash = json.dumps(hashed_list)
     await session.commit()
 
-    token = create_access_token(user.id, user.email)
+    token = create_access_token(user.id, user.email, security_version=user.mfa.security_version if user.mfa else 0)
     memberships = await repo.get_memberships(user.id)
 
     if check_notification_pref(user, "login_alerts"):
@@ -425,7 +473,8 @@ async def regenerate_backup_codes(
         )
 
     plain_codes, hashed_codes = _generate_backup_codes()
-    current_user.backup_codes_hash = json.dumps(hashed_codes)
+    mfa = await _ensure_user_mfa(session, current_user)
+    mfa.backup_codes_hash = json.dumps(hashed_codes)
     await session.commit()
 
     return {"backup_codes": plain_codes}
@@ -460,20 +509,21 @@ async def set_org_require_2fa(
 
     business_id = membership.business_id
 
-    # Load or create business_config
-    config_result = await session.execute(
-        select(BusinessConfigModel).where(
-            BusinessConfigModel.business_id == business_id
+    sec_result = await session.execute(
+        select(BusinessSecurityPolicyModel).where(
+            BusinessSecurityPolicyModel.business_id == business_id
         )
     )
-    config = config_result.scalars().first()
-    if not config:
-        raise HTTPException(status_code=404, detail="Business config not found.")
+    sec = sec_result.scalars().first()
+    if not sec:
+        sec = BusinessSecurityPolicyModel(business_id=business_id)
+        session.add(sec)
+        await session.flush()
 
-    config.require_2fa = body.require
+    sec.require_2fa = body.require
 
     if body.require:
-        config.require_2fa_enforced_at = datetime.now(_tz.utc)
+        sec.require_2fa_enforced_at = datetime.now(_tz.utc)
         grace_deadline = datetime.now(_tz.utc) + timedelta(hours=_GRACE_HOURS)
 
         # Load all active members
@@ -493,7 +543,8 @@ async def set_org_require_2fa(
         for m in members:
             u = m.user
             if u and u.id != current_user.id and not u.totp_enabled_at:
-                u.totp_grace_until = grace_deadline
+                umfa = await _ensure_user_mfa(session, u)
+                umfa.totp_grace_until = grace_deadline
                 affected.append(u)
                 await notif_repo.create(
                     user_id=u.id,
@@ -529,8 +580,17 @@ async def set_org_require_2fa(
             )
         )
         for m in members_result.scalars().all():
-            if m.user and m.user.totp_grace_until and not m.user.totp_enabled_at:
-                m.user.totp_grace_until = None
+            u = m.user
+            if u and u.totp_grace_until and not u.totp_enabled_at:
+                umfa = await _ensure_user_mfa(session, u)
+                umfa.totp_grace_until = None
 
+    await log_user_audit_event(
+        session,
+        event_type="org.2fa_enforcement_changed",
+        user_id=current_user.id,
+        business_id=business_id,
+        metadata={"require_2fa": body.require},
+    )
     await session.commit()
-    return {"require_2fa": config.require_2fa}
+    return {"require_2fa": sec.require_2fa}

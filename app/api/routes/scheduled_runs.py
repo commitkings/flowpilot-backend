@@ -129,6 +129,8 @@ def _serialize(r: ScheduledRunModel) -> dict:
         "next_run_at": r.next_run_at.isoformat() if r.next_run_at else None,
         "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
         "last_reminded_at": r.last_reminded_at.isoformat() if r.last_reminded_at else None,
+        "pre_approval_status": getattr(r, "pre_approval_status", None),
+        "pre_approval_sent_at": r.pre_approval_sent_at.isoformat() if getattr(r, "pre_approval_sent_at", None) else None,
         "is_active": r.is_active,
         "run_config": r.run_config,
         "created_at": r.created_at.isoformat(),
@@ -374,3 +376,103 @@ async def delete_scheduled_run(
     )
     await session.commit()
     return {"status": "deleted"}
+
+
+# ── Pre-approval endpoints (authenticated — require login + approval PIN) ──────
+
+class PreApproveRequest(BaseModel):
+    pin: str = Field(..., min_length=4, max_length=6, pattern=r"^\d{4,6}$")
+
+
+@router.post("/runs/scheduled/{run_id}/pre-approve", status_code=status.HTTP_200_OK)
+async def pre_approve_scheduled_run(
+    run_id: uuid.UUID,
+    body: PreApproveRequest,
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Approve the next execution of a scheduled run.
+
+    Requires a valid JWT (login) and the caller's approval PIN.
+    """
+    from app.api.auth.passwords import verify_password
+
+    if not current_user.approval_pin_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No approval PIN configured. Set one up in Settings → Security.",
+        )
+    if not verify_password(body.pin, current_user.approval_pin_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect approval PIN.",
+        )
+
+    business_id = await _get_business_id(current_user, session)
+    result = await session.execute(
+        select(ScheduledRunModel).where(
+            ScheduledRunModel.id == run_id,
+            ScheduledRunModel.business_id == business_id,
+        )
+    )
+    run = result.scalars().first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Scheduled run not found")
+
+    if getattr(run, "pre_approval_status", None) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No approval is pending for this scheduled run.",
+        )
+
+    await session.execute(
+        update(ScheduledRunModel)
+        .where(ScheduledRunModel.id == run_id)
+        .values(pre_approval_status="approved")
+    )
+    await session.commit()
+    return {"status": "approved", "run_id": str(run_id), "name": run.name}
+
+
+@router.post("/runs/scheduled/{run_id}/skip-next", status_code=status.HTTP_200_OK)
+async def skip_next_scheduled_run(
+    run_id: uuid.UUID,
+    body: PreApproveRequest,
+    current_user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Skip the next execution of a scheduled run.
+
+    Requires a valid JWT (login) and the caller's approval PIN.
+    """
+    from app.api.auth.passwords import verify_password
+
+    if not current_user.approval_pin_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No approval PIN configured. Set one up in Settings → Security.",
+        )
+    if not verify_password(body.pin, current_user.approval_pin_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect approval PIN.",
+        )
+
+    business_id = await _get_business_id(current_user, session)
+    result = await session.execute(
+        select(ScheduledRunModel).where(
+            ScheduledRunModel.id == run_id,
+            ScheduledRunModel.business_id == business_id,
+        )
+    )
+    run = result.scalars().first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Scheduled run not found")
+
+    await session.execute(
+        update(ScheduledRunModel)
+        .where(ScheduledRunModel.id == run_id)
+        .values(pre_approval_status="skipped")
+    )
+    await session.commit()
+    return {"status": "skipped", "run_id": str(run_id), "name": run.name}

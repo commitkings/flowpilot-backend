@@ -445,28 +445,18 @@ def _build_intent_tools(
             if not biz:
                 return {"error": "Business not found"}
 
-            from sqlalchemy import select
-            from src.infrastructure.database.flowpilot_models import BusinessConfigModel
-
-            result = await db_session.execute(
-                select(BusinessConfigModel).where(
-                    BusinessConfigModel.business_id == uuid.UUID(business_id)
-                )
-            )
-            config = result.scalar_one_or_none()
-
             return {
                 "business_name": biz.business_name,
                 "business_type": biz.business_type,
-                "risk_appetite": config.risk_appetite if config else None,
-                "default_risk_tolerance": float(config.default_risk_tolerance)
-                if config and config.default_risk_tolerance
+                "risk_appetite": biz.risk_appetite,
+                "default_risk_tolerance": float(biz.default_risk_tolerance)
+                if biz.default_risk_tolerance is not None
                 else 0.35,
-                "default_budget_cap": float(config.default_budget_cap)
-                if config and config.default_budget_cap
+                "default_budget_cap": float(biz.default_budget_cap)
+                if biz.default_budget_cap
                 else None,
-                "primary_use_cases": config.primary_use_cases if config else None,
-                "primary_bank": config.primary_bank if config else None,
+                "primary_use_cases": biz.primary_use_cases,
+                "primary_bank": biz.primary_bank,
             }
         except Exception as e:
             logger.error(f"get_business_info failed: {e}")

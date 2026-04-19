@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 
@@ -13,7 +14,7 @@ class AccountValidationResult:
 
 @dataclass
 class TransferRequest:
-    amount: float
+    amount: Decimal
     reference: str
     narration: str
     destination_bank_code: str

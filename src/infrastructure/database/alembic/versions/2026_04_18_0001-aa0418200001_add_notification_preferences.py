@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
 revision = "aa0418200001"
-down_revision = "aa0417200003"
+down_revision = "aa0417200004"
 branch_labels = None
 depends_on = None
 

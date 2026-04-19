@@ -86,6 +86,44 @@ async def _fire_run(scheduled_id: uuid.UUID, business_id: uuid.UUID, objective: 
                 or ""
             )
 
+            # KYC status gate — skip silently if business is not yet verified
+            if getattr(business, "kyc_status", None) != "verified":
+                logger.warning(
+                    "[Scheduler] Skipping scheduled run %s: business %s KYC not verified",
+                    scheduled_id, business_id,
+                )
+                return
+
+            # Wallet balance gate — skip if wallet is empty (no point burning a credit)
+            from src.infrastructure.database.repositories.wallet_repository import WalletRepository
+            _wallet_repo = WalletRepository(session)
+            _wallet = await _wallet_repo.get(business_id)
+            if _wallet is None or _wallet.balance <= 0:
+                logger.warning(
+                    "[Scheduler] Skipping scheduled run %s: business %s wallet is empty",
+                    scheduled_id, business_id,
+                )
+                return
+
+            # AI credit gate — deduct atomically; skip if no credits remain
+            from sqlalchemy import update as _sa_update
+            _credit_result = await session.execute(
+                _sa_update(BusinessModel)
+                .where(
+                    BusinessModel.id == business_id,
+                    BusinessModel.ai_credit_balance > 0,
+                )
+                .values(ai_credit_balance=BusinessModel.ai_credit_balance - 1)
+                .returning(BusinessModel.id)
+                .execution_options(synchronize_session=False)
+            )
+            if _credit_result.fetchone() is None:
+                logger.warning(
+                    "[Scheduler] Skipping scheduled run %s: business %s has no AI credits",
+                    scheduled_id, business_id,
+                )
+                return
+
             run = AgentRunModel(
                 business_id=business_id,
                 created_by=owner_membership.user_id,
@@ -95,6 +133,17 @@ async def _fire_run(scheduled_id: uuid.UUID, business_id: uuid.UUID, objective: 
                 risk_tolerance=0.35,
             )
             session.add(run)
+
+            # AI credit audit log
+            from src.infrastructure.database.flowpilot_models import AiCreditTransactionModel
+            session.add(AiCreditTransactionModel(
+                business_id=business_id,
+                run_id=None,
+                type="debit",
+                credits=1,
+                description=f"Scheduled run: {objective[:80]} (schedule {scheduled_id})",
+            ))
+
             await session.commit()
             await session.refresh(run)
 
@@ -176,16 +225,36 @@ async def _dispatch_loop() -> None:
 
                     run_type = getattr(scheduled, "run_type", "recurring")
 
+                    # ── Pre-approval gate ─────────────────────────────────────
+                    # If an approval request was sent 24 h before, require it to be
+                    # acknowledged before firing.  Silence (pending) = skip.
+                    pre_sent = getattr(scheduled, "pre_approval_sent_at", None)
+                    pre_status = getattr(scheduled, "pre_approval_status", None)
+                    should_fire = True
+                    if pre_sent is not None and pre_status != "approved":
+                        should_fire = False
+                        logger.info(
+                            "[Scheduler] Skipping scheduled run %s ('%s'): pre-approval was "
+                            "requested but status is '%s' (not approved).",
+                            scheduled.id, scheduled.name, pre_status,
+                        )
+
+                    # ── Reset pre-approval fields for next occurrence ──────────
+                    _approval_reset = {
+                        "pre_approval_status": None,
+                        "pre_approval_token": None,
+                        "pre_approval_sent_at": None,
+                    }
+
                     if run_type == "one_time":
-                        # One-time: mark as fired and deactivate — never reschedule
                         await session.execute(
                             update(ScheduledRunModel)
                             .where(ScheduledRunModel.id == scheduled.id)
-                            .values(last_run_at=now, next_run_at=None, is_active=False)
+                            .values(last_run_at=now, next_run_at=None, is_active=False,
+                                    **_approval_reset)
                         )
                         await session.commit()
                     else:
-                        # Recurring: compute next fire time anchored to `now` so there's no drift
                         next_run = _compute_next(scheduled.cron_expression, after=now)
                         if next_run is None:
                             logger.warning(
@@ -196,23 +265,22 @@ async def _dispatch_loop() -> None:
                             await session.execute(
                                 update(ScheduledRunModel)
                                 .where(ScheduledRunModel.id == scheduled.id)
-                                .values(last_run_at=now, is_active=False)
+                                .values(last_run_at=now, is_active=False, **_approval_reset)
                             )
                             await session.commit()
                             continue
 
-                        # Update timestamps first so we don't double-fire
                         await session.execute(
                             update(ScheduledRunModel)
                             .where(ScheduledRunModel.id == scheduled.id)
-                            .values(last_run_at=now, next_run_at=next_run)
+                            .values(last_run_at=now, next_run_at=next_run, **_approval_reset)
                         )
                         await session.commit()
 
-                    # Fire asynchronously regardless of type
-                    asyncio.create_task(
-                        _fire_run(scheduled.id, scheduled.business_id, scheduled.objective)
-                    )
+                    if should_fire:
+                        asyncio.create_task(
+                            _fire_run(scheduled.id, scheduled.business_id, scheduled.objective)
+                        )
 
         except asyncio.CancelledError:
             logger.info("[Scheduler] Dispatch loop cancelled")
@@ -400,21 +468,21 @@ async def _check_scheduled_reminders() -> None:
                         await notif_repo.create(
                             user_id=owner_user.id,
                             business_id=scheduled.business_id,
-                            title="Scheduled run fires tomorrow",
+                            title="Approval required: scheduled run fires tomorrow",
                             message=(
-                                f'"{scheduled.name}" is scheduled to run on {fires_at_str}. '
-                                "Pause it if you need to make changes first."
+                                f'"{scheduled.name}" runs on {fires_at_str}. '
+                                "Log in to the dashboard to approve or skip it."
                             ),
                             type="info",
                             resource_type="scheduled_run",
                             resource_id=str(scheduled.id),
                         )
 
-                        # Email
-                        from src.services.email_service import send_scheduled_run_reminder_email, check_notification_pref as _cnp_sr
+                        # Approval-request email (replaces the plain reminder)
+                        from src.services.email_service import send_scheduled_run_approval_request_email, check_notification_pref as _cnp_sr
                         if _cnp_sr(owner_user, "scheduled_run_reminders"):
                             asyncio.create_task(
-                                send_scheduled_run_reminder_email(
+                                send_scheduled_run_approval_request_email(
                                     to=owner_user.email,
                                     display_name=owner_user.display_name or owner_user.email,
                                     schedule_name=scheduled.name,
@@ -425,22 +493,26 @@ async def _check_scheduled_reminders() -> None:
                                 )
                             )
 
-                        # Mark as reminded for this occurrence
+                        # Mark as reminded and set pre-approval to pending
                         await session.execute(
                             update(ScheduledRunModel)
                             .where(ScheduledRunModel.id == scheduled.id)
-                            .values(last_reminded_at=scheduled.next_run_at)
+                            .values(
+                                last_reminded_at=scheduled.next_run_at,
+                                pre_approval_status="pending",
+                                pre_approval_sent_at=now,
+                            )
                         )
 
                         logger.info(
-                            "[Scheduler] Sent day-before reminder for '%s' (id=%s) firing at %s",
+                            "[Scheduler] Sent day-before approval request for '%s' (id=%s) firing at %s",
                             scheduled.name,
                             scheduled.id,
                             fires_at_str,
                         )
                     except Exception as exc:
                         logger.exception(
-                            "[Scheduler] Error sending reminder for scheduled run %s: %s",
+                            "[Scheduler] Error sending approval request for scheduled run %s: %s",
                             scheduled.id,
                             exc,
                         )
@@ -457,6 +529,89 @@ async def _check_scheduled_reminders() -> None:
 
 _webhook_health_task: Optional[asyncio.Task] = None
 _2fa_reminder_task: Optional[asyncio.Task] = None
+_institution_sync_task: Optional[asyncio.Task] = None
+
+# Sync interval: 30 days. Fire once immediately on startup, then repeat.
+_INSTITUTION_SYNC_INTERVAL = 30 * 86_400
+
+
+async def _sync_institutions_from_monnify() -> None:
+    """Monthly loop: refresh the institution table from the Monnify /banks API.
+
+    Runs once immediately on worker startup so the table is current without
+    waiting a full month, then sleeps 30 days between syncs.
+    """
+    from src.infrastructure.database.connection import get_session_factory
+    from src.infrastructure.external_services.monnify.client import MonnifyClient
+    from sqlalchemy import text
+
+    logger.info("[Scheduler] Institution sync loop started")
+
+    _RETRY_DELAYS = [60, 300, 900]  # 1 min, 5 min, 15 min before giving up for the cycle
+
+    while True:
+        synced = False
+        for attempt, retry_delay in enumerate([0] + _RETRY_DELAYS):
+            if retry_delay:
+                logger.info(
+                    "[Scheduler] Institution sync retry %d/%d in %ds",
+                    attempt, len(_RETRY_DELAYS), retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+            try:
+                client = MonnifyClient()
+                resp = await client.banks()
+                banks = resp.get("responseBody", [])
+
+                if not banks:
+                    logger.warning("[Scheduler] Monnify /banks returned empty list — skipping sync")
+                    synced = True
+                    break
+
+                now = datetime.now(timezone.utc)
+                upserted = 0
+
+                async with get_session_factory()() as session:
+                    for b in banks:
+                        code = str(b.get("code", "")).strip()
+                        name = str(b.get("name", "")).strip()
+                        if not code or not name:
+                            continue
+                        await session.execute(
+                            text("""
+                                INSERT INTO institution
+                                    (institution_code, institution_name, nip_code,
+                                     cbn_code, institution_type, is_active, last_synced_at)
+                                VALUES
+                                    (:code, :name, :code, :code, 'bank', true, :now)
+                                ON CONFLICT (institution_code) DO UPDATE SET
+                                    institution_name = EXCLUDED.institution_name,
+                                    nip_code         = EXCLUDED.nip_code,
+                                    cbn_code         = EXCLUDED.cbn_code,
+                                    is_active        = true,
+                                    last_synced_at   = EXCLUDED.last_synced_at
+                            """),
+                            {"code": code, "name": name, "now": now},
+                        )
+                        upserted += 1
+                    await session.commit()
+
+                logger.info(
+                    "[Scheduler] Institution sync complete — %d banks upserted from Monnify", upserted
+                )
+                synced = True
+                break
+
+            except asyncio.CancelledError:
+                logger.info("[Scheduler] Institution sync loop cancelled")
+                return
+            except Exception as exc:
+                logger.warning("[Scheduler] Institution sync attempt %d failed: %s", attempt + 1, exc)
+
+        if not synced:
+            logger.error("[Scheduler] Institution sync failed after all retries — will retry next cycle")
+
+        await asyncio.sleep(_INSTITUTION_SYNC_INTERVAL)
 
 # ── Webhook health monitoring ─────────────────────────────────────────────────
 
@@ -642,7 +797,7 @@ async def _check_2fa_grace_expiry() -> None:
     is only useful during the window).
     """
     from src.infrastructure.database.connection import get_session_factory
-    from src.infrastructure.database.flowpilot_models import UserModel
+    from src.infrastructure.database.flowpilot_models import UserMfaModel, UserModel
     from sqlalchemy import select
 
     logger.info("[Scheduler] 2FA grace-expiry reminder loop started")
@@ -655,26 +810,27 @@ async def _check_2fa_grace_expiry() -> None:
             warn_before = now + timedelta(minutes=_2FA_WARN_MINUTES)
 
             async with get_session_factory()() as session:
-                # Find users who haven't set up 2FA, have a grace deadline,
-                # and that deadline falls within the next 20 minutes.
+                # Join UserMfaModel — totp columns live there after schema redesign.
                 result = await session.execute(
-                    select(UserModel).where(
-                        UserModel.totp_enabled_at.is_(None),
-                        UserModel.totp_grace_until.isnot(None),
-                        UserModel.totp_grace_until > now,       # not yet expired
-                        UserModel.totp_grace_until <= warn_before,  # expiring soon
+                    select(UserModel, UserMfaModel)
+                    .join(UserMfaModel, UserMfaModel.user_id == UserModel.id)
+                    .where(
+                        UserMfaModel.totp_enabled_at.is_(None),
+                        UserMfaModel.totp_grace_until.isnot(None),
+                        UserMfaModel.totp_grace_until > now,
+                        UserMfaModel.totp_grace_until <= warn_before,
                         UserModel.is_active.is_(True),
                     )
                 )
-                users = result.scalars().all()
+                rows = result.all()
 
-                for user in users:
+                for user, mfa in rows:
                     if user.id in already_notified:
                         continue
 
                     minutes_left = max(
                         1,
-                        int((user.totp_grace_until - now).total_seconds() / 60),
+                        int((mfa.totp_grace_until - now).total_seconds() / 60),
                     )
 
                     from src.services.email_service import send_2fa_grace_expiring_email
@@ -707,7 +863,7 @@ async def _check_2fa_grace_expiry() -> None:
 
 def start_scheduler() -> None:
     """Start all background loops. Call once from app lifespan."""
-    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task, _institution_sync_task
     if _task is None or _task.done():
         _task = asyncio.create_task(_dispatch_loop())
         logger.info("[Scheduler] Background task created")
@@ -723,11 +879,14 @@ def start_scheduler() -> None:
     if _webhook_health_task is None or _webhook_health_task.done():
         _webhook_health_task = asyncio.create_task(_check_webhook_health())
         logger.info("[Scheduler] Webhook health check task created")
+    if _institution_sync_task is None or _institution_sync_task.done():
+        _institution_sync_task = asyncio.create_task(_sync_institutions_from_monnify())
+        logger.info("[Scheduler] Institution sync task created")
 
 
 def stop_scheduler() -> None:
     """Cancel all background loops. Call from app shutdown."""
-    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task
+    global _task, _expiry_task, _reminder_task, _2fa_reminder_task, _webhook_health_task, _institution_sync_task
     if _task and not _task.done():
         _task.cancel()
         logger.info("[Scheduler] Background task cancelled")
@@ -743,3 +902,6 @@ def stop_scheduler() -> None:
     if _webhook_health_task and not _webhook_health_task.done():
         _webhook_health_task.cancel()
         logger.info("[Scheduler] Webhook health check task cancelled")
+    if _institution_sync_task and not _institution_sync_task.done():
+        _institution_sync_task.cancel()
+        logger.info("[Scheduler] Institution sync task cancelled")

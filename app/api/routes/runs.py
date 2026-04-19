@@ -4,7 +4,7 @@ import io
 import json as json_mod
 import logging
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -23,7 +23,7 @@ from src.agents.event_publisher import EventPublisher, subscribe, unsubscribe
 from src.agents.state import AgentState
 from src.config.settings import Settings
 from src.infrastructure.database.connection import get_db_session
-from src.infrastructure.database.flowpilot_models import BusinessMemberModel, BusinessModel, UserModel
+from src.infrastructure.database.flowpilot_models import BusinessMemberModel, BusinessModel, UserModel, SavedRecipientModel
 from src.infrastructure.database.repositories import (
     AuditRepository,
     CandidateRepository,
@@ -251,6 +251,71 @@ def _resolve_approval_assignment(all_approvers: list, run, business_uuid) -> lis
     return approver_role[:1] if approver_role else pool[:1]
 
 
+async def _check_kyc_payout_limits(
+    session,
+    biz,
+    business_uuid: uuid.UUID,
+    candidate_rows: list[dict],
+) -> None:
+    """Raise HTTPException if any candidate or the batch total breaches KYC limits.
+
+    Called at run-creation time when candidates are known upfront, so we don't
+    burn an AI credit on a run that would be blocked at approval time anyway.
+    """
+    from datetime import date as _date
+    from src.services.kyc_limit_service import get_limits as _get_kyc_limits
+    from src.config.kyc_limits import SUPPORT_EMAIL as _SUPPORT_EMAIL
+    from src.infrastructure.database.flowpilot_models import KycLimitTrackerModel
+    from sqlalchemy import select as _sel
+
+    account_type = getattr(biz, "account_type", "business") or "business"
+    kyc_level = getattr(biz, "kyc_level", 0) or 0
+    if kyc_level == 0 and getattr(biz, "kyc_status", None) == "verified":
+        kyc_level = 1
+
+    limits = await _get_kyc_limits(session, account_type, kyc_level)
+    if not limits:
+        return
+
+    # Single run cap — total batch amount
+    total = sum(row["amount"] for row in candidate_rows)
+    if total > limits["single"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Total payout amount (₦{float(total):,.2f}) exceeds your single-run limit of "
+                f"₦{float(limits['single']):,.2f}. Split the batch or upgrade your KYC level. "
+                f"Contact {_SUPPORT_EMAIL}."
+            ),
+        )
+
+    # Monthly cap projection
+    today = _date.today()
+    month_start = today.replace(day=1)
+
+    tracker_r = await session.execute(
+        _sel(KycLimitTrackerModel).where(KycLimitTrackerModel.business_id == business_uuid)
+    )
+    tracker = tracker_r.scalar_one_or_none()
+    used = Decimal("0.00")
+    if tracker:
+        if tracker.month_start >= month_start:
+            used = tracker.monthly_payout_used
+        # else: new month — tracker resets at approval time, treat used as 0
+
+    projected = used + total
+    if projected > limits["monthly"]:
+        remaining = max(Decimal("0"), limits["monthly"] - used)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This batch (₦{float(total):,.2f}) would exceed your monthly payout limit of "
+                f"₦{float(limits['monthly']):,.2f}. You have ₦{float(remaining):,.2f} remaining "
+                f"this month. Upgrade your KYC level or contact {_SUPPORT_EMAIL}."
+            ),
+        )
+
+
 async def _notify(session, user_id, business_id, title: str, message: str,
                   type: str = "info", resource_type: str | None = None, resource_id: str | None = None):
     """Create an in-app notification — best-effort, never raises."""
@@ -362,6 +427,12 @@ async def create_run(
             raise HTTPException(status_code=402, detail="Insufficient wallet balance.")
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── KYC payout limits pre-flight (candidates only — amounts known upfront) ─
+    # Mirrors the approval-time check so we fail fast without burning an AI credit.
+    if candidate_rows and biz:
+        await _check_kyc_payout_limits(session, biz, business_uuid, candidate_rows)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── AI processing credit — atomic deduction ──────────────────────────────
     # Single SQL UPDATE with a WHERE guard:  no TOCTOU race, balance can never
     # go negative. If 0 rows are updated the balance was already 0 (or the biz
@@ -453,6 +524,35 @@ async def create_run(
             ],
             business_id=business_uuid,
         )
+        # Upsert each candidate into the saved_recipient address book
+        _now = datetime.now(timezone.utc)
+        for _c in request.candidates:
+            _existing = await session.execute(
+                _select(SavedRecipientModel).where(
+                    SavedRecipientModel.business_id == business_uuid,
+                    SavedRecipientModel.account_number == _c.account_number,
+                    SavedRecipientModel.institution_code == _c.institution_code,
+                )
+            )
+            _recipient = _existing.scalar_one_or_none()
+            if _recipient:
+                _recipient.name = _c.beneficiary_name
+                if _c.beneficiary_email:
+                    _recipient.email = _c.beneficiary_email
+                _recipient.payment_count = (_recipient.payment_count or 0) + 1
+                _recipient.last_paid_at = _now
+                _recipient.updated_at = _now
+            else:
+                session.add(SavedRecipientModel(
+                    business_id=business_uuid,
+                    name=_c.beneficiary_name,
+                    account_number=_c.account_number,
+                    institution_code=_c.institution_code,
+                    email=_c.beneficiary_email,
+                    payment_count=1,
+                    last_paid_at=_now,
+                ))
+
         await session.commit()
         # Build dicts for RiskAgent (matches its expected input format)
         candidate_dicts = [
@@ -519,6 +619,29 @@ async def create_run(
     await session.commit()
 
     logger.info(f"Created run {run_id}: {request.objective[:80]}")
+
+    from src.infrastructure.queue.agent_queue import enqueue_run as _enqueue
+    _enqueued = await _enqueue(run_id, {
+        "date_from": request.date_from.isoformat() if request.date_from else None,
+        "date_to": request.date_to.isoformat() if request.date_to else None,
+        "objective": request.objective,
+    })
+    if _enqueued:
+        logger.info(f"Run {run_id} enqueued for async processing")
+        return RunResponse(
+            run_id=run_id,
+            objective=run.objective,
+            status="pending",
+            created_at=run.created_at.isoformat(),
+            risk_tolerance=float(run.risk_tolerance),
+            budget_cap=float(run.budget_cap) if run.budget_cap is not None else None,
+            assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
+            plan_steps=None,
+            candidates=None,
+            candidate_count=len(candidate_rows),
+            current_step="pending",
+            error=None,
+        )
 
     try:
         publisher = EventPublisher(run.id, session)
@@ -1237,55 +1360,67 @@ async def nudge_approver(
             detail="Nudge can only be sent when the payout is awaiting approval.",
         )
 
-    if not run.assigned_to_id:
-        raise HTTPException(status_code=400, detail="This payout has no assigned approver.")
-
-    # Load the assigned approver
-    at_result = await session.execute(
-        _select_nudge(UserModel).where(UserModel.id == run.assigned_to_id)
-    )
-    approver_user = at_result.scalar_one_or_none()
-    if not approver_user:
-        raise HTTPException(status_code=404, detail="Assigned approver not found.")
-
     # Count candidates
     db_candidates = await candidate_repo.get_by_run(run_uuid)
     candidate_count = len(db_candidates)
 
-    # In-app notification
-    await _notify(
-        session,
-        approver_user.id,
-        run.business_id,
-        title="Reminder: Payout awaiting your approval",
-        message=(
-            f'The payout "{run.objective[:60]}" is still waiting for your review. '
-            "Please approve or reject it to proceed."
-        ),
-        type="warning",
-        resource_type="run",
-        resource_id=run_id,
-    )
-    await session.commit()
-
-    # Email — fire-and-forget
-    try:
-        from src.services.email_service import check_notification_pref as _cnp2
-        if _cnp2(approver_user, "payout_updates"):
-            import asyncio as _asyncio
-            _asyncio.create_task(
-                send_run_awaiting_approval_email(
-                    to=approver_user.email,
-                    run_id=run_id,
-                    objective=run.objective,
-                    candidate_count=candidate_count,
-                    approver_name=approver_user.display_name or approver_user.email,
-                )
+    # Resolve who to nudge: assigned approver → all active approvers/owners
+    if run.assigned_to_id:
+        at_result = await session.execute(
+            _select_nudge(UserModel).where(UserModel.id == run.assigned_to_id)
+        )
+        approver_user = at_result.scalar_one_or_none()
+        targets = [approver_user] if approver_user else []
+    else:
+        rows = (await session.execute(
+            _select_nudge(BusinessMemberModel, UserModel)
+            .join(UserModel, BusinessMemberModel.user_id == UserModel.id)
+            .where(
+                BusinessMemberModel.business_id == run.business_id,
+                BusinessMemberModel.role.in_(["owner", "approver"]),
+                BusinessMemberModel.is_active.is_(True),
             )
-    except Exception as exc:
-        logger.warning("[Nudge] Could not send nudge email: %s", exc)
+        )).all()
+        targets = [u for _, u in rows]
 
-    return {"ok": True, "nudged_user": approver_user.email}
+    if not targets:
+        raise HTTPException(status_code=404, detail="No active approvers found for this run.")
+
+    from src.services.email_service import check_notification_pref as _cnp2
+    import asyncio as _asyncio
+
+    nudged_emails = []
+    for approver_user in targets:
+        await _notify(
+            session,
+            approver_user.id,
+            run.business_id,
+            title="Reminder: Payout awaiting your approval",
+            message=(
+                f'The payout "{run.objective[:60]}" is still waiting for your review. '
+                "Please approve or reject it to proceed."
+            ),
+            type="warning",
+            resource_type="run",
+            resource_id=run_id,
+        )
+        try:
+            if _cnp2(approver_user, "payout_updates"):
+                _asyncio.create_task(
+                    send_run_awaiting_approval_email(
+                        to=approver_user.email,
+                        run_id=run_id,
+                        objective=run.objective,
+                        candidate_count=candidate_count,
+                        approver_name=approver_user.display_name or approver_user.email,
+                    )
+                )
+        except Exception as exc:
+            logger.warning("[Nudge] Could not send nudge email to %s: %s", approver_user.email, exc)
+        nudged_emails.append(approver_user.email)
+
+    await session.commit()
+    return {"ok": True, "nudged_users": nudged_emails}
 
 
 # --------------------------------------------------------------------------- #
@@ -1456,6 +1591,31 @@ async def rerun_payout(
             logger.warning("[Rerun] Could not notify approver: %s", exc)
 
     logger.info(f"Rerun triggered for run {run_id} by {current_user.id}")
+
+    from src.infrastructure.queue.agent_queue import enqueue_run as _enqueue_rr
+    _rr_enqueued = await _enqueue_rr(run_id, {
+        "date_from": body.date_from.isoformat() if body.date_from else None,
+        "date_to": body.date_to.isoformat() if body.date_to else None,
+        "objective": body.objective,
+    })
+    if _rr_enqueued:
+        logger.info(f"Rerun {run_id} enqueued for async processing")
+        await session.refresh(run)
+        db_candidates = await candidate_repo.get_by_run(run_uuid)
+        return RunResponse(
+            run_id=str(run.id),
+            objective=run.objective,
+            status="pending",
+            created_at=run.created_at.isoformat(),
+            risk_tolerance=float(run.risk_tolerance),
+            budget_cap=float(run.budget_cap) if run.budget_cap is not None else None,
+            assigned_to_id=str(run.assigned_to_id) if run.assigned_to_id else None,
+            plan_steps=None,
+            candidates=_candidates_to_response(db_candidates) or None,
+            candidate_count=len(db_candidates),
+            current_step="pending",
+            error=None,
+        )
 
     # Re-launch orchestration pipeline
     state: AgentState = {

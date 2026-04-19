@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update as _sa_update, delete as _sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.auth.api_key_auth import ApiKeyContext, get_api_key_context, require_scope
 from src.infrastructure.database.connection import get_db_session, get_session_factory
@@ -36,7 +37,6 @@ from src.infrastructure.database.flowpilot_models import (
     AuditLogModel,
     BusinessMemberModel,
     BusinessModel,
-    BusinessConfigModel,
     PayoutCandidateModel,
     ReconciledTransactionModel,
     SavedRecipientModel,
@@ -732,16 +732,17 @@ async def get_org_profile(
 ) -> dict:
     """Return the organisation profile associated with this API key."""
     biz_result = await session.execute(
-        select(BusinessModel).where(BusinessModel.id == ctx.business_id)
+        select(BusinessModel)
+        .options(
+            selectinload(BusinessModel.payment_policy),
+            selectinload(BusinessModel.virtual_accounts),
+            selectinload(BusinessModel.profile_row),
+        )
+        .where(BusinessModel.id == ctx.business_id)
     )
     biz = biz_result.scalar_one_or_none()
     if biz is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
-
-    cfg_result = await session.execute(
-        select(BusinessConfigModel).where(BusinessConfigModel.business_id == ctx.business_id)
-    )
-    config = cfg_result.scalar_one_or_none()
 
     return {
         "id": str(biz.id),
@@ -752,9 +753,9 @@ async def get_org_profile(
         "virtual_account_number": biz.virtual_account_number,
         "virtual_account_bank": biz.virtual_account_bank,
         "virtual_account_name": biz.virtual_account_name,
-        "daily_payout_limit": float(config.daily_payout_limit) if config and config.daily_payout_limit else None,
-        "single_payout_cap": float(config.single_payout_cap) if config and config.single_payout_cap else None,
-        "risk_appetite": config.risk_appetite if config else None,
+        "daily_payout_limit": float(biz.daily_payout_limit) if biz.daily_payout_limit else None,
+        "single_payout_cap": float(biz.single_payout_cap) if biz.single_payout_cap else None,
+        "risk_appetite": biz.risk_appetite,
     }
 
 

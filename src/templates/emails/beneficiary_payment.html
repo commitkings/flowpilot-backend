@@ -32,11 +32,16 @@
             <td style="height:4px;background-color:{% if status == 'success' %}#16a34a{% else %}#dc2626{% endif %};border-radius:12px 12px 0 0;font-size:0;line-height:0;">&nbsp;</td>
           </tr>
 
-          <!-- Logo -->
+          <!-- Logo: business logo if set, else FlowPilot default -->
           <tr>
             <td align="center" class="logo-pad" style="background-color:#ffffff;padding:28px 40px 20px;">
+              {% if business_logo_url %}
+              <img src="{{ business_logo_url }}" alt="{{ org_name }}" height="40"
+                   style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;max-width:160px;object-fit:contain;" />
+              {% else %}
               <img src="https://i.postimg.cc/ZqzNQW8H/flowpilot-logo-darkblue.png" alt="FlowPilot" height="28"
                    style="display:block;border:0;outline:none;text-decoration:none;margin:0 auto;" />
+              {% endif %}
             </td>
           </tr>
 

@@ -181,6 +181,8 @@ class Settings:
     MONNIFY_SECRET_KEY: Optional[str] = os.getenv("MONNIFY_SECRET_KEY")
     MONNIFY_CONTRACT_CODE: Optional[str] = os.getenv("MONNIFY_CONTRACT_CODE")
     MONNIFY_SOURCE_ACCOUNT_NUMBER: Optional[str] = os.getenv("MONNIFY_SOURCE_ACCOUNT_NUMBER")
+    # Partner bank codes for reserved accounts (comma-separated). Monnify docs default: 50515 (Moniepoint MFB).
+    MONNIFY_PREFERRED_BANKS: str = os.getenv("MONNIFY_PREFERRED_BANKS", "50515")
     INTERNAL_SERVICE_TOKEN: Optional[str] = os.getenv("INTERNAL_SERVICE_TOKEN")
 
     @classmethod
@@ -332,6 +334,10 @@ class Settings:
     # ------------------------------------------------------------------
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+    # Controls KYC verification behaviour.
+    # "test"  → auto-verify after 30 s (no external provider calls).
+    # "production" → real Monnify BVN/NIN checks + manual document review.
+    VERIFICATION_ENV: str = os.getenv("VERIFICATION_ENV", "test")
 
     @classmethod
     def is_production(cls) -> bool:

@@ -1,7 +1,8 @@
 """MinIO / S3 storage client for FlowPilot document uploads.
 
-Uses boto3 with the configured MINIO_ENDPOINT. Falls back gracefully if
-the bucket is unreachable (e.g. local dev without a running MinIO instance).
+Uses boto3 with the configured MINIO_ENDPOINT. Falls back to the local
+filesystem (LOCAL_UPLOADS_DIR) when MinIO is unreachable — useful for
+local dev or when MinIO is not deployed.
 
 Performance notes:
 - The boto3 client is created once and reused (module-level singleton).
@@ -17,6 +18,13 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+# Set USE_S3=false in .env to skip MinIO entirely and always use local storage.
+_USE_S3 = os.getenv("USE_S3", "true").strip().lower() not in ("false", "0", "no")
+
+# Directory used when MinIO is unavailable.  Mount a Docker volume here so
+# files survive container restarts.
+_LOCAL_UPLOADS_DIR = os.getenv("LOCAL_UPLOADS_DIR", "/app/uploads")
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +108,12 @@ def _get_upload_client():
             aws_access_key_id=_ACCESS_KEY,
             aws_secret_access_key=_SECRET_KEY,
             region_name=_REGION,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 1},
+            ),
         )
     return _upload_client
 
@@ -120,7 +133,12 @@ def _get_public_client():
             aws_access_key_id=_ACCESS_KEY,
             aws_secret_access_key=_SECRET_KEY,
             region_name=_REGION,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 1},
+            ),
         )
     return _public_client
 
@@ -165,6 +183,16 @@ def _presigned_sync(object_key: str, expiry: int) -> Optional[str]:
     )
 
 
+def _upload_local(file_bytes: bytes, folder: str, unique_name: str) -> str:
+    """Write bytes to LOCAL_UPLOADS_DIR and return the object key."""
+    dest_dir = os.path.join(_LOCAL_UPLOADS_DIR, folder)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, unique_name)
+    with open(dest_path, "wb") as fh:
+        fh.write(file_bytes)
+    return f"local/{folder}/{unique_name}"
+
+
 async def upload_file(
     file_bytes: bytes,
     filename: str,
@@ -173,27 +201,45 @@ async def upload_file(
 ) -> Optional[str]:
     """Upload bytes to MinIO and return the object key (path in bucket).
 
-    Returns the object key on success, None on failure.
-    The caller should store the key and use get_presigned_url() to generate
-    time-limited download URLs.
+    Falls back to local filesystem storage (LOCAL_UPLOADS_DIR) when MinIO
+    is unreachable.  Local keys use the prefix ``local/`` so downstream
+    code can distinguish them from MinIO keys.
 
-    All blocking I/O runs in a thread pool so the asyncio event loop is free.
+    Returns the object key on success, None on failure.
     """
     if not content_type:
         guessed, _ = mimetypes.guess_type(filename)
         content_type = guessed or "application/octet-stream"
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
-    object_key = f"{folder}/{uuid.uuid4().hex}.{ext}"
+    unique_name = f"{uuid.uuid4().hex}.{ext}"
+    object_key = f"{folder}/{unique_name}"
 
     loop = asyncio.get_running_loop()
+    if not _USE_S3:
+        try:
+            local_key = await loop.run_in_executor(_executor, _upload_local, file_bytes, folder, unique_name)
+            logger.info("USE_S3=false — stored %s locally at %s", filename, local_key)
+            return local_key
+        except Exception as exc:
+            logger.error("Local storage failed for %s: %s", filename, exc)
+            return None
+
     try:
         await loop.run_in_executor(_executor, _upload_sync, file_bytes, object_key, content_type)
         logger.info("Uploaded %s → s3://%s/%s", filename, _BUCKET, object_key)
         return object_key
     except Exception as exc:
-        logger.error("MinIO upload failed for %s: %s", filename, exc)
-        return None
+        logger.warning("MinIO upload failed for %s (%s) — falling back to local storage", filename, exc)
+        try:
+            local_key = await loop.run_in_executor(
+                _executor, _upload_local, file_bytes, folder, unique_name
+            )
+            logger.info("Stored %s locally at %s", filename, local_key)
+            return local_key
+        except Exception as local_exc:
+            logger.error("Local fallback also failed for %s: %s", filename, local_exc)
+            return None
 
 
 def get_presigned_url(object_key: str, expiry: int = _PRESIGNED_EXPIRY) -> Optional[str]:
@@ -210,7 +256,27 @@ def get_presigned_url(object_key: str, expiry: int = _PRESIGNED_EXPIRY) -> Optio
 
 
 async def download_file(object_key: str) -> Optional[bytes]:
-    """Download a file from MinIO and return its bytes. Returns None on failure."""
+    """Download a file and return its bytes. Returns None on failure.
+
+    Keys prefixed with ``local/`` are read from LOCAL_UPLOADS_DIR instead
+    of MinIO (these are files written by the local fallback path).
+    """
+    if not _USE_S3 or object_key.startswith("local/"):
+        relative = object_key[len("local/"):] if object_key.startswith("local/") else object_key
+        local_path = os.path.join(_LOCAL_UPLOADS_DIR, relative)
+        try:
+            loop = asyncio.get_running_loop()
+            def _read_local():
+                with open(local_path, "rb") as fh:
+                    return fh.read()
+            return await loop.run_in_executor(_executor, _read_local)
+        except FileNotFoundError:
+            logger.error("Local file not found: %s", local_path)
+            return None
+        except Exception as exc:
+            logger.error("Failed to read local file %s: %s", local_path, exc)
+            return None
+
     try:
         loop = asyncio.get_running_loop()
         def _download_sync():
@@ -252,6 +318,12 @@ def make_file_url(object_key: Optional[str]) -> Optional[str]:
     # Local upload path - return as-is (served via StaticFiles or Next.js proxy)
     if object_key.startswith("/uploads/") or object_key.startswith("uploads/"):
         return object_key
+    # Local fallback file — route through the API file proxy
+    if object_key.startswith("local/"):
+        api_base = os.getenv("API_BASE_URL", "").rstrip("/")
+        if api_base:
+            return f"{api_base}/api/v1/files/{object_key}"
+        return f"/api/v1/files/{object_key}"
     # Construct backend proxy URL
     api_base = os.getenv("API_BASE_URL", "").rstrip("/")
     if api_base:
